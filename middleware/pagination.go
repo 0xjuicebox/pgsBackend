@@ -14,7 +14,7 @@ const (
 )
 
 func Paginate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.Writer, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
 		//Safe fallbacks
 		page := 1
@@ -37,7 +37,7 @@ func Paginate(next http.Handler) http.Handler {
 		}
 
 		ctx := context.WithValue(r.Context(), PageKey, page)
-		ctx = context.WithValue(r.Context(), LimitKey, limit)
+		ctx = context.WithValue(ctx, LimitKey, limit)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

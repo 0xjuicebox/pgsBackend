@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/0xjuicebox/goService/middleware" // Make sure this matches your mod name
+	"github.com/0xjuicebox/pgsBackend/middleware" // Make sure this matches your mod name
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5"
@@ -51,7 +51,7 @@ type CustomerResource struct {
 func (cr CustomerResource) Routes() chi.Router {
 	r := chi.NewRouter()
 
-	r.Get("/", cr.List)
+	r.With(middleware.Paginate).Get("/", cr.List)
 	r.Post("/", cr.Create)
 
 	r.Route("/{id}", func(r chi.Router) {
@@ -105,6 +105,62 @@ func (cr CustomerResource) List(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(customers)
+}
+
+func (cr CustomerResource) Create(w http.ResponseWriter, r *http.Request) {
+	var c Customer
+
+	// 1. Decode the incoming JSON payload into our Customer struct
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		http.Error(w, "Invalid JSON payload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 2. Generate a time-sorted UUID v7 on the server side
+	u, err := uuid.NewV7()
+	if err != nil {
+		http.Error(w, "Failed to generate server-side ID", http.StatusInternalServerError)
+		return
+	}
+	c.Id = u
+
+	// 3. Raw SQL Insert mapping your 11 flattened product columns
+	query := `
+		INSERT INTO customers (
+			id, name, phone_number, house_address, geo_latitude, geo_longitude,
+			default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
+			default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
+			default_oil_qty, default_atta_qty, default_burfi_qty
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10,
+			$11, $12, $13, $14,
+			$15, $16, $17
+		)
+	`
+
+	// 4. Pass the context and values directly to pgxpool
+	_, err = cr.DB.Exec(
+		r.Context(), query,
+		c.Id, c.Name, c.PhoneNumber, c.HouseAddress, c.GeoLatitude, c.GeoLongitude,
+		c.DefaultQuantity.Milk, c.DefaultQuantity.Curd, c.DefaultQuantity.Butter, c.DefaultQuantity.Ghee,
+		c.DefaultQuantity.Lassi, c.DefaultQuantity.Paneer, c.DefaultQuantity.Jaggery, c.DefaultQuantity.Khand,
+		c.DefaultQuantity.Oil, c.DefaultQuantity.Atta, c.DefaultQuantity.Burfi,
+	)
+
+	if err != nil {
+		// This will catch things like trying to register the same phone number twice
+		http.Error(w, "Database insertion failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 5. Send back a clean 201 Created response along with the generated ID
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"id":      c.Id.String(),
+		"message": "Customer onboarded successfully via backend engine",
+	})
 }
 
 func (cr CustomerResource) Get(w http.ResponseWriter, r *http.Request) {
