@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/customer"
+	"github.com/0xjuicebox/pgsBackend/internal/driver"
 	"github.com/0xjuicebox/pgsBackend/internal/route"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -60,9 +61,11 @@ func main() {
 	r.Use(middleware.Timeout(60 * time.Second))
 
 	cr := customer.CustomerResource{DB: pool}
-	rr := route.RouterResource{DB: pool}
+	rr := route.RouteResource{DB: pool}
+	dr := driver.DriverResource{DB: pool}
 	r.Mount("/customer", cr.Routes())
 	r.Mount("/route", rr.Routes())
+	r.Mount("/driver", dr.Routes())
 
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("welcome"))

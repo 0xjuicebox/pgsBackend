@@ -34,14 +34,16 @@ type Order struct {
 }
 
 type Customer struct {
-	Id              uuid.UUID `json:"uuid"`
-	Name            string    `json:"customer"`
-	PhoneNumber     string    `json:"phoneNumber"`
-	HouseAddress    string    `json:"houseAddress"`
-	GeoLatitude     string    `json:"geoLatitude"`
-	GeoLongitude    string    `json:"geoLonitude"`
-	DefaultQuantity Order     `json:"defaultOrder"`
-	IsActive        bool      `json:"isActive"` // Changed to bool to match standard DB boolean types
+	Id              uuid.UUID  `json:"uuid"`
+	Name            string     `json:"customer"`
+	PhoneNumber     string     `json:"phoneNumber"`
+	HouseAddress    string     `json:"houseAddress"`
+	GeoLatitude     string     `json:"geoLatitude"`
+	GeoLongitude    string     `json:"geoLonitude"`
+	DefaultQuantity Order      `json:"defaultOrder"`
+	IsActive        bool       `json:"isActive"` // Changed to bool to match standard DB boolean types
+	StopOrder       int        `json:"stopOrder"`
+	RouteId         *uuid.UUID `json:"routeId"`
 }
 
 type CustomerResource struct {
@@ -58,6 +60,7 @@ func (cr CustomerResource) Routes() chi.Router {
 		r.Get("/", cr.Get)
 		r.Put("/", cr.Update)
 		r.Delete("/", cr.Delete)
+
 	})
 	return r
 }
@@ -70,7 +73,7 @@ func (cr CustomerResource) List(w http.ResponseWriter, r *http.Request) {
 	// Order matches the scan block below precisely
 	query := `
 		SELECT
-			id, name, phone_number, house_address, geo_latitude, geo_longitude, is_active,
+			id, name, phone_number, house_address, geo_latitude, geo_longitude, is_active, stop_order, route_id,
 			default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
 			default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
 			default_oil_qty, default_atta_qty, default_burfi_qty
@@ -91,7 +94,7 @@ func (cr CustomerResource) List(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var c Customer
 		err := rows.Scan(
-			&c.Id, &c.Name, &c.PhoneNumber, &c.HouseAddress, &c.GeoLatitude, &c.GeoLongitude, &c.IsActive,
+			&c.Id, &c.Name, &c.PhoneNumber, &c.HouseAddress, &c.GeoLatitude, &c.GeoLongitude, &c.IsActive, &c.StopOrder, &c.RouteId,
 			&c.DefaultQuantity.Milk, &c.DefaultQuantity.Curd, &c.DefaultQuantity.Butter, &c.DefaultQuantity.Ghee,
 			&c.DefaultQuantity.Lassi, &c.DefaultQuantity.Paneer, &c.DefaultQuantity.Jaggery, &c.DefaultQuantity.Khand,
 			&c.DefaultQuantity.Oil, &c.DefaultQuantity.Atta, &c.DefaultQuantity.Burfi,
@@ -168,7 +171,7 @@ func (cr CustomerResource) Get(w http.ResponseWriter, r *http.Request) {
 
 	query := `
 		SELECT
-			id, name, phone_number, house_address, geo_latitude, geo_longitude, is_active,
+			id, name, phone_number, house_address, geo_latitude, geo_longitude, is_active, stop_order, route_id
 			default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
 			default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
 			default_oil_qty, default_atta_qty, default_burfi_qty
@@ -178,7 +181,7 @@ func (cr CustomerResource) Get(w http.ResponseWriter, r *http.Request) {
 
 	var c Customer
 	err := cr.DB.QueryRow(r.Context(), query, id).Scan(
-		&c.Id, &c.Name, &c.PhoneNumber, &c.HouseAddress, &c.GeoLatitude, &c.GeoLongitude, &c.IsActive,
+		&c.Id, &c.Name, &c.PhoneNumber, &c.HouseAddress, &c.GeoLatitude, &c.GeoLongitude, &c.IsActive, &c.StopOrder, &c.RouteId,
 		&c.DefaultQuantity.Milk, &c.DefaultQuantity.Curd, &c.DefaultQuantity.Butter, &c.DefaultQuantity.Ghee,
 		&c.DefaultQuantity.Lassi, &c.DefaultQuantity.Paneer, &c.DefaultQuantity.Jaggery, &c.DefaultQuantity.Khand,
 		&c.DefaultQuantity.Oil, &c.DefaultQuantity.Atta, &c.DefaultQuantity.Burfi,
@@ -210,15 +213,17 @@ func (cr CustomerResource) Update(w http.ResponseWriter, r *http.Request) {
 		UPDATE customers
 		SET
 			name = $1, phone_number = $2, house_address = $3, geo_latitude = $4, geo_longitude = $5, is_active = $6,
-			default_milk_qty = $7, default_curd_qty = $8, default_butter_qty = $9, default_ghee_qty = $10,
-			default_lassi_qty = $11, default_paneer_qty = $12, default_jaggery_qty = $13, default_khand_qty = $14,
-			default_oil_qty = $15, default_atta_qty = $16, default_burfi_qty = $17
-		WHERE id = $18
+			stop_order = $7, route_id = $8,
+			default_milk_qty = $9, default_curd_qty = $10, default_butter_qty = $11, default_ghee_qty = $12,
+			default_lassi_qty = $13, default_paneer_qty = $14, default_jaggery_qty = $15, default_khand_qty = $16,
+			default_oil_qty = $17, default_atta_qty = $18, default_burfi_qty = $19
+		WHERE id = $20
 	`
 
 	_, err := cr.DB.Exec(
 		r.Context(), query,
 		c.Name, c.PhoneNumber, c.HouseAddress, c.GeoLatitude, c.GeoLongitude, c.IsActive,
+		c.StopOrder, c.RouteId, // Injected values right here
 		c.DefaultQuantity.Milk, c.DefaultQuantity.Curd, c.DefaultQuantity.Butter, c.DefaultQuantity.Ghee,
 		c.DefaultQuantity.Lassi, c.DefaultQuantity.Paneer, c.DefaultQuantity.Jaggery, c.DefaultQuantity.Khand,
 		c.DefaultQuantity.Oil, c.DefaultQuantity.Atta, c.DefaultQuantity.Burfi,
