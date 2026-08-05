@@ -1,8 +1,9 @@
-# Stage 1: Build using official Go 1.26-alpine image
-FROM golang:1.26 AS builder
+# Stage 1: Build stage using Alpine-based Go 1.26
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
+# Install git and SSL certificates using Alpine's apk
 RUN apk add --no-cache git ca-certificates
 
 COPY go.mod go.sum ./
@@ -26,5 +27,4 @@ COPY --from=builder /app/main .
 
 EXPOSE 8080
 
-CMD ["./main"]
 CMD ["./main"]
