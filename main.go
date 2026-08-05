@@ -24,9 +24,9 @@ import (
 )
 
 func main() {
-
+	// Attempt to load .env for local development; log a notice instead of exiting if missing
 	if err := godotenv.Load(); err != nil {
-		log.Fatal("Error parsing %v", err)
+		log.Println("Notice: No .env file found, reading environment variables from system")
 	}
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -35,7 +35,6 @@ func main() {
 	}
 
 	config, err := pgxpool.ParseConfig(dsn)
-
 	if err != nil {
 		log.Fatalf("Unable to parse connection string: %v", err)
 	}
@@ -61,7 +60,7 @@ func main() {
 
 	r := chi.NewRouter()
 
-	//Middleware stack
+	// Middleware stack
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -78,8 +77,6 @@ func main() {
 		WhatsApp: ws,
 	}
 
-	// 2. Mount it to the chi router
-	// (Add this right next to r.Mount("/override", ...) and r.Mount("/register", ...))
 	r.Mount("/update", updateResource.Routes())
 
 	cr := customer.CustomerResource{DB: pool, WhatsApp: ws}
@@ -89,6 +86,7 @@ func main() {
 	or := override.OverrideResource{DB: pool, WhatsApp: ws}
 	delR := delivery.DeliveryResource{DB: pool, WhatsApp: ws}
 	webR := webhook.WhatsAppResource{WhatsApp: ws, DB: pool}
+
 	r.Mount("/customer", cr.Routes())
 	r.Mount("/route", rr.Routes())
 	r.Mount("/driver", dr.Routes())
@@ -102,5 +100,13 @@ func main() {
 		w.Write([]byte("welcome"))
 	})
 
-	http.ListenAndServe(":3000", r)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	log.Printf("Server starting on port :%s", port)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
+	}
 }
