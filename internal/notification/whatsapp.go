@@ -25,7 +25,7 @@ func NewWhatsAppService() *WhatsAppService {
 func (s *WhatsAppService) SendUpdateLink(toPhone, token string) error {
 	variables := fmt.Sprintf(`{"1":"%s"}`, token)
 	// ⚠️ Replace with your actual Update Link Template SID from Twilio!
-	return s.SendContentTemplate(toPhone, "HX789b26b4f4d5cf9673a085d7552b5b67", variables)
+	return s.SendContentTemplate(toPhone, "HX306ea9cbf65027086120b77ccdfae302", variables)
 }
 
 // formatPhone ensures the number is perfectly formatted for Twilio's WhatsApp API
@@ -97,7 +97,7 @@ func (s *WhatsAppService) SendRejectionNotification(toPhone, customerName, reaso
 // as a separate Twilio template from the registration one.
 func (s *WhatsAppService) SendOverrideLink(toPhone, token string) error {
 	variables := fmt.Sprintf(`{"1":"%s"}`, token)
-	return s.SendContentTemplate(toPhone, "HX9e75e3bbf77f3e5a81e451c83f5615ec", variables)
+	return s.SendContentTemplate(toPhone, "HX40cbc193ae82c16ffcc1d47a31dda48c", variables)
 }
 
 // -------------------------------------------------------------------------
@@ -130,7 +130,7 @@ func (s *WhatsAppService) SendRegistrationPrompt(toPhone string) error {
 // suffix, not the whole URL — so we pass just the raw token here, not a full link.)
 func (s *WhatsAppService) SendRegistrationLink(toPhone, token string) error {
 	variables := fmt.Sprintf(`{"1":"%s"}`, token)
-	return s.SendContentTemplate(toPhone, "HX4c6ef08f450b065b975dc09e89135114", variables)
+	return s.SendContentTemplate(toPhone, "HX69072c45c623b99ebf805e81d2ef5ac9", variables)
 }
 
 func (s *WhatsAppService) SendContentTemplate(toPhone string, templateSid string, variables string) error {
