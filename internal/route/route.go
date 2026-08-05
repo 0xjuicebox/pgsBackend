@@ -1,6 +1,7 @@
 package route
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -38,7 +39,11 @@ func (rr RouteResource) Routes() chi.Router {
 
 		r.Put("/sequence", rr.UpdateSequence)
 		r.Put("/driver", rr.UpdateDriver)
+
+		// Driver-facing: Who gets what TODAY
 		r.Get("/manifest", rr.GetManifest)
+		// Admin-facing: EVERYONE assigned to this route
+		r.Get("/roster", rr.GetRoster)
 	})
 
 	return r
@@ -51,7 +56,6 @@ func (rr RouteResource) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Generate the Server-Side UUID
 	u, err := uuid.NewV7()
 	if err != nil {
 		http.Error(w, "Failed to generate ID", http.StatusInternalServerError)
@@ -59,7 +63,6 @@ func (rr RouteResource) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	rt.Id = u
 
-	// 2. Insert into the database (driver_id defaults to null)
 	query := `
 		INSERT INTO routes (id, name, description)
 		VALUES ($1, $2, $3)
@@ -71,7 +74,6 @@ func (rr RouteResource) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Return the success response with the real ID
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{
@@ -142,7 +144,6 @@ func (rr RouteResource) Get(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(rt)
 }
 
-// Update allows you to only update the Name and Description of the Route
 func (rr RouteResource) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
@@ -171,7 +172,6 @@ func (rr RouteResource) Update(w http.ResponseWriter, r *http.Request) {
 func (rr RouteResource) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	// Postgres automatically safely unassigns all customers attached to this ID!
 	query := `DELETE FROM routes WHERE id = $1`
 
 	_, err := rr.DB.Exec(r.Context(), query, id)
@@ -197,7 +197,6 @@ func (rr RouteResource) UpdateSequence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Begin a safe database transaction block
 	tx, err := rr.DB.Begin(r.Context())
 	if err != nil {
 		http.Error(w, "Failed to start transaction: "+err.Error(), http.StatusInternalServerError)
@@ -205,8 +204,6 @@ func (rr RouteResource) UpdateSequence(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	// 2. Loop through the array and update the stop_order based on array index.
-	// Only targets customers who are ALREADY assigned to this route_id.
 	query := `
 		UPDATE customers
 		SET stop_order = $1
@@ -215,7 +212,6 @@ func (rr RouteResource) UpdateSequence(w http.ResponseWriter, r *http.Request) {
 
 	for index, customerId := range payload.CustomerIDs {
 		stopOrder := index + 1
-
 		_, err := tx.Exec(r.Context(), query, stopOrder, customerId, routeId)
 		if err != nil {
 			http.Error(w, "Failed updating sequence at customer "+customerId+": "+err.Error(), http.StatusInternalServerError)
@@ -223,7 +219,6 @@ func (rr RouteResource) UpdateSequence(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. Commit the transaction to save all changes safely at once
 	if err := tx.Commit(r.Context()); err != nil {
 		http.Error(w, "Failed to commit transaction: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -234,7 +229,7 @@ func (rr RouteResource) UpdateSequence(w http.ResponseWriter, r *http.Request) {
 }
 
 type DriverPayload struct {
-	DriverId *string `json:"driverId"` // Pointer allows passing null to completely unassign a driver
+	DriverId *string `json:"driverId"`
 }
 
 func (rr RouteResource) UpdateDriver(w http.ResponseWriter, r *http.Request) {
@@ -258,11 +253,80 @@ func (rr RouteResource) UpdateDriver(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "Driver link updated on route"})
 }
 
-// We define a specialized ManifestStop that encapsulates a customer's identity
-// along with their dynamically calculated daily order.
+// -------------------------------------------------------------------------
+// GET /roster
+// Used by Admin for Drag & Drop sequence editing. Ignores daily schedules.
+// -------------------------------------------------------------------------
+
+type RosterStop struct {
+	Id           uuid.UUID `json:"id"`
+	Name         string    `json:"name"`
+	PhoneNumber  string    `json:"phoneNumber"`
+	HouseAddress string    `json:"houseAddress"`
+	StopOrder    int       `json:"stopOrder"`
+	IsActive     bool      `json:"isActive"`
+}
+
+type RosterResponse struct {
+	RouteID   uuid.UUID    `json:"routeId"`
+	RouteName string       `json:"routeName"`
+	Stops     []RosterStop `json:"stops"`
+}
+
+func (rr RouteResource) GetRoster(w http.ResponseWriter, r *http.Request) {
+	routeId := chi.URLParam(r, "id")
+	var response RosterResponse
+
+	metaQuery := `SELECT id, name FROM routes WHERE id = $1`
+	err := rr.DB.QueryRow(r.Context(), metaQuery, routeId).Scan(&response.RouteID, &response.RouteName)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			http.Error(w, "Route not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 🚀 CRITICAL FIX: COALESCE(house_address, '') prevents pgx from crashing
+	// if a customer record has a NULL house_address.
+	customerQuery := `
+		SELECT id, name, phone_number, COALESCE(house_address, ''), stop_order, is_active
+		FROM customers
+		WHERE route_id = $1 AND status IN ('active', 'disabled')
+		ORDER BY stop_order ASC
+	`
+	rows, err := rr.DB.Query(r.Context(), customerQuery, routeId)
+	if err != nil {
+		http.Error(w, "Error fetching roster: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	response.Stops = []RosterStop{}
+	for rows.Next() {
+		var stop RosterStop
+		if err := rows.Scan(&stop.Id, &stop.Name, &stop.PhoneNumber, &stop.HouseAddress, &stop.StopOrder, &stop.IsActive); err != nil {
+			http.Error(w, "Error scanning roster: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		response.Stops = append(response.Stops, stop)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// -------------------------------------------------------------------------
+// GET /manifest
+// Used by Drivers. Filters by target date and non-zero orders.
+// -------------------------------------------------------------------------
+
 type ManifestStop struct {
 	customer.Customer
 	DeliveryOrder customer.Order `json:"deliveryOrder"`
+	Status        *string        `json:"status"`
+	ActualOrder   customer.Order `json:"actualOrder"`
 }
 
 type ManifestResponse struct {
@@ -276,78 +340,74 @@ type ManifestResponse struct {
 
 func (rr RouteResource) GetManifest(w http.ResponseWriter, r *http.Request) {
 	routeId := chi.URLParam(r, "id")
-
-	// Determine the Target Date (YYYY-MM-DD), defaulting to today
 	targetDate := r.URL.Query().Get("date")
 	if targetDate == "" {
 		targetDate = time.Now().Format("2006-01-02")
 	}
 
-	// 1. Fetch Route Metadata
+	manifest, err := GenerateManifest(rr.DB, r.Context(), routeId, targetDate)
+	if err != nil {
+		http.Error(w, "Error generating manifest: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(manifest)
+}
+
+func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, targetDate string) (ManifestResponse, error) {
+	var manifest ManifestResponse
+	manifest.TargetDate = targetDate
+
 	metaQuery := `
 		SELECT r.id, r.name, d.name, d.phone_number
 		FROM routes r
 		LEFT JOIN drivers d ON r.driver_id = d.id
 		WHERE r.id = $1
 	`
-
-	var manifest ManifestResponse
-	manifest.TargetDate = targetDate
-
-	err := rr.DB.QueryRow(r.Context(), metaQuery, routeId).Scan(
-		&manifest.RouteID,
-		&manifest.RouteName,
-		&manifest.DriverName,
-		&manifest.DriverPhone,
+	err := db.QueryRow(ctx, metaQuery, routeId).Scan(
+		&manifest.RouteID, &manifest.RouteName, &manifest.DriverName, &manifest.DriverPhone,
 	)
-
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			http.Error(w, "Route not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Database error fetching manifest metadata: "+err.Error(), http.StatusInternalServerError)
-		return
+		return manifest, err
 	}
 
-	// 2. Query customers matching the target date's delivery schedule, or customers with active overrides.
-	// COALESCE prioritize the override quantities first, falling back to subscription defaults.
 	customerQuery := `
 		SELECT
 			c.id, c.name, c.phone_number, c.house_address, c.geo_latitude, c.geo_longitude, c.is_active, c.stop_order, c.route_id,
-			COALESCE(o.new_milk_qty, s.default_milk_qty, 0),
-			COALESCE(o.new_curd_qty, s.default_curd_qty, 0),
-			COALESCE(o.new_butter_qty, s.default_butter_qty, 0),
-			COALESCE(o.new_ghee_qty, s.default_ghee_qty, 0),
-			COALESCE(o.new_lassi_qty, s.default_lassi_qty, 0),
-			COALESCE(o.new_paneer_qty, s.default_paneer_qty, 0),
-			COALESCE(o.new_jaggery_qty, s.default_jaggery_qty, 0),
-			COALESCE(o.new_khand_qty, s.default_khand_qty, 0),
-			COALESCE(o.new_oil_qty, s.default_oil_qty, 0),
-			COALESCE(o.new_atta_qty, s.default_atta_qty, 0),
-			COALESCE(o.new_burfi_qty, s.default_burfi_qty, 0)
+			COALESCE(o.new_milk_qty, s.default_milk_qty, 0), COALESCE(o.new_curd_qty, s.default_curd_qty, 0),
+			COALESCE(o.new_butter_qty, s.default_butter_qty, 0), COALESCE(o.new_ghee_qty, s.default_ghee_qty, 0),
+			COALESCE(o.new_lassi_qty, s.default_lassi_qty, 0), COALESCE(o.new_paneer_qty, s.default_paneer_qty, 0),
+			COALESCE(o.new_jaggery_qty, s.default_jaggery_qty, 0), COALESCE(o.new_khand_qty, s.default_khand_qty, 0),
+			COALESCE(o.new_oil_qty, s.default_oil_qty, 0), COALESCE(o.new_atta_qty, s.default_atta_qty, 0),
+			COALESCE(o.new_burfi_qty, s.default_burfi_qty, 0),
+			dl.status,
+			COALESCE(dl.delivered_milk_qty, 0), COALESCE(dl.delivered_curd_qty, 0),
+			COALESCE(dl.delivered_butter_qty, 0), COALESCE(dl.delivered_ghee_qty, 0),
+			COALESCE(dl.delivered_lassi_qty, 0), COALESCE(dl.delivered_paneer_qty, 0),
+			COALESCE(dl.delivered_jaggery_qty, 0), COALESCE(dl.delivered_khand_qty, 0),
+			COALESCE(dl.delivered_oil_qty, 0), COALESCE(dl.delivered_atta_qty, 0),
+			COALESCE(dl.delivered_burfi_qty, 0)
 		FROM customers c
 		INNER JOIN subscriptions s ON c.id = s.customer_id
 		LEFT JOIN order_overrides o ON c.id = o.customer_id AND o.target_date = $2
+		LEFT JOIN delivery_logs dl ON c.id = dl.customer_id AND dl.delivery_date = $2
 		WHERE c.route_id = $1 AND c.is_active = TRUE AND c.stop_order > 0
-		  AND (
+			AND (
 			s.schedule_type = 'daily'
 			OR (s.schedule_type = 'custom' AND EXTRACT(DOW FROM $2::date)::int = ANY(s.active_days))
 			OR (s.schedule_type = 'alternate' AND ($2::date - s.anchor_date) % 2 = 0)
 			OR o.id IS NOT NULL
-		  )
+			)
 		ORDER BY c.stop_order ASC
 	`
-
-	rows, err := rr.DB.Query(r.Context(), customerQuery, routeId, targetDate)
+	rows, err := db.Query(ctx, customerQuery, routeId, targetDate)
 	if err != nil {
-		http.Error(w, "Database error fetching manifest stops: "+err.Error(), http.StatusInternalServerError)
-		return
+		return manifest, err
 	}
 	defer rows.Close()
 
 	manifest.Stops = []ManifestStop{}
-
 	for rows.Next() {
 		var stop ManifestStop
 		err := rows.Scan(
@@ -355,25 +415,18 @@ func (rr RouteResource) GetManifest(w http.ResponseWriter, r *http.Request) {
 			&stop.DeliveryOrder.Milk, &stop.DeliveryOrder.Curd, &stop.DeliveryOrder.Butter, &stop.DeliveryOrder.Ghee,
 			&stop.DeliveryOrder.Lassi, &stop.DeliveryOrder.Paneer, &stop.DeliveryOrder.Jaggery, &stop.DeliveryOrder.Khand,
 			&stop.DeliveryOrder.Oil, &stop.DeliveryOrder.Atta, &stop.DeliveryOrder.Burfi,
+			&stop.Status,
+			&stop.ActualOrder.Milk, &stop.ActualOrder.Curd, &stop.ActualOrder.Butter, &stop.ActualOrder.Ghee,
+			&stop.ActualOrder.Lassi, &stop.ActualOrder.Paneer, &stop.ActualOrder.Jaggery, &stop.ActualOrder.Khand,
+			&stop.ActualOrder.Oil, &stop.ActualOrder.Atta, &stop.ActualOrder.Burfi,
 		)
 		if err != nil {
-			http.Error(w, "Row scan error compiling manifest: "+err.Error(), http.StatusInternalServerError)
-			return
+			return manifest, err
 		}
-
-		// Skip this stop if every single product quantity is 0 (e.g., Vacation Pause)
-		if stop.DeliveryOrder.Milk == 0 && stop.DeliveryOrder.Curd == 0 &&
-			stop.DeliveryOrder.Butter == 0 && stop.DeliveryOrder.Ghee == 0 &&
-			stop.DeliveryOrder.Lassi == 0 && stop.DeliveryOrder.Paneer == 0 &&
-			stop.DeliveryOrder.Jaggery == 0 && stop.DeliveryOrder.Khand == 0 &&
-			stop.DeliveryOrder.Oil == 0 && stop.DeliveryOrder.Atta == 0 &&
-			stop.DeliveryOrder.Burfi == 0 {
+		if stop.DeliveryOrder.Milk == 0 && stop.DeliveryOrder.Curd == 0 && stop.DeliveryOrder.Butter == 0 && stop.DeliveryOrder.Ghee == 0 && stop.DeliveryOrder.Lassi == 0 && stop.DeliveryOrder.Paneer == 0 && stop.DeliveryOrder.Jaggery == 0 && stop.DeliveryOrder.Khand == 0 && stop.DeliveryOrder.Oil == 0 && stop.DeliveryOrder.Atta == 0 && stop.DeliveryOrder.Burfi == 0 {
 			continue
 		}
-
 		manifest.Stops = append(manifest.Stops, stop)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(manifest)
+	return manifest, nil
 }

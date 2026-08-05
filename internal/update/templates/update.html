@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Update Details — PGS Direct</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root {
+    --accent: #1a7a4c;
+    --accent-light: #e6f4ec;
+    --ink: #1c2321;
+    --ink-soft: #5c6a63;
+    --bg: #f9f9f9;
+    --card: #ffffff;
+    --border: #eaeaea;
+    --danger: #dc2626;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    padding-bottom: 40px;
+  }
+
+  header.hero {
+    background: linear-gradient(135deg, #1a7a4c, #0f4d30);
+    color: white;
+    padding: 24px 20px 32px;
+    text-align: center;
+    border-bottom-left-radius: 24px;
+    border-bottom-right-radius: 24px;
+  }
+  header.hero h1 { margin: 0 0 6px; font-size: 22px; font-weight: 700; }
+  header.hero p { margin: 0; opacity: 0.9; font-size: 14px; }
+
+  main { max-width: 600px; margin: -24px auto 0; padding: 0 16px; }
+
+  .card {
+    background: var(--card);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+    border: 1px solid var(--border);
+  }
+  .card h2 {
+    font-size: 15px; font-weight: 700; margin: 0 0 16px; color: var(--ink);
+    display: flex; align-items: center; gap: 8px; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--ink-soft); margin: 14px 0 6px; }
+  label:first-of-type { margin-top: 0; }
+  input[type="text"], input[type="date"], textarea {
+    width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 12px;
+    font-size: 15px; font-family: inherit; background: #fafafa; transition: 0.2s;
+  }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); background: white; box-shadow: 0 0 0 3px var(--accent-light); }
+  textarea { resize: vertical; min-height: 60px; }
+
+  /* MAP */
+  .map-wrapper { position: relative; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); margin-top: 8px; }
+  #map { height: 220px; width: 100%; }
+  .center-pin { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -100%); z-index: 1000; pointer-events: none; font-size: 32px; transition: transform 0.1s; }
+  .center-pin.dragging { transform: translate(-50%, -120%) scale(1.1); }
+  .map-toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+  .locate-btn { padding: 8px 12px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent-light); color: var(--accent); font-weight: 600; font-size: 12px; cursor: pointer; }
+
+  /* SCHEDULE */
+  .segmented { display: flex; background: #f0f1ef; border-radius: 12px; padding: 4px; gap: 4px; }
+  .segmented button { flex: 1; padding: 10px 4px; border: none; background: transparent; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--ink-soft); cursor: pointer; transition: 0.15s; }
+  .segmented button.active { background: white; color: var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .conditional { display: none; margin-top: 14px; }
+  .conditional.visible { display: block; animation: fadeIn 0.2s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
+
+  .days-row { display: flex; gap: 6px; margin-top: 8px; }
+  .day-toggle { flex: 1; aspect-ratio: 1; border-radius: 50%; border: 1px solid var(--border); background: white; font-size: 12px; font-weight: 700; color: var(--ink-soft); cursor: pointer; transition: 0.1s; }
+  .day-toggle.active { background: var(--accent); border-color: var(--accent); color: white; }
+
+  /* ITEMS (Clean UI) */
+  .items-list { display: flex; flex-direction: column; gap: 12px; }
+  .item-row { border: 1px solid var(--border); border-radius: 12px; padding: 14px; background: white; display: flex; align-items: center; justify-content: space-between; transition: 0.15s; }
+  .item-row.active { border-color: var(--accent); background: #fafdfb; }
+  .item-info { display: flex; align-items: center; gap: 10px; }
+  .item-info .emoji { font-size: 24px; }
+  .item-info .name { font-size: 15px; font-weight: 600; color: var(--ink); }
+
+  .btn-add { padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border); background: #fafafa; font-size: 13px; font-weight: 600; color: var(--ink); cursor: pointer; }
+  .stepper { display: none; align-items: center; gap: 10px; background: #f4f6f4; padding: 4px; border-radius: 10px; }
+  .stepper button { width: 32px; height: 32px; border-radius: 8px; border: none; background: white; color: var(--ink); font-size: 16px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+  .stepper .qty { font-size: 14px; font-weight: 700; min-width: 40px; text-align: center; color: var(--accent); }
+  .item-row.active .btn-add { display: none; }
+  .item-row.active .stepper { display: flex; }
+
+  /* BUTTONS & TOAST */
+  .submit-btn { width: 100%; padding: 16px; border: none; border-radius: 14px; background: var(--accent); color: white; font-size: 16px; font-weight: 700; cursor: pointer; box-shadow: 0 4px 6px rgba(26,122,76,0.2); transition: 0.1s; margin-top: 8px; }
+  .submit-btn:disabled { opacity: 0.6; }
+  .submit-btn:active { transform: scale(0.98); }
+
+  .loader { text-align: center; padding: 60px 20px; font-weight: 600; color: var(--ink-soft); }
+  .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-100px); background: var(--danger); color: white; padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 600; box-shadow: 0 8px 16px rgba(0,0,0,0.15); transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); z-index: 999; }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+  .success-screen { display: none; text-align: center; padding: 60px 20px; }
+  .success-screen .emoji { font-size: 48px; }
+</style>
+</head>
+<body>
+
+<div class="toast" id="toast"></div>
+
+<header class="hero">
+  <h1>✏️ Update Details</h1>
+  <p>Modify your profile or default subscription</p>
+</header>
+
+<main>
+  <div id="loader" class="loader">Loading your details...</div>
+
+  <div id="formRoot" style="display: none;">
+    <form id="updateForm">
+
+      <!-- PROFILE -->
+      <div class="card">
+        <h2>👤 Your Profile</h2>
+        <label for="name">Full name</label>
+        <input type="text" id="name" required />
+
+        <label for="address">House address</label>
+        <textarea id="address" required></textarea>
+
+        <label>Delivery Location</label>
+        <div class="map-wrapper">
+          <div id="map"></div>
+          <div class="center-pin" id="centerPin">📍</div>
+        </div>
+        <div class="map-toolbar">
+          <button type="button" class="locate-btn" id="locateBtn">📍 Center on Me</button>
+        </div>
+      </div>
+
+      <!-- SCHEDULE -->
+      <div class="card">
+        <h2>📅 Default Schedule</h2>
+        <div class="segmented" id="scheduleSegmented">
+          <button type="button" data-value="daily">Everyday</button>
+          <button type="button" data-value="alternate">Alternate Days</button>
+          <button type="button" data-value="custom">Custom Days</button>
+        </div>
+
+        <div class="conditional" id="alternateSection">
+          <label for="startDate">Start from</label>
+          <input type="date" id="startDate" />
+        </div>
+
+        <div class="conditional" id="customSection">
+          <label>Which days should we deliver?</label>
+          <div class="days-row" id="daysRow"></div>
+        </div>
+      </div>
+
+      <!-- ORDER -->
+      <div class="card">
+        <h2>🛒 Default Order</h2>
+        <div class="items-list" id="itemsList"></div>
+      </div>
+
+      <div style="text-align: center; font-size: 12px; color: var(--ink-soft); margin-bottom: 12px; padding: 0 10px;">
+        Note: Saving changes will temporarily pause your deliveries so our team can review your new details and assign a route.
+      </div>
+      <button type="submit" class="submit-btn" id="submitBtn">Save Changes</button>
+    </form>
+  </div>
+
+  <div class="success-screen" id="successScreen">
+    <div class="emoji">✅</div>
+    <h2>Updated Successfully!</h2>
+    <p style="color: var(--ink-soft); font-size: 14px;">Your details have been saved and your account is pending review. You can return to WhatsApp.</p>
+  </div>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const TOKEN = "{{.Token}}";
+
+  const ITEMS = [
+    { key: 'milkQuantity',    label: 'Milk',        emoji: '🥛', unit: 'L',  min: 500, step: 500 },
+    { key: 'curdQuantity',    label: 'Curd',        emoji: '🍶', unit: 'L',  min: 500, step: 500 },
+    { key: 'butterQuantity',  label: 'Butter',      emoji: '🧈', unit: 'kg', min: 250, step: 250 },
+    { key: 'gheeQuantity',    label: 'Desi Ghee',   emoji: '🫙', unit: 'kg', min: 250, step: 250 },
+    { key: 'lassiQuantity',   label: 'Buttermilk',  emoji: '🥤', unit: 'L',  min: 500, step: 500 },
+    { key: 'paneerQuantity',  label: 'Paneer',      emoji: '🧀', unit: 'kg', min: 250, step: 250 },
+    { key: 'jaggeryQuantity', label: 'Jaggery',     emoji: '🍯', unit: 'kg', min: 250, step: 250 },
+    { key: 'khandQuantity',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', min: 250, step: 250 },
+    { key: 'oilQuantity',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  min: 500, step: 500 },
+    { key: 'attaQuantity',    label: 'Atta',        emoji: '🌾', unit: 'kg', min: 250, step: 250 },
+    { key: 'burfiQuantity',   label: 'Milk Burfi',  emoji: '🍬', unit: 'kg', min: 250, step: 250 },
+  ];
+
+  let serverState = null;
+  const itemState = {};
+
+  // Maps & UI State
+  let map, selectedLat, selectedLng;
+  let scheduleType = 'daily';
+  const activeDays = new Set();
+
+  async function loadState() {
+    try {
+      const res = await fetch(`/update/state?token=${TOKEN}`);
+      if (!res.ok) throw new Error("Link expired. Please request a new one.");
+      serverState = await res.json();
+
+      document.getElementById('loader').style.display = 'none';
+      document.getElementById('formRoot').style.display = 'block';
+
+      initForm();
+      initMap();
+    } catch (e) {
+      document.getElementById('loader').textContent = e.message;
+    }
+  }
+
+  function formatQty(val, unit) {
+    if (val === 0) return "0";
+    if (unit === 'L') return val < 1000 ? `${val} ml` : `${parseFloat((val/1000).toFixed(2))} L`;
+    return val < 1000 ? `${val} g` : `${parseFloat((val/1000).toFixed(2))} kg`;
+  }
+
+  function initMap() {
+    selectedLat = parseFloat(serverState.latitude) || 28.6139;
+    selectedLng = parseFloat(serverState.longitude) || 77.2090;
+
+    map = L.map('map', { zoomControl: false }).setView([selectedLat, selectedLng], 15);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+    const centerPin = document.getElementById('centerPin');
+    map.on('movestart', () => centerPin.classList.add('dragging'));
+    map.on('moveend', () => {
+      centerPin.classList.remove('dragging');
+      selectedLat = map.getCenter().lat.toFixed(6);
+      selectedLng = map.getCenter().lng.toFixed(6);
+    });
+
+    document.getElementById('locateBtn').onclick = () => {
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(pos => {
+          map.flyTo([pos.coords.latitude, pos.coords.longitude], 16);
+        });
+      }
+    };
+    // Fix map rendering bug inside hidden div
+    setTimeout(() => map.invalidateSize(), 100);
+  }
+
+  function setScheduleType(type) {
+    scheduleType = type;
+    document.querySelectorAll('#scheduleSegmented button').forEach(b => {
+      b.classList.toggle('active', b.dataset.value === type);
+    });
+    document.getElementById('alternateSection').classList.toggle('visible', type === 'alternate');
+    document.getElementById('customSection').classList.toggle('visible', type === 'custom');
+  }
+
+  function initForm() {
+    // 1. Profile
+    document.getElementById('name').value = serverState.name;
+    document.getElementById('address').value = serverState.address;
+
+    // 2. Schedule
+    document.querySelectorAll('#scheduleSegmented button').forEach(btn => {
+      btn.onclick = () => setScheduleType(btn.dataset.value);
+    });
+    setScheduleType(serverState.scheduleType);
+
+    if (serverState.startDate) document.getElementById('startDate').value = serverState.startDate;
+
+    const dayLabels = ['S','M','T','W','T','F','S'];
+    const daysRow = document.getElementById('daysRow');
+    if (serverState.activeDays) serverState.activeDays.forEach(d => activeDays.add(d));
+
+    dayLabels.forEach((label, idx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'day-toggle';
+      if (activeDays.has(idx)) btn.classList.add('active');
+      btn.textContent = label;
+      btn.onclick = () => {
+        if (activeDays.has(idx)) { activeDays.delete(idx); btn.classList.remove('active'); }
+        else { activeDays.add(idx); btn.classList.add('active'); }
+      };
+      daysRow.appendChild(btn);
+    });
+
+    // 3. Items
+    const list = document.getElementById('itemsList');
+    ITEMS.forEach(item => {
+      itemState[item.key] = serverState.defaultOrder[item.key] || 0;
+
+      const row = document.createElement('div');
+      row.className = 'item-row';
+      if (itemState[item.key] > 0) row.classList.add('active');
+
+      row.innerHTML = `
+        <div class="item-info">
+          <span class="emoji">${item.emoji}</span>
+          <span class="name">${item.label}</span>
+        </div>
+        <button type="button" class="btn-add">+ Add</button>
+        <div class="stepper">
+          <button type="button" class="dec">−</button>
+          <span class="qty">${formatQty(itemState[item.key], item.unit)}</span>
+          <button type="button" class="inc">+</button>
+        </div>
+      `;
+
+      const qtyDisplay = row.querySelector('.qty');
+
+      function updateItemUI(val) {
+        itemState[item.key] = val;
+        qtyDisplay.textContent = formatQty(val, item.unit);
+        if (val > 0) row.classList.add('active');
+        else row.classList.remove('active');
+      }
+
+      row.querySelector('.btn-add').onclick = () => updateItemUI(item.min);
+      row.querySelector('.dec').onclick = () => {
+        const next = itemState[item.key] - item.step;
+        updateItemUI(next >= item.min ? next : 0);
+      };
+      row.querySelector('.inc').onclick = () => {
+        const current = itemState[item.key];
+        const jump = current >= 5000 ? (item.unit === 'L' ? 1000 : 500) : item.step;
+        updateItemUI(current === 0 ? item.min : current + jump);
+      };
+
+      list.appendChild(row);
+    });
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 3000);
+  }
+
+  document.getElementById('updateForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const name = document.getElementById('name').value.trim();
+    const address = document.getElementById('address').value.trim();
+    const totalQty = Object.values(itemState).reduce((a, b) => a + b, 0);
+
+    if (totalQty <= 0) return showToast("Please select at least one item.");
+    if (scheduleType === 'custom' && activeDays.size === 0) return showToast("Select at least one delivery day.");
+    if (scheduleType === 'alternate' && !document.getElementById('startDate').value) return showToast("Choose a start date.");
+
+    const payload = {
+      token: TOKEN,
+      name: name,
+      address: address,
+      latitude: String(selectedLat),
+      longitude: String(selectedLng),
+      scheduleType: scheduleType,
+      activeDays: Array.from(activeDays),
+      startDate: document.getElementById('startDate').value,
+      items: itemState,
+    };
+
+    const submitBtn = document.getElementById('submitBtn');
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Saving...";
+
+    try {
+      const res = await fetch('/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) throw new Error(await res.text());
+
+      document.getElementById('formRoot').style.display = 'none';
+      document.getElementById('successScreen').style.display = 'block';
+      window.scrollTo(0,0);
+    } catch (err) {
+      showToast(err.message || "Error saving details.");
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Save Changes";
+    }
+  });
+
+  loadState();
+</script>
+</body>
+</html>

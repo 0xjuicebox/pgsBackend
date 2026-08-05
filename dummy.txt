@@ -1,0 +1,59 @@
+package notification
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/twilio/twilio-go"
+	openapi "github.com/twilio/twilio-go/rest/api/v2010"
+)
+
+type WhatsAppService struct {
+	client    *twilio.RestClient
+	fromPhone string
+}
+
+func NewWhatsAppService() *WhatsAppService {
+	// The client automatically reads TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN from your .env
+	return &WhatsAppService{
+		client:    twilio.NewRestClient(),
+		fromPhone: os.Getenv("TWILIO_WHATSAPP_NUMBER"),
+	}
+}
+
+func (s *WhatsAppService) SendDeliveryUpdate(toPhone string, messageBody string) error {
+	// 1. Format the recipient's phone number
+	// Twilio requires the format "whatsapp:+919999900000"
+	toPhone = strings.ReplaceAll(toPhone, " ", "")
+	if !strings.HasPrefix(toPhone, "+91") {
+		toPhone = "+91" + toPhone
+	}
+	if !strings.HasPrefix(toPhone, "whatsapp:") {
+		toPhone = "whatsapp:" + toPhone
+	}
+
+	// 2. Format the sender's phone number
+	fromPhone := s.fromPhone
+	if !strings.HasPrefix(fromPhone, "whatsapp:") {
+		fromPhone = "whatsapp:" + fromPhone
+	}
+
+	// 3. Build the payload
+	params := &openapi.CreateMessageParams{}
+	params.SetTo(toPhone)
+	params.SetFrom(fromPhone)
+	params.SetBody(messageBody)
+
+	// 4. Send it!
+	resp, err := s.client.Api.CreateMessage(params)
+	if err != nil {
+		return fmt.Errorf("twilio failure: %w", err)
+	}
+
+	if resp.Sid != nil {
+		fmt.Printf("✅ WhatsApp alert sent successfully! SID: %s\n", *resp.Sid)
+	}
+
+	return nil
+}

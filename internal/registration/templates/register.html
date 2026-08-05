@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Register — PGS Direct</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root {
+    --accent: #1a7a4c;
+    --accent-light: #e6f4ec;
+    --ink: #1c2321;
+    --ink-soft: #5c6a63;
+    --bg: #f7f8f6;
+    --card: #ffffff;
+    --border: #e3e7e3;
+    --danger: #c0392b;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  header.hero {
+    background: linear-gradient(135deg, #1a7a4c, #0f4d30);
+    color: white;
+    padding: 36px 20px 44px;
+    text-align: center;
+  }
+  header.hero h1 { margin: 0 0 6px; font-size: 24px; }
+  header.hero p { margin: 0; opacity: 0.85; font-size: 14px; }
+  main {
+    max-width: 580px;
+    margin: -24px auto 40px;
+    padding: 0 16px;
+  }
+  .card {
+    background: var(--card);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    border: 1px solid var(--border);
+  }
+  .card h2 {
+    font-size: 15px;
+    margin: 0 0 14px;
+    color: var(--ink);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card h2 .step-num {
+    background: var(--accent);
+    color: white;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 600;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-soft);
+    margin: 14px 0 6px;
+  }
+  label:first-of-type { margin-top: 0; }
+  input[type="text"], input[type="date"], textarea {
+    width: 100%;
+    padding: 11px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 15px;
+    font-family: inherit;
+    background: #fcfdfc;
+  }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  textarea { resize: vertical; min-height: 60px; }
+
+  /* --- FIXED CENTER PIN MAP STYLES --- */
+  .map-wrapper {
+    position: relative;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    margin-top: 8px;
+  }
+  #map { height: 240px; width: 100%; }
+  .center-pin {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -100%);
+    z-index: 1000;
+    pointer-events: none;
+    font-size: 32px;
+    filter: drop-shadow(0 4px 6px rgba(0,0,0,0.3));
+    transition: transform 0.1s;
+  }
+  .center-pin.dragging {
+    transform: translate(-50%, -120%) scale(1.1);
+  }
+  .center-shadow {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 10px;
+    height: 6px;
+    background: rgba(0,0,0,0.25);
+    border-radius: 50%;
+    z-index: 999;
+    pointer-events: none;
+  }
+  .map-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+  .locate-btn {
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    background: var(--accent-light);
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .locate-btn:active { opacity: 0.8; }
+
+  /* --- SCHEDULE SEGMENTED CONTROL --- */
+  .segmented {
+    display: flex;
+    background: #f0f1ef;
+    border-radius: 10px;
+    padding: 4px;
+    gap: 4px;
+  }
+  .segmented button {
+    flex: 1;
+    padding: 9px 4px;
+    border: none;
+    background: transparent;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-soft);
+    cursor: pointer;
+  }
+  .segmented button.active { background: white; color: var(--accent); box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+  .conditional { display: none; margin-top: 14px; }
+  .conditional.visible { display: block; }
+  .days-row { display: flex; gap: 6px; margin-top: 6px; }
+  .day-toggle {
+    flex: 1;
+    aspect-ratio: 1;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: white;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--ink-soft);
+    cursor: pointer;
+  }
+  .day-toggle.active { background: var(--accent); border-color: var(--accent); color: white; }
+
+  /* --- ITEM CARDS --- */
+  .items-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .item-row {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    background: white;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .item-row.selected {
+    border-color: var(--accent);
+    background: #fafdfb;
+  }
+  .item-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .item-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .item-title .emoji { font-size: 26px; }
+  .item-title .name { font-size: 15px; font-weight: 600; color: var(--ink); }
+  .item-title .unit-tag {
+    font-size: 11px;
+    background: #eef1ef;
+    color: var(--ink-soft);
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-weight: 600;
+  }
+  .add-init-btn {
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    background: white;
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .add-init-btn:hover { background: var(--accent-light); }
+
+  /* --- SMART STEPPER --- */
+  .stepper-wrap {
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .item-row.selected .stepper-wrap { display: flex; }
+  .stepper-main {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .qty-display {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .stepper-buttons {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .stepper-buttons button {
+    height: 34px;
+    padding: 0 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: white;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .stepper-buttons button.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: white;
+  }
+  .stepper-buttons button.fine {
+    font-size: 12px;
+    color: var(--accent);
+    border-color: var(--accent-light);
+    background: var(--accent-light);
+  }
+
+  /* --- PRESET CHIPS --- */
+  .presets-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .preset-chip {
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: #f4f6f4;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink-soft);
+    cursor: pointer;
+  }
+  .preset-chip.active {
+    background: var(--accent-light);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* --- NOTIFICATIONS --- */
+  .error-banner {
+    display: none;
+    background: #fdecea;
+    color: var(--danger);
+    border: 1px solid #f5c6c1;
+    padding: 10px 12px;
+    border-radius: 10px;
+    font-size: 13px;
+    margin-bottom: 14px;
+  }
+  .error-banner.visible { display: block; }
+  .submit-btn {
+    width: 100%;
+    padding: 15px;
+    border: none;
+    border-radius: 12px;
+    background: var(--accent);
+    color: white;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .submit-btn:disabled { opacity: 0.6; }
+  .success-screen {
+    display: none;
+    text-align: center;
+    padding: 60px 20px;
+  }
+  .success-screen.visible { display: block; }
+  .success-screen .emoji { font-size: 48px; }
+  .success-screen h2 { margin: 12px 0 8px; }
+  .success-screen p { color: var(--ink-soft); font-size: 14px; }
+  #formRoot.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>🥛 PGS Direct</h1>
+  <p>Complete your registration in a couple of minutes</p>
+</header>
+
+<main>
+  <div id="errorBanner" class="error-banner"></div>
+
+  <div id="formRoot">
+    <form id="registerForm">
+
+      <div class="card">
+        <h2><span class="step-num">1</span> Your Details</h2>
+        <label for="name">Full name</label>
+        <input type="text" id="name" required placeholder="e.g. Priya Sharma" />
+
+        <label for="address">House address</label>
+        <textarea id="address" required placeholder="Flat / house no., street, landmark"></textarea>
+
+        <label>Drag map to position pin at your door</label>
+        <div class="map-wrapper">
+          <div id="map"></div>
+          <div class="center-shadow"></div>
+          <div class="center-pin" id="centerPin">📍</div>
+        </div>
+        <div class="map-toolbar">
+          <span id="coordsDisplay">Positioning...</span>
+          <button type="button" class="locate-btn" id="locateBtn">📍 Center on Me</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="step-num">2</span> Delivery Schedule</h2>
+        <div class="segmented" id="scheduleSegmented">
+          <button type="button" data-value="daily" class="active">Everyday</button>
+          <button type="button" data-value="alternate">Alternate Days</button>
+          <button type="button" data-value="custom">Custom Days</button>
+        </div>
+
+        <div class="conditional" id="alternateSection">
+          <label for="startDate">Start from</label>
+          <input type="date" id="startDate" />
+        </div>
+
+        <div class="conditional" id="customSection">
+          <label>Which days should we deliver?</label>
+          <div class="days-row" id="daysRow"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="step-num">3</span> Your Order</h2>
+        <p style="font-size:13px; color:var(--ink-soft); margin-top:-6px; margin-bottom:14px;">
+          Select items and set your daily quantities.
+        </p>
+        <div class="items-list" id="itemsList"></div>
+      </div>
+
+      <button type="submit" class="submit-btn" id="submitBtn">Complete Registration</button>
+    </form>
+  </div>
+
+  <div class="success-screen" id="successScreen">
+    <div class="emoji">✅</div>
+    <h2>Registration received!</h2>
+    <p>Head back to WhatsApp — we've sent a confirmation there, and our team will follow up once your delivery route is confirmed.</p>
+  </div>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const TOKEN = "{{.Token}}";
+
+  // --- 1. FIXED CENTER-PIN MAP SETUP ---
+  const DEFAULT_LAT = 28.6139, DEFAULT_LNG = 77.2090;
+  const map = L.map('map', { zoomControl: false }).setView([DEFAULT_LAT, DEFAULT_LNG], 14);
+  L.control.zoom({ position: 'topright' }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  let selectedLat = DEFAULT_LAT, selectedLng = DEFAULT_LNG;
+  const coordsDisplay = document.getElementById('coordsDisplay');
+  const centerPin = document.getElementById('centerPin');
+
+  function updateCoordinates() {
+    const center = map.getCenter();
+    selectedLat = center.lat.toFixed(6);
+    selectedLng = center.lng.toFixed(6);
+    coordsDisplay.textContent = `Pin: ${selectedLat}, ${selectedLng}`;
+  }
+
+  map.on('movestart', () => centerPin.classList.add('dragging'));
+  map.on('move', updateCoordinates);
+  map.on('moveend', () => {
+    centerPin.classList.remove('dragging');
+    updateCoordinates();
+  });
+  updateCoordinates();
+
+  document.getElementById('locateBtn').addEventListener('click', () => {
+    if (!navigator.geolocation) {
+      showError("Location access not supported. Please pan the map manually.");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        map.flyTo([pos.coords.latitude, pos.coords.longitude], 16, { duration: 1 });
+      },
+      () => showError("Couldn't access your location. Please pan the map manually.")
+    );
+  });
+
+  // --- 2. SCHEDULE CONFIGURATION ---
+  const scheduleButtons = document.querySelectorAll('#scheduleSegmented button');
+  let scheduleType = 'daily';
+  scheduleButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      scheduleButtons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      scheduleType = btn.dataset.value;
+      document.getElementById('alternateSection').classList.toggle('visible', scheduleType === 'alternate');
+      document.getElementById('customSection').classList.toggle('visible', scheduleType === 'custom');
+    });
+  });
+
+  const dayLabels = ['S','M','T','W','T','F','S'];
+  const activeDays = new Set();
+  const daysRow = document.getElementById('daysRow');
+  dayLabels.forEach((label, idx) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'day-toggle';
+    btn.textContent = label;
+    btn.addEventListener('click', () => {
+      if (activeDays.has(idx)) { activeDays.delete(idx); btn.classList.remove('active'); }
+      else { activeDays.add(idx); btn.classList.add('active'); }
+    });
+    daysRow.appendChild(btn);
+  });
+
+  // --- 3. ITEMS & SMART STEPPER CONFIGURATION ---
+  // All quantities are processed in BASE UNITS (ml for L, g for kg)
+  const ITEMS = [
+    { key: 'milk',    label: 'Milk',        emoji: '🥛', unit: 'L',  min: 500, max: 10000, step: 500, presets: [500, 1000, 2000, 5000] },
+    { key: 'curd',    label: 'Curd',        emoji: '🍶', unit: 'L',  min: 500, max: 10000, step: 500, presets: [500, 1000, 2000, 5000] },
+    { key: 'butter',  label: 'Butter',      emoji: '🧈', unit: 'kg', min: 250, max: 20000, step: 250, presets: [250, 500, 1000, 5000] },
+    { key: 'ghee',    label: 'Desi Ghee',  emoji: '🫙', unit: 'kg', min: 250, max: 20000, step: 250, presets: [250, 500, 1000, 5000] },
+    { key: 'lassi',   label: 'Buttermilk', emoji: '🥤', unit: 'L',  min: 500, max: 10000, step: 500, presets: [500, 1000, 2000, 5000] },
+    { key: 'paneer',  label: 'Paneer',      emoji: '🧀', unit: 'kg', min: 250, max: 10000, step: 250, presets: [250, 500, 1000, 5000] },
+    { key: 'jaggery', label: 'Jaggery',    emoji: '🍯', unit: 'kg', min: 250, max: 20000, step: 250, presets: [250, 500, 1000, 5000] },
+    { key: 'khand',   label: 'Desi Khand', emoji: '🍚', unit: 'kg', min: 250, max: 20000, step: 250, presets: [250, 500, 1000, 5000] },
+    { key: 'oil',     label: 'Mustard Oil',emoji: '🫗', unit: 'L',  min: 500, max: 20000, step: 500, presets: [500, 1000, 2000, 5000] },
+    { key: 'atta',    label: 'Atta',        emoji: '🌾', unit: 'kg', min: 250, max: 20000, step: 250, presets: [1000, 5000, 10000, 20000] },
+    { key: 'burfi',   label: 'Milk Burfi', emoji: '🍬', unit: 'kg', min: 250, max: 20000, step: 250, presets: [250, 500, 1000, 2000] },
+  ];
+
+  const itemState = {}; // Stores base unit integer (ml or g)
+  const itemsList = document.getElementById('itemsList');
+
+  // Formats base units to readable strings (500 -> "500 ml", 1500 -> "1.5 L")
+  function formatQty(val, unit) {
+    if (val === 0) return "0";
+    if (unit === 'L') {
+      return val < 1000 ? `${val} ml` : `${parseFloat((val/1000).toFixed(2))} L`;
+    }
+    return val < 1000 ? `${val} g` : `${parseFloat((val/1000).toFixed(2))} kg`;
+  }
+
+  ITEMS.forEach(item => {
+    itemState[item.key] = 0;
+    const row = document.createElement('div');
+    row.className = 'item-row';
+
+    // Generate Preset Chips HTML
+    const presetsHTML = item.presets.map(p =>
+      `<button type="button" class="preset-chip" data-preset="${p}">${formatQty(p, item.unit)}</button>`
+    ).join('');
+
+    row.innerHTML = `
+      <div class="item-header">
+        <div class="item-title">
+          <span class="emoji">${item.emoji}</span>
+          <span class="name">${item.label}</span>
+          <span class="unit-tag">min ${formatQty(item.min, item.unit)}</span>
+        </div>
+        <button type="button" class="add-init-btn">+ Add</button>
+      </div>
+      <div class="stepper-wrap">
+        <div class="stepper-main">
+          <span class="qty-display">0</span>
+          <div class="stepper-buttons">
+            <button type="button" class="dec">−</button>
+            <button type="button" class="fine" title="Fine step +${formatQty(item.step, item.unit)}">+¼</button>
+            <button type="button" class="primary inc">+</button>
+          </div>
+        </div>
+        <div class="presets-row">${presetsHTML}</div>
+      </div>
+    `;
+
+    const addBtn = row.querySelector('.add-init-btn');
+    const qtyDisplay = row.querySelector('.qty-display');
+    const presetChips = row.querySelectorAll('.preset-chip');
+
+    function updateView(val) {
+      itemState[item.key] = val;
+      if (val > 0) {
+        row.classList.add('selected');
+        addBtn.style.display = 'none';
+        qtyDisplay.textContent = formatQty(val, item.unit);
+      } else {
+        row.classList.remove('selected');
+        addBtn.style.display = 'inline-block';
+      }
+      presetChips.forEach(chip => {
+        const isMatch = parseInt(chip.dataset.preset, 10) === val;
+        chip.classList.toggle('active', isMatch);
+      });
+    }
+
+    addBtn.addEventListener('click', () => updateView(item.min));
+
+    // Minimum Step Decrement
+    row.querySelector('.dec').addEventListener('click', () => {
+      const next = itemState[item.key] - item.step;
+      updateView(next >= item.min ? next : 0);
+    });
+
+    // Smart Increment: Steps by min step below 5kg/5L, steps by 500g/1000ml above 5kg/5L
+    row.querySelector('.inc').addEventListener('click', () => {
+      const current = itemState[item.key];
+      const jump = (current >= 5000) ? (item.unit === 'L' ? 1000 : 500) : item.step;
+      const next = Math.min(item.max, current + jump);
+      updateView(next);
+    });
+
+    // Fine-Tune Increment (+0.25 kg / +500 ml)
+    row.querySelector('.fine').addEventListener('click', () => {
+      const next = Math.min(item.max, itemState[item.key] + item.step);
+      updateView(next);
+    });
+
+    // Preset Chip Click
+    presetChips.forEach(chip => {
+      chip.addEventListener('click', () => {
+        updateView(parseInt(chip.dataset.preset, 10));
+      });
+    });
+
+    itemsList.appendChild(row);
+  });
+
+  // --- 4. FORM SUBMISSION ---
+  function showError(msg) {
+    const banner = document.getElementById('errorBanner');
+    banner.textContent = msg;
+    banner.classList.add('visible');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  function clearError() {
+    document.getElementById('errorBanner').classList.remove('visible');
+  }
+
+  document.getElementById('registerForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearError();
+
+    const name = document.getElementById('name').value.trim();
+    const address = document.getElementById('address').value.trim();
+    const totalQty = Object.values(itemState).reduce((a, b) => a + b, 0);
+
+    if (!name || !address) {
+      showError("Please fill in your name and address.");
+      return;
+    }
+    if (totalQty <= 0) {
+      showError("Please select at least one item for your order.");
+      return;
+    }
+    if (scheduleType === 'custom' && activeDays.size === 0) {
+      showError("Please select at least one delivery day.");
+      return;
+    }
+    if (scheduleType === 'alternate' && !document.getElementById('startDate').value) {
+      showError("Please choose a start date for alternate-day delivery.");
+      return;
+    }
+
+    const payload = {
+      token: TOKEN,
+      name: name,
+      address: address,
+      latitude: String(selectedLat),
+      longitude: String(selectedLng),
+      scheduleType: scheduleType,
+      activeDays: Array.from(activeDays),
+      startDate: document.getElementById('startDate').value,
+      items: itemState, // Passes integer base units (ml / grams) directly to Go backend
+    };
+
+    const submitBtn = document.getElementById('submitBtn');
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Submitting...";
+
+    try {
+      const res = await fetch(window.location.pathname, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || 'Something went wrong. Please try again.');
+      }
+
+      document.getElementById('formRoot').classList.add('hidden');
+      document.getElementById('successScreen').classList.add('visible');
+    } catch (err) {
+      showError(err.message || "Something went wrong. Please try again.");
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Complete Registration";
+    }
+  });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Manage Deliveries — PGS Direct</title>
+<style>
+  :root {
+    --accent: #1a7a4c;
+    --accent-light: #e6f4ec;
+    --ink: #1c2321;
+    --ink-soft: #5c6a63;
+    --bg: #f9f9f9;
+    --card: #ffffff;
+    --border: #eaeaea;
+    --danger: #dc2626;
+    --danger-light: #fef2f2;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    padding-bottom: 100px; /* Space for bottom bar */
+  }
+
+  /* --- HEADER --- */
+  header {
+    background: var(--card);
+    padding: 20px 20px 16px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { margin: 0 0 4px; font-size: 20px; font-weight: 700; }
+  header p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+
+  /* --- CALENDAR SCROLLER --- */
+  .date-scroller {
+    display: flex;
+    gap: 12px;
+    overflow-x: auto;
+    padding: 20px 16px;
+    scrollbar-width: none;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+  }
+  .date-scroller::-webkit-scrollbar { display: none; }
+
+  .date-pill {
+    flex: 0 0 68px;
+    padding: 12px 0;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    cursor: pointer;
+    transition: 0.15s;
+    user-select: none;
+  }
+  .date-pill.disabled { opacity: 0.4; cursor: not-allowed; background: var(--bg); }
+  .date-pill.selected { background: var(--accent); border-color: var(--accent); color: white; }
+
+  .date-pill .day { font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 4px; color: var(--ink-soft); }
+  .date-pill.selected .day { color: rgba(255,255,255,0.8); }
+  .date-pill .num { font-size: 20px; font-weight: 700; }
+
+  /* Status Indicators */
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 6px; }
+  .status-custom { background: var(--warning, #d97706); }
+  .status-paused { background: var(--danger); }
+  .date-pill.selected .status-dot { background: white; }
+
+  /* --- CONTENT AREA --- */
+  main { max-width: 600px; margin: 0 auto; padding: 20px 16px; }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--ink-soft);
+  }
+  .empty-state .icon { font-size: 48px; margin-bottom: 16px; display: block; }
+  .empty-state h3 { margin: 0 0 8px; font-size: 18px; color: var(--ink); }
+
+  .editor-section { display: none; animation: fadeIn 0.2s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+
+  .editor-header { font-size: 14px; font-weight: 700; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 16px; letter-spacing: 0.5px; }
+
+  /* Big Action Buttons */
+  .action-btn {
+    width: 100%; padding: 16px; border-radius: 14px; border: none;
+    font-size: 16px; font-weight: 700; margin-bottom: 12px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    transition: 0.1s;
+  }
+  .action-btn:active { transform: scale(0.98); }
+  .action-pause { background: var(--danger-light); color: var(--danger); border: 1px solid #fecaca; }
+  .action-reset { background: white; color: var(--ink); border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+
+  /* Clean Item List */
+  .items-list {
+    background: white;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    overflow: hidden;
+    margin-top: 24px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+  }
+  .item-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px; border-bottom: 1px solid var(--border);
+  }
+  .item-row:last-child { border-bottom: none; }
+
+  .item-info { display: flex; align-items: center; gap: 12px; }
+  .item-info .emoji { font-size: 24px; }
+  .item-info .name { font-size: 15px; font-weight: 600; color: var(--ink); }
+
+  .btn-add {
+    padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border);
+    background: var(--bg); font-size: 14px; font-weight: 600; color: var(--ink);
+    cursor: pointer;
+  }
+
+  .stepper { display: none; align-items: center; gap: 12px; }
+  .stepper button {
+    width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--accent);
+    background: white; color: var(--accent); font-size: 18px; font-weight: 600;
+    line-height: 1; cursor: pointer;
+  }
+  .stepper button:active { background: var(--accent-light); }
+  .stepper .qty { font-size: 15px; font-weight: 700; min-width: 44px; text-align: center; }
+
+  /* Show stepper, hide add btn when active */
+  .item-row.active .btn-add { display: none; }
+  .item-row.active .stepper { display: flex; }
+
+  /* --- BOTTOM BAR --- */
+  .bottom-bar {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: white; border-top: 1px solid var(--border);
+    padding: 16px 20px; box-shadow: 0 -4px 12px rgba(0,0,0,0.05);
+    display: none; align-items: center; justify-content: space-between; gap: 16px;
+    z-index: 100;
+  }
+  .bottom-summary { font-size: 13px; font-weight: 600; color: var(--ink-soft); line-height: 1.4; flex: 1; }
+  .bottom-summary strong { color: var(--ink); display: block; font-size: 16px; margin-bottom: 2px; }
+  .btn-primary {
+    background: var(--accent); color: white; border: none; border-radius: 24px;
+    padding: 14px 28px; font-size: 15px; font-weight: 700; cursor: pointer;
+  }
+  .btn-primary:disabled { opacity: 0.6; }
+
+  .toast {
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-100px);
+    background: #1c2321; color: white; padding: 12px 24px; border-radius: 30px;
+    font-size: 14px; font-weight: 600; box-shadow: 0 8px 16px rgba(0,0,0,0.15);
+    transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); z-index: 999;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+
+<div class="toast" id="toast">✅ Changes saved!</div>
+
+<header>
+  <h1>Manage Deliveries</h1>
+  <p>Modify or pause your upcoming orders</p>
+</header>
+
+<div class="date-scroller" id="dateScroller"></div>
+
+<main>
+  <div id="emptyState" class="empty-state">
+    <span class="icon">👆</span>
+    <h3>Select dates to edit</h3>
+    <p>Tap one or multiple dates above to view or change your schedule.</p>
+  </div>
+
+  <div id="editorSection" class="editor-section">
+    <div class="editor-header" id="editorTitle">Editing 1 Date</div>
+
+    <button class="action-btn action-pause" onclick="pauseSelected()">
+      ⏸️ Pause Delivery
+    </button>
+    <button class="action-btn action-reset" onclick="submitAction('delete')" id="btnReset">
+      🔄 Revert to Default Order
+    </button>
+
+    <div class="items-list" id="itemsList"></div>
+  </div>
+</main>
+
+<div class="bottom-bar" id="bottomBar">
+  <div class="bottom-summary" id="bottomSummary">
+    <strong>Review Changes</strong>
+    To 1 date
+  </div>
+  <button class="btn-primary" id="btnApply" onclick="submitAction('set')">Save</button>
+</div>
+
+<script>
+  const TOKEN = "{{.Token}}";
+
+  const ITEMS = [
+    { key: 'milkQuantity',    label: 'Milk',        emoji: '🥛', unit: 'L',  min: 500, step: 500 },
+    { key: 'curdQuantity',    label: 'Curd',        emoji: '🍶', unit: 'L',  min: 500, step: 500 },
+    { key: 'butterQuantity',  label: 'Butter',      emoji: '🧈', unit: 'kg', min: 250, step: 250 },
+    { key: 'gheeQuantity',    label: 'Desi Ghee',   emoji: '🫙', unit: 'kg', min: 250, step: 250 },
+    { key: 'lassiQuantity',   label: 'Buttermilk',  emoji: '🥤', unit: 'L',  min: 500, step: 500 },
+    { key: 'paneerQuantity',  label: 'Paneer',      emoji: '🧀', unit: 'kg', min: 250, step: 250 },
+    { key: 'jaggeryQuantity', label: 'Jaggery',     emoji: '🍯', unit: 'kg', min: 250, step: 250 },
+    { key: 'khandQuantity',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', min: 250, step: 250 },
+    { key: 'oilQuantity',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  min: 500, step: 500 },
+    { key: 'attaQuantity',    label: 'Atta',        emoji: '🌾', unit: 'kg', min: 250, step: 250 },
+    { key: 'burfiQuantity',   label: 'Milk Burfi',  emoji: '🍬', unit: 'kg', min: 250, step: 250 },
+  ];
+
+  let serverState = null;
+  let selectedDates = new Set();
+  const currentEditorState = {};
+
+  async function loadState() {
+    try {
+      const res = await fetch(`/override/state?token=${TOKEN}`);
+      if (!res.ok) throw new Error();
+      serverState = await res.json();
+      buildCalendar();
+      buildEditorItems();
+      syncEditor();
+    } catch (e) {
+      document.body.innerHTML = '<div style="padding:40px;text-align:center;">Link expired. Please request a new one on WhatsApp.</div>';
+    }
+  }
+
+  function formatQty(val, unit) {
+    if (val === 0) return "0";
+    if (unit === 'L') return val < 1000 ? `${val} ml` : `${parseFloat((val/1000).toFixed(2))} L`;
+    return val < 1000 ? `${val} g` : `${parseFloat((val/1000).toFixed(2))} kg`;
+  }
+
+  function getISTTime() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
+
+  function calculateTotalQty(orderObj) {
+    if (!orderObj) return 0;
+    return Object.values(orderObj).reduce((sum, val) => sum + (val || 0), 0);
+  }
+
+  // --- CALENDAR LOGIC ---
+  function buildCalendar() {
+    const scroller = document.getElementById('dateScroller');
+    scroller.innerHTML = '';
+    const today = getISTTime();
+    const cutoffPassed = today.getHours() >= 3;
+
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(today);
+      d.setDate(today.getDate() + i);
+      const dateStr = [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-');
+
+      const card = document.createElement('div');
+      card.className = 'date-pill';
+
+      let statusClass = '';
+      if (serverState.overrides[dateStr]) {
+        statusClass = calculateTotalQty(serverState.overrides[dateStr]) === 0 ? 'status-paused' : 'status-custom';
+      }
+
+      if (i === 0 && cutoffPassed) card.classList.add('disabled');
+      if (selectedDates.has(dateStr)) card.classList.add('selected');
+
+      card.innerHTML = `
+        <div class="day">${i===0 ? 'TODAY' : d.toLocaleDateString('en-US', {weekday:'short'})}</div>
+        <div class="num">${d.getDate()}</div>
+        ${statusClass ? `<div class="status-dot ${statusClass}"></div>` : ''}
+      `;
+
+      card.addEventListener('click', () => {
+        if (card.classList.contains('disabled')) return showToast("Cannot edit today's order after 3:00 AM.");
+
+        if (selectedDates.has(dateStr)) selectedDates.delete(dateStr);
+        else selectedDates.add(dateStr);
+
+        buildCalendar(); // Cheap re-render to update classes
+        syncEditor();
+      });
+
+      scroller.appendChild(card);
+    }
+  }
+
+  // --- EDITOR UI LOGIC ---
+  function buildEditorItems() {
+    const list = document.getElementById('itemsList');
+    list.innerHTML = '';
+
+    ITEMS.forEach(item => {
+      currentEditorState[item.key] = 0;
+
+      const row = document.createElement('div');
+      row.className = 'item-row';
+      row.id = `row-${item.key}`;
+
+      row.innerHTML = `
+        <div class="item-info">
+          <span class="emoji">${item.emoji}</span>
+          <span class="name">${item.label}</span>
+        </div>
+        <button type="button" class="btn-add">+ Add</button>
+        <div class="stepper">
+          <button type="button" class="dec">−</button>
+          <span class="qty">0</span>
+          <button type="button" class="inc">+</button>
+        </div>
+      `;
+
+      const qtyDisplay = row.querySelector('.qty');
+
+      function updateItemUI(val) {
+        currentEditorState[item.key] = val;
+        qtyDisplay.textContent = formatQty(val, item.unit);
+        if (val > 0) row.classList.add('active');
+        else row.classList.remove('active');
+      }
+
+      row.querySelector('.btn-add').onclick = () => updateItemUI(item.min);
+      row.querySelector('.dec').onclick = () => {
+        const next = currentEditorState[item.key] - item.step;
+        updateItemUI(next >= item.min ? next : 0);
+      };
+      row.querySelector('.inc').onclick = () => {
+        const current = currentEditorState[item.key];
+        const jump = current >= 5000 ? (item.unit === 'L' ? 1000 : 500) : item.step;
+        updateItemUI(current === 0 ? item.min : current + jump);
+      };
+
+      row.updateRaw = updateItemUI;
+      list.appendChild(row);
+    });
+  }
+
+  function syncEditor() {
+    const emptyState = document.getElementById('emptyState');
+    const editor = document.getElementById('editorSection');
+    const bottomBar = document.getElementById('bottomBar');
+
+    if (selectedDates.size === 0) {
+      emptyState.style.display = 'block';
+      editor.style.display = 'none';
+      bottomBar.style.display = 'none';
+      return;
+    }
+
+    emptyState.style.display = 'none';
+    editor.style.display = 'block';
+    bottomBar.style.display = 'flex';
+
+    const isSingle = selectedDates.size === 1;
+    document.getElementById('editorTitle').textContent = isSingle ? "Editing 1 Date" : `Editing ${selectedDates.size} Dates`;
+    document.getElementById('bottomSummary').innerHTML = `<strong>Review Changes</strong>Applying to ${selectedDates.size} date(s)`;
+
+    let allHaveOverrides = true;
+    selectedDates.forEach(date => { if (!serverState.overrides[date]) allHaveOverrides = false; });
+    document.getElementById('btnReset').style.display = allHaveOverrides ? 'flex' : 'none';
+
+    let dataSource = serverState.defaultOrder;
+    if (isSingle) {
+      const singleDate = Array.from(selectedDates)[0];
+      if (serverState.overrides[singleDate]) dataSource = serverState.overrides[singleDate];
+    }
+
+    ITEMS.forEach(item => {
+      document.getElementById(`row-${item.key}`).updateRaw(dataSource[item.key] || 0);
+    });
+  }
+
+  // --- ACTIONS ---
+  function pauseSelected() {
+    ITEMS.forEach(item => document.getElementById(`row-${item.key}`).updateRaw(0));
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 3000);
+  }
+
+  async function submitAction(action) {
+    const payload = {
+      token: TOKEN,
+      dates: Array.from(selectedDates),
+      action: action,
+      items: currentEditorState
+    };
+
+    const btn = document.getElementById('btnApply');
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+
+    try {
+      const res = await fetch('/override', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) throw new Error(await res.text());
+
+      showToast("✅ Schedule updated & notification sent!");
+      selectedDates.clear();
+      await loadState();
+
+    } catch (e) {
+      showToast("❌ Error saving changes.");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
+
+  loadState();
+</script>
+</body>
+</html>

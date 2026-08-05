@@ -10,9 +10,13 @@ import (
 	"github.com/0xjuicebox/pgsBackend/internal/customer"
 	"github.com/0xjuicebox/pgsBackend/internal/delivery"
 	"github.com/0xjuicebox/pgsBackend/internal/driver"
+	"github.com/0xjuicebox/pgsBackend/internal/notification"
 	"github.com/0xjuicebox/pgsBackend/internal/override"
+	"github.com/0xjuicebox/pgsBackend/internal/registration"
 	"github.com/0xjuicebox/pgsBackend/internal/route"
 	"github.com/0xjuicebox/pgsBackend/internal/subscription"
+	"github.com/0xjuicebox/pgsBackend/internal/update"
+	"github.com/0xjuicebox/pgsBackend/internal/webhook"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -22,7 +26,7 @@ import (
 func main() {
 
 	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: No .env file found, falling back to system environment variables")
+		log.Fatal("Error parsing %v", err)
 	}
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -63,18 +67,36 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
-	cr := customer.CustomerResource{DB: pool}
+	ws := notification.NewWhatsAppService()
+	registrationResource := registration.Resource{
+		DB:       pool,
+		WhatsApp: ws,
+	}
+
+	updateResource := update.UpdateResource{
+		DB:       pool,
+		WhatsApp: ws,
+	}
+
+	// 2. Mount it to the chi router
+	// (Add this right next to r.Mount("/override", ...) and r.Mount("/register", ...))
+	r.Mount("/update", updateResource.Routes())
+
+	cr := customer.CustomerResource{DB: pool, WhatsApp: ws}
 	rr := route.RouteResource{DB: pool}
 	dr := driver.DriverResource{DB: pool}
 	sr := subscription.SubscriptionResource{DB: pool}
-	or := override.OverrideResource{DB: pool}
-	delR := delivery.DeliveryResource{DB: pool}
+	or := override.OverrideResource{DB: pool, WhatsApp: ws}
+	delR := delivery.DeliveryResource{DB: pool, WhatsApp: ws}
+	webR := webhook.WhatsAppResource{WhatsApp: ws, DB: pool}
 	r.Mount("/customer", cr.Routes())
 	r.Mount("/route", rr.Routes())
 	r.Mount("/driver", dr.Routes())
 	r.Mount("/subscription", sr.Routes())
 	r.Mount("/override", or.Routes())
+	r.Mount("/register", registrationResource.Routes())
 	r.Mount("/delivery", delR.Routes())
+	r.Mount("/webhooks/whatsapp", webR.Routes())
 
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("welcome"))
