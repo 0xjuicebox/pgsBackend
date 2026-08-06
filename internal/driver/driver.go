@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,7 +18,7 @@ import (
 type Driver struct {
 	Id          uuid.UUID `json:"id"`
 	Name        string    `json:"name"`
-	PhoneNumber string    `json:"PhoneNumber"`
+	PhoneNumber string    `json:"phoneNumber"`
 	IsActive    bool      `json:"isActive"`
 	CreatedAt   time.Time `json:"createdAt"`
 }
@@ -29,7 +30,7 @@ type DriverResource struct {
 func (dr DriverResource) Routes() chi.Router {
 	r := chi.NewRouter()
 
-	// 🖥️ ADMIN ROUTES
+	// Admin routes
 	r.With(middleware.Paginate).Get("/", dr.List)
 	r.Post("/", dr.Create)
 	r.Route("/{id}", func(r chi.Router) {
@@ -38,7 +39,7 @@ func (dr DriverResource) Routes() chi.Router {
 		r.Delete("/", dr.Delete)
 	})
 
-	// 📱 MOBILE ROUTES (Protected by Supabase)
+	// Mobile routes (protected by Supabase JWT)
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.SupabaseAuth)
 		r.Post("/sync", dr.Sync)
@@ -49,71 +50,9 @@ func (dr DriverResource) Routes() chi.Router {
 	return r
 }
 
-// Sync ensures the Go Database matches Supabase after an OTP login
-func (dr *DriverResource) Sync(w http.ResponseWriter, r *http.Request) {
-	// Grab UUID from Supabase JWT
-	userID := r.Context().Value(middleware.UserIDKey).(string)
-
-	// Grab Phone securely from JWT
-	var phone string
-	if p, ok := r.Context().Value(middleware.PhoneKey).(string); ok {
-		phone = p
-	}
-
-	var req struct {
-		Name string `json:"name"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	if req.Name == "" {
-		req.Name = "Unknown Driver"
-	}
-
-	// Updated query to match your original schema exactly
-	query := `
-		INSERT INTO drivers (id, name, phone_number)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (id) DO UPDATE SET phone_number = EXCLUDED.phone_number;
-	`
-
-	_, err := dr.DB.Exec(r.Context(), query, userID, req.Name, phone)
-
-	// If Postgres rejects it, it will print in huge red letters in your terminal
-	if err != nil {
-		fmt.Printf("\n🚨 🚨 🚨 DB SYNC ERROR: %v\n\n", err)
-		http.Error(w, `{"error": "Sync failed"}`, http.StatusInternalServerError)
-		return
-	}
-
-	fmt.Println("✅ Driver successfully synced to Postgres! UUID:", userID)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "synced"}`))
-}
-
-// GetMobileManifest securely looks up the route based on the JWT
-func (dr *DriverResource) GetMobileManifest(w http.ResponseWriter, r *http.Request) {
-	driverID := r.Context().Value(middleware.UserIDKey).(string)
-
-	var routeID string
-	err := dr.DB.QueryRow(r.Context(), `SELECT id FROM routes WHERE driver_id = $1 LIMIT 1`, driverID).Scan(&routeID)
-	if err != nil {
-		http.Error(w, `{"error": "No active route assigned to this driver"}`, http.StatusNotFound)
-		return
-	}
-
-	targetDate := r.URL.Query().Get("date")
-	if targetDate == "" {
-		targetDate = time.Now().Format("2006-01-02")
-	}
-
-	manifest, err := route.GenerateManifest(dr.DB, r.Context(), routeID, targetDate)
-	if err != nil {
-		http.Error(w, "Error generating manifest: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(manifest)
-}
+// -------------------------------------------------------------------------
+// Admin CRUD — unchanged from original except we never touch routes.driver_id
+// -------------------------------------------------------------------------
 
 func (dr DriverResource) Create(w http.ResponseWriter, r *http.Request) {
 	var d Driver
@@ -122,30 +61,18 @@ func (dr DriverResource) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u, err := uuid.NewV7()
-	if err != nil {
-		http.Error(w, "ID generation failed", http.StatusInternalServerError)
-		return
-	}
+	u, _ := uuid.NewV7()
 	d.Id = u
 
-	query := `
-		INSERT INTO drivers (id, name, phone_number)
-		VALUES ($1, $2, $3)
-	`
-
-	_, err = dr.DB.Exec(r.Context(), query, d.Id, d.Name, d.PhoneNumber)
+	_, err := dr.DB.Exec(r.Context(), `INSERT INTO drivers (id, name, phone_number) VALUES ($1, $2, $3)`, d.Id, d.Name, d.PhoneNumber)
 	if err != nil {
-		http.Error(w, "Database execution failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{
-		"id":      d.Id.String(),
-		"message": "Driver registered successfully",
-	})
+	json.NewEncoder(w).Encode(map[string]string{"id": d.Id.String(), "message": "Driver registered successfully"})
 }
 
 func (dr DriverResource) List(w http.ResponseWriter, r *http.Request) {
@@ -159,16 +86,11 @@ func (dr DriverResource) List(w http.ResponseWriter, r *http.Request) {
 	}
 	offset := (page - 1) * limit
 
-	query := `
-		SELECT id, name, phone_number, is_active, created_at
-		FROM drivers
-		ORDER BY created_at DESC
-		LIMIT $1 OFFSET $2
-	`
-
-	rows, err := dr.DB.Query(r.Context(), query, limit, offset)
+	rows, err := dr.DB.Query(r.Context(),
+		`SELECT id, name, phone_number, is_active, created_at FROM drivers ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+		limit, offset)
 	if err != nil {
-		http.Error(w, "Failed to query drivers: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -176,9 +98,8 @@ func (dr DriverResource) List(w http.ResponseWriter, r *http.Request) {
 	drivers := []Driver{}
 	for rows.Next() {
 		var d Driver
-		err := rows.Scan(&d.Id, &d.Name, &d.PhoneNumber, &d.IsActive, &d.CreatedAt)
-		if err != nil {
-			http.Error(w, "Row scan failure: "+err.Error(), http.StatusInternalServerError)
+		if err := rows.Scan(&d.Id, &d.Name, &d.PhoneNumber, &d.IsActive, &d.CreatedAt); err != nil {
+			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		drivers = append(drivers, d)
@@ -191,10 +112,9 @@ func (dr DriverResource) List(w http.ResponseWriter, r *http.Request) {
 func (dr DriverResource) Get(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	query := `SELECT id, name, phone_number, is_active, created_at FROM drivers WHERE id = $1`
-
 	var d Driver
-	err := dr.DB.QueryRow(r.Context(), query, id).Scan(&d.Id, &d.Name, &d.PhoneNumber, &d.IsActive, &d.CreatedAt)
+	err := dr.DB.QueryRow(r.Context(), `SELECT id, name, phone_number, is_active, created_at FROM drivers WHERE id = $1`, id).
+		Scan(&d.Id, &d.Name, &d.PhoneNumber, &d.IsActive, &d.CreatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			http.Error(w, "Driver not found", http.StatusNotFound)
@@ -217,13 +137,9 @@ func (dr DriverResource) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := `
-		UPDATE drivers
-		SET name = $1, phone_number = $2, is_active = $3
-		WHERE id = $4
-	`
-
-	_, err := dr.DB.Exec(r.Context(), query, d.Name, d.PhoneNumber, d.IsActive, id)
+	_, err := dr.DB.Exec(r.Context(),
+		`UPDATE drivers SET name = $1, phone_number = $2, is_active = $3 WHERE id = $4`,
+		d.Name, d.PhoneNumber, d.IsActive, id)
 	if err != nil {
 		http.Error(w, "Update failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -236,10 +152,7 @@ func (dr DriverResource) Update(w http.ResponseWriter, r *http.Request) {
 func (dr DriverResource) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	// Soft delete pattern to preserve financial/delivery history chains
-	query := `UPDATE drivers SET is_active = FALSE WHERE id = $1`
-
-	_, err := dr.DB.Exec(r.Context(), query, id)
+	_, err := dr.DB.Exec(r.Context(), `UPDATE drivers SET is_active = FALSE WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, "Deactivation failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -249,29 +162,124 @@ func (dr DriverResource) Delete(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "Driver profile deactivated"})
 }
 
-// CloseRoute allows the driver to manually end their shift.
-// Any pending deliveries are instantly marked as UNATTEMPTED.
+// -------------------------------------------------------------------------
+// Mobile — Sync, Manifest, CloseRoute
+// -------------------------------------------------------------------------
+
+func (dr *DriverResource) Sync(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(middleware.UserIDKey).(string)
+
+	var phone string
+	if p, ok := r.Context().Value(middleware.PhoneKey).(string); ok {
+		phone = p
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Name == "" {
+		req.Name = "Unknown Driver"
+	}
+
+	_, err := dr.DB.Exec(r.Context(), `
+		INSERT INTO drivers (id, name, phone_number) VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO UPDATE SET phone_number = EXCLUDED.phone_number
+	`, userID, req.Name, phone)
+
+	if err != nil {
+		fmt.Printf("\n🚨 DB SYNC ERROR: %v\n\n", err)
+		http.Error(w, `{"error": "Sync failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Println("✅ Driver synced. UUID:", userID)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status": "synced"}`))
+}
+
+// GetMobileManifest looks up the route assigned to this driver via
+// route_slot_drivers instead of the old routes.driver_id column.
+//
+// Slot detection: if a ?slot query param is given, use it. Otherwise infer
+// from the current time against system_config cutoffs. If the driver is
+// assigned to multiple routes (morning on A, evening on B), the slot
+// determines which route they see.
+func (dr *DriverResource) GetMobileManifest(w http.ResponseWriter, r *http.Request) {
+	driverID := r.Context().Value(middleware.UserIDKey).(string)
+
+	targetDate := r.URL.Query().Get("date")
+	if targetDate == "" {
+		targetDate = time.Now().Format("2006-01-02")
+	}
+
+	slot := r.URL.Query().Get("slot")
+	if slot == "" {
+		slot = inferSlot(r.Context(), dr.DB)
+	}
+
+	// Find which route this driver runs for the given slot.
+	var routeID string
+	err := dr.DB.QueryRow(r.Context(), `
+		SELECT route_id FROM route_slot_drivers
+		WHERE driver_id = $1 AND slot = $2
+		LIMIT 1
+	`, driverID, slot).Scan(&routeID)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			http.Error(w, `{"error": "No route assigned to this driver for the `+slot+` slot"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	manifest, err := route.GenerateManifest(dr.DB, r.Context(), routeID, targetDate, slot)
+	if err != nil {
+		http.Error(w, "Error generating manifest: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(manifest)
+}
+
+// CloseRoute marks undelivered stops as UNATTEMPTED for the driver's current
+// slot. Reads route assignment from route_slot_drivers and schedule info from
+// subscriptions.
 func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 	driverID := r.Context().Value(middleware.UserIDKey).(string)
 
+	slot := r.URL.Query().Get("slot")
+	if slot == "" {
+		slot = inferSlot(r.Context(), dr.DB)
+	}
+
 	var routeID string
-	err := dr.DB.QueryRow(r.Context(), `SELECT id FROM routes WHERE driver_id = $1 LIMIT 1`, driverID).Scan(&routeID)
+	err := dr.DB.QueryRow(r.Context(), `
+		SELECT route_id FROM route_slot_drivers
+		WHERE driver_id = $1 AND slot = $2 LIMIT 1
+	`, driverID, slot).Scan(&routeID)
 	if err != nil {
-		http.Error(w, `{"error": "No active route"}`, http.StatusNotFound)
+		http.Error(w, `{"error": "No active route for this slot"}`, http.StatusNotFound)
 		return
 	}
 
 	targetDate := time.Now().Format("2006-01-02")
 
+	// Insert UNATTEMPTED logs for every scheduled customer on this route+slot
+	// who doesn't already have a delivery log for today.
 	query := `
-		INSERT INTO delivery_logs (customer_id, route_id, delivery_date, status)
+		INSERT INTO delivery_logs (customer_id, route_id, driver_id, delivery_date, status, slot)
 		SELECT
-			c.id, c.route_id, $2::date, 'UNATTEMPTED'
-		FROM customers c
-		INNER JOIN subscriptions s ON c.id = s.customer_id
-		LEFT JOIN order_overrides o ON c.id = o.customer_id AND o.target_date = $2::date
-		LEFT JOIN delivery_logs dl ON c.id = dl.customer_id AND dl.delivery_date = $2::date
-		WHERE c.route_id = $1 AND c.is_active = TRUE AND c.stop_order > 0
+			s.customer_id, s.route_id, $4, $2::date, 'UNATTEMPTED', $3
+		FROM subscriptions s
+		JOIN customers c ON c.id = s.customer_id
+		LEFT JOIN order_overrides o ON o.customer_id = c.id AND o.target_date = $2::date AND o.slot = $3
+		LEFT JOIN delivery_logs dl ON dl.customer_id = c.id AND dl.delivery_date = $2::date AND dl.slot = $3
+		WHERE s.route_id = $1 AND s.slot = $3
+		  AND c.is_active = TRUE AND s.stop_order > 0
 		  AND dl.id IS NULL
 		  AND (
 			  s.schedule_type = 'daily'
@@ -281,7 +289,7 @@ func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 		  )
 	`
 
-	_, err = dr.DB.Exec(r.Context(), query, routeID, targetDate)
+	_, err = dr.DB.Exec(r.Context(), query, routeID, targetDate, slot, driverID)
 	if err != nil {
 		http.Error(w, "Failed to close route: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -289,4 +297,21 @@ func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message": "Route closed successfully"}`))
+}
+
+// inferSlot picks "morning" or "evening" based on the current time and the
+// cutoff stored in system_config. If it's before the evening cutoff, the
+// driver is probably still on their morning run; after it, they're on evening.
+// Falls back to "morning" if anything goes wrong.
+func inferSlot(ctx context.Context, db *pgxpool.Pool) string {
+	var eveningCutoff string
+	err := db.QueryRow(ctx, `SELECT evening_cutoff_time FROM system_config LIMIT 1`).Scan(&eveningCutoff)
+	if err != nil {
+		return "morning"
+	}
+	now := time.Now().Format("15:04")
+	if now >= eveningCutoff {
+		return "evening"
+	}
+	return "morning"
 }

@@ -1,198 +1,391 @@
 package billing
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
+	"github.com/0xjuicebox/pgsBackend/middleware"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type GenerateRequest struct {
-	Month string `json:"month"` // Format: "YYYY-MM" (e.g., "2026-07")
+var Products = []string{
+	"milk", "curd", "butter", "ghee", "lassi", "paneer",
+	"jaggery", "khand", "oil", "atta", "burfi",
 }
 
-// InvoiceBreakdown represents the frozen JSON state of the bill
 type InvoiceBreakdown struct {
 	Quantities map[string]int     `json:"quantities"`
 	Prices     map[string]float64 `json:"prices"`
+	LineTotals map[string]float64 `json:"lineTotals"`
 }
 
-// LiveTally represents what the Admin sees mid-month
-type LiveTally struct {
-	CustomerId  uuid.UUID        `json:"customerId"`
-	TotalAmount float64          `json:"totalAmount"`
-	Breakdown   InvoiceBreakdown `json:"breakdown"`
+type CustomerTally struct {
+	CustomerId    uuid.UUID        `json:"customerId"`
+	CustomerName  string           `json:"customerName"`
+	PhoneNumber   string           `json:"phoneNumber"`
+	DeliveryCount int              `json:"deliveryCount"`
+	TotalAmount   float64          `json:"totalAmount"`
+	Breakdown     InvoiceBreakdown `json:"breakdown"`
+	InvoiceId     *uuid.UUID       `json:"invoiceId"`
+	InvoiceStatus *string          `json:"invoiceStatus"`
+	IsFinalized   bool             `json:"isFinalized"`
 }
 
-type BillingResource struct {
-	DB *pgxpool.Pool
+type MonthSummary struct {
+	Month           string          `json:"month"`
+	CustomerCount   int             `json:"customerCount"`
+	TotalRevenue    float64         `json:"totalRevenue"`
+	FinalizedCount  int             `json:"finalizedCount"`
+	PendingAmount   float64         `json:"pendingAmount"`
+	CollectedAmount float64         `json:"collectedAmount"`
+	Tallies         []CustomerTally `json:"tallies"`
 }
+
+type GenerateRequest struct {
+	Month string `json:"month"`
+}
+type MarkPaidRequest struct {
+	Status string `json:"status"`
+}
+
+type BillingResource struct{ DB *pgxpool.Pool }
 
 func (br BillingResource) Routes() chi.Router {
 	r := chi.NewRouter()
-
-	r.Get("/live", br.GetLiveTallies) // Admin Dashboard Preview
-	r.Post("/generate", br.Generate)  // The Big End-of-Month Button
-
+	r.Get("/live", br.GetLiveTallies)
+	r.Get("/customer/{id}", br.GetCustomerBill)
+	r.Post("/generate", br.Generate)
+	r.With(middleware.Paginate).Get("/invoices", br.ListInvoices)
+	r.Put("/invoices/{id}/status", br.MarkPaid)
 	return r
 }
 
-// getAggregatedData is a helper that runs the massive aggregation query
-// used by BOTH the Live Tally and the Generator endpoints.
-func (br BillingResource) getAggregatedData(r *http.Request, month string) ([]LiveTally, error) {
-	// We CROSS JOIN with the system_config table (Limit 1) to get the live prices,
-	// and aggregate all DELIVERED quantities for the requested month.
-	query := `
-		SELECT
-			d.customer_id,
-			SUM(d.delivered_milk_qty), SUM(d.delivered_curd_qty), SUM(d.delivered_butter_qty),
-			SUM(d.delivered_ghee_qty), SUM(d.delivered_lassi_qty), SUM(d.delivered_paneer_qty),
-			SUM(d.delivered_jaggery_qty), SUM(d.delivered_khand_qty), SUM(d.delivered_oil_qty),
-			SUM(d.delivered_atta_qty), SUM(d.delivered_burfi_qty),
-			c.milk_price, c.curd_price, c.butter_price, c.ghee_price, c.lassi_price,
-			c.paneer_price, c.jaggery_price, c.khand_price, c.oil_price, c.atta_price, c.burfi_price
-		FROM delivery_logs d
-		CROSS JOIN (
-			SELECT milk_price, curd_price, butter_price, ghee_price, lassi_price,
-			       paneer_price, jaggery_price, khand_price, oil_price, atta_price, burfi_price
-			FROM system_config LIMIT 1
-		) c
-		WHERE d.status = 'DELIVERED' AND TO_CHAR(d.delivery_date, 'YYYY-MM') = $1
-		GROUP BY
-			d.customer_id,
-			c.milk_price, c.curd_price, c.butter_price, c.ghee_price, c.lassi_price,
-			c.paneer_price, c.jaggery_price, c.khand_price, c.oil_price, c.atta_price, c.burfi_price
-	`
+func (br BillingResource) aggregate(ctx context.Context, month string) ([]CustomerTally, error) {
+	sums := make([]string, 0, len(Products)*2)
+	for _, p := range Products {
+		sums = append(sums, fmt.Sprintf("COALESCE(SUM(d.delivered_%s_qty), 0)", p))
+		sums = append(sums, fmt.Sprintf("COALESCE(SUM(d.delivered_%s_qty * d.unit_price_%s), 0)", p, p))
+	}
 
-	rows, err := br.DB.Query(r.Context(), query, month)
+	query := fmt.Sprintf(`
+		SELECT c.id, c.name, c.phone_number, COUNT(d.id), %s
+		FROM customers c
+		JOIN delivery_logs d ON d.customer_id = c.id
+		WHERE d.status = 'DELIVERED' AND TO_CHAR(d.delivery_date, 'YYYY-MM') = $1
+		GROUP BY c.id, c.name, c.phone_number
+		ORDER BY c.name ASC
+	`, strings.Join(sums, ", "))
+
+	rows, err := br.DB.Query(ctx, query, month)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var tallies []LiveTally
-
+	n := len(Products)
+	tallies := []CustomerTally{}
 	for rows.Next() {
-		var t LiveTally
-		var mq, cq, bq, gq, lq, pq, jq, kq, oq, aq, burq int
-		var mp, cp, bp, gp, lp, pp, jp, kp, op, ap, burp float64
-
-		err := rows.Scan(
-			&t.CustomerId,
-			&mq, &cq, &bq, &gq, &lq, &pq, &jq, &kq, &oq, &aq, &burq,
-			&mp, &cp, &bp, &gp, &lp, &pp, &jp, &kp, &op, &ap, &burp,
-		)
-		if err != nil {
+		var t CustomerTally
+		qty := make([]int, n)
+		revenue := make([]float64, n)
+		dest := []any{&t.CustomerId, &t.CustomerName, &t.PhoneNumber, &t.DeliveryCount}
+		for i := 0; i < n; i++ {
+			dest = append(dest, &qty[i], &revenue[i])
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
-
 		t.Breakdown = InvoiceBreakdown{
-			Quantities: map[string]int{
-				"milk": mq, "curd": cq, "butter": bq, "ghee": gq, "lassi": lq,
-				"paneer": pq, "jaggery": jq, "khand": kq, "oil": oq, "atta": aq, "burfi": burq,
-			},
-			Prices: map[string]float64{
-				"milk": mp, "curd": cp, "butter": bp, "ghee": gp, "lassi": lp,
-				"paneer": pp, "jaggery": jp, "khand": kp, "oil": op, "atta": ap, "burfi": burp,
-			},
+			Quantities: map[string]int{}, Prices: map[string]float64{}, LineTotals: map[string]float64{},
 		}
-
-		// Calculate total amount dynamically
-		t.TotalAmount = (float64(mq) * mp) + (float64(cq) * cp) + (float64(bq) * bp) +
-			(float64(gq) * gp) + (float64(lq) * lp) + (float64(pq) * pp) +
-			(float64(jq) * jp) + (float64(kq) * kp) + (float64(oq) * op) +
-			(float64(aq) * ap) + (float64(burq) * burp)
-
+		for i, p := range Products {
+			t.Breakdown.Quantities[p] = qty[i]
+			if qty[i] > 0 {
+				t.Breakdown.Prices[p] = revenue[i] / float64(qty[i])
+				t.Breakdown.LineTotals[p] = revenue[i]
+			}
+			t.TotalAmount += revenue[i]
+		}
 		tallies = append(tallies, t)
 	}
-
-	return tallies, nil
+	return tallies, rows.Err()
 }
 
-// GetLiveTallies powers the Admin Dashboard preview
+func (br BillingResource) mergeInvoices(ctx context.Context, month string, tallies []CustomerTally) error {
+	rows, err := br.DB.Query(ctx, `SELECT customer_id, id, status, total_amount, breakdown FROM invoices WHERE billing_month = $1`, month)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type frozen struct {
+		id     uuid.UUID
+		status string
+		amount float64
+		bd     InvoiceBreakdown
+	}
+	byCustomer := map[uuid.UUID]frozen{}
+	for rows.Next() {
+		var custID uuid.UUID
+		var f frozen
+		var raw []byte
+		if err := rows.Scan(&custID, &f.id, &f.status, &f.amount, &raw); err != nil {
+			return err
+		}
+		_ = json.Unmarshal(raw, &f.bd)
+		byCustomer[custID] = f
+	}
+	for i := range tallies {
+		if f, ok := byCustomer[tallies[i].CustomerId]; ok {
+			tallies[i].InvoiceId = &f.id
+			s := f.status
+			tallies[i].InvoiceStatus = &s
+			tallies[i].IsFinalized = true
+			tallies[i].TotalAmount = f.amount
+			tallies[i].Breakdown = f.bd
+		}
+	}
+	return rows.Err()
+}
+
 func (br BillingResource) GetLiveTallies(w http.ResponseWriter, r *http.Request) {
 	month := r.URL.Query().Get("month")
 	if month == "" {
-		http.Error(w, "Missing 'month' query parameter (e.g., ?month=2026-07)", http.StatusBadRequest)
+		month = time.Now().Format("2006-01")
+	}
+	if !validMonth(month) {
+		http.Error(w, "month must be YYYY-MM", http.StatusBadRequest)
 		return
 	}
-
-	tallies, err := br.getAggregatedData(r, month)
+	tallies, err := br.aggregate(r.Context(), month)
 	if err != nil {
-		http.Error(w, "Failed to calculate live tallies: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Calculation error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tallies)
+	if err := br.mergeInvoices(r.Context(), month, tallies); err != nil {
+		http.Error(w, "Invoice load error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	summary := MonthSummary{Month: month, Tallies: tallies, CustomerCount: len(tallies)}
+	for _, t := range tallies {
+		summary.TotalRevenue += t.TotalAmount
+		if t.IsFinalized {
+			summary.FinalizedCount++
+			if t.InvoiceStatus != nil && strings.HasPrefix(*t.InvoiceStatus, "PAID") {
+				summary.CollectedAmount += t.TotalAmount
+			} else {
+				summary.PendingAmount += t.TotalAmount
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, summary)
 }
 
-// Generate locks in the final invoices at the end of the month
+type BillDay struct {
+	Date       string         `json:"date"`
+	Slot       string         `json:"slot"`
+	Status     string         `json:"status"`
+	Quantities map[string]int `json:"quantities"`
+	DayTotal   float64        `json:"dayTotal"`
+	IsFlagged  bool           `json:"isFlagged"`
+	LogId      uuid.UUID      `json:"logId"`
+}
+
+func (br BillingResource) GetCustomerBill(w http.ResponseWriter, r *http.Request) {
+	customerID := chi.URLParam(r, "id")
+	month := r.URL.Query().Get("month")
+	if month == "" {
+		month = time.Now().Format("2006-01")
+	}
+	qtyCols := make([]string, 0, len(Products))
+	priceCols := make([]string, 0, len(Products))
+	for _, p := range Products {
+		qtyCols = append(qtyCols, "d.delivered_"+p+"_qty")
+		priceCols = append(priceCols, "d.unit_price_"+p)
+	}
+	query := fmt.Sprintf(`
+		SELECT d.id, TO_CHAR(d.delivery_date, 'YYYY-MM-DD'), d.slot, d.status, COALESCE(d.is_flagged, false), %s, %s
+		FROM delivery_logs d
+		WHERE d.customer_id = $1 AND TO_CHAR(d.delivery_date, 'YYYY-MM') = $2
+		ORDER BY d.delivery_date ASC, d.slot ASC
+	`, strings.Join(qtyCols, ", "), strings.Join(priceCols, ", "))
+	rows, err := br.DB.Query(r.Context(), query, customerID, month)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	n := len(Products)
+	days := []BillDay{}
+	for rows.Next() {
+		var d BillDay
+		qty := make([]int, n)
+		price := make([]float64, n)
+		dest := []any{&d.LogId, &d.Date, &d.Slot, &d.Status, &d.IsFlagged}
+		for i := range qty {
+			dest = append(dest, &qty[i])
+		}
+		for i := range price {
+			dest = append(dest, &price[i])
+		}
+		if err := rows.Scan(dest...); err != nil {
+			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		d.Quantities = map[string]int{}
+		for i, p := range Products {
+			if qty[i] > 0 {
+				d.Quantities[p] = qty[i]
+				if d.Status == "DELIVERED" {
+					d.DayTotal += float64(qty[i]) * price[i]
+				}
+			}
+		}
+		days = append(days, d)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"customerId": customerID, "month": month, "days": days})
+}
+
 func (br BillingResource) Generate(w http.ResponseWriter, r *http.Request) {
 	var req GenerateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-
-	// 1. Calculate the final math
-	tallies, err := br.getAggregatedData(r, req.Month)
-	if err != nil {
-		http.Error(w, "Failed to calculate invoices: "+err.Error(), http.StatusInternalServerError)
+	if !validMonth(req.Month) {
+		http.Error(w, "month must be YYYY-MM", http.StatusBadRequest)
 		return
 	}
-
-	// 2. Start a transaction to save all invoices safely
+	if req.Month >= time.Now().Format("2006-01") {
+		http.Error(w, "Cannot generate for current or future month", http.StatusBadRequest)
+		return
+	}
+	tallies, err := br.aggregate(r.Context(), req.Month)
+	if err != nil {
+		http.Error(w, "Calculation error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	tx, err := br.DB.Begin(r.Context())
 	if err != nil {
-		http.Error(w, "Transaction start failed", http.StatusInternalServerError)
+		http.Error(w, "Transaction error", http.StatusInternalServerError)
 		return
 	}
 	defer tx.Rollback(r.Context())
-
-	// Insert query using ON CONFLICT DO NOTHING.
-	// This makes the button completely safe to double-click! It won't duplicate invoices.
-	insertQuery := `
-		INSERT INTO invoices (id, customer_id, billing_month, total_amount, breakdown)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (customer_id, billing_month) DO NOTHING
-	`
-
-	invoicesGenerated := 0
-
-	for _, tally := range tallies {
-		// Only bill customers who actually owe money > 0
-		if tally.TotalAmount <= 0 {
+	generated, skipped := 0, 0
+	for _, t := range tallies {
+		if t.TotalAmount <= 0 {
 			continue
 		}
-
-		invId, _ := uuid.NewV7()
-		breakdownJSON, _ := json.Marshal(tally.Breakdown)
-
-		tag, err := tx.Exec(r.Context(), insertQuery, invId, tally.CustomerId, req.Month, tally.TotalAmount, breakdownJSON)
+		invID, _ := uuid.NewV7()
+		breakdown, _ := json.Marshal(t.Breakdown)
+		tag, err := tx.Exec(r.Context(), `INSERT INTO invoices (id, customer_id, billing_month, total_amount, breakdown) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (customer_id, billing_month) DO NOTHING`, invID, t.CustomerId, req.Month, t.TotalAmount, breakdown)
 		if err != nil {
-			http.Error(w, "Failed to save invoice for customer "+tally.CustomerId.String(), http.StatusInternalServerError)
+			http.Error(w, "Invoice save failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		// tag.RowsAffected() tells us if it actually inserted or if it was blocked by the duplicate rule
 		if tag.RowsAffected() > 0 {
-			invoicesGenerated++
+			generated++
+		} else {
+			skipped++
 		}
 	}
-
 	if err := tx.Commit(r.Context()); err != nil {
-		http.Error(w, "Transaction commit failed", http.StatusInternalServerError)
+		http.Error(w, "Commit failed", http.StatusInternalServerError)
 		return
 	}
+	writeJSON(w, http.StatusCreated, map[string]any{"message": "Billing cycle processed", "month": req.Month, "invoicesGenerated": generated, "alreadyExisted": skipped})
+}
 
+type InvoiceRow struct {
+	Id           uuid.UUID `json:"id"`
+	CustomerId   uuid.UUID `json:"customerId"`
+	CustomerName string    `json:"customerName"`
+	PhoneNumber  string    `json:"phoneNumber"`
+	BillingMonth string    `json:"billingMonth"`
+	TotalAmount  float64   `json:"totalAmount"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
+func (br BillingResource) ListInvoices(w http.ResponseWriter, r *http.Request) {
+	page, _ := r.Context().Value(middleware.PageKey).(int)
+	limit, _ := r.Context().Value(middleware.LimitKey).(int)
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 {
+		limit = 20
+	}
+	conds := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, val any) {
+		args = append(args, val)
+		conds = append(conds, fmt.Sprintf(clause, len(args)))
+	}
+	if m := r.URL.Query().Get("month"); m != "" {
+		add("i.billing_month = $%d", m)
+	}
+	if s := r.URL.Query().Get("status"); s != "" {
+		add("i.status = $%d", s)
+	}
+	if c := r.URL.Query().Get("customerId"); c != "" {
+		add("i.customer_id = $%d", c)
+	}
+	args = append(args, limit, (page-1)*limit)
+	query := fmt.Sprintf(`SELECT i.id, i.customer_id, c.name, c.phone_number, i.billing_month, i.total_amount, i.status, i.created_at FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE %s ORDER BY i.billing_month DESC, c.name ASC LIMIT $%d OFFSET $%d`, strings.Join(conds, " AND "), len(args)-1, len(args))
+	rows, err := br.DB.Query(r.Context(), query, args...)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	invoices := []InvoiceRow{}
+	for rows.Next() {
+		var inv InvoiceRow
+		if err := rows.Scan(&inv.Id, &inv.CustomerId, &inv.CustomerName, &inv.PhoneNumber, &inv.BillingMonth, &inv.TotalAmount, &inv.Status, &inv.CreatedAt); err != nil {
+			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		invoices = append(invoices, inv)
+	}
+	writeJSON(w, http.StatusOK, invoices)
+}
+
+var allowedInvoiceStatus = map[string]bool{"PENDING": true, "PAID_ONLINE": true, "PAID_CASH": true}
+
+func (br BillingResource) MarkPaid(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req MarkPaidRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !allowedInvoiceStatus[req.Status] {
+		http.Error(w, "status must be PENDING, PAID_ONLINE or PAID_CASH", http.StatusBadRequest)
+		return
+	}
+	var updated uuid.UUID
+	err := br.DB.QueryRow(r.Context(), `UPDATE invoices SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING id`, req.Status, id).Scan(&updated)
+	if err == pgx.ErrNoRows {
+		http.Error(w, "Invoice not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Invoice status updated", "status": req.Status})
+}
+
+func validMonth(m string) bool { _, err := time.Parse("2006-01", m); return err == nil }
+func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":           "Billing cycle processed successfully",
-		"month":             req.Month,
-		"invoicesGenerated": invoicesGenerated,
-	})
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(body)
 }

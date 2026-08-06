@@ -14,12 +14,34 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Route no longer carries a single driver_id — driver assignment is per-slot
+// and lives in route_slot_drivers. Prices are per-route.
 type Route struct {
-	Id          uuid.UUID  `json:"id"`
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	DriverId    *uuid.UUID `json:"driverId"` // Pointer because it can be null initially
-	CreatedAt   time.Time  `json:"createdAt"`
+	Id          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"createdAt"`
+
+	// Per-route price list, returned on Get/List so the admin UI can render
+	// and edit them without a separate call.
+	Prices map[string]float64 `json:"prices,omitempty"`
+
+	// Populated by List/Get via a secondary query — tells the admin who's
+	// running this route right now without navigating to a separate screen.
+	SlotDrivers []SlotDriver `json:"slotDrivers,omitempty"`
+}
+
+type SlotDriver struct {
+	Slot        string     `json:"slot"`
+	DriverId    *uuid.UUID `json:"driverId"`
+	DriverName  *string    `json:"driverName"`
+	DriverPhone *string    `json:"driverPhone"`
+}
+
+// Products is the canonical list, same order as every other package.
+var Products = []string{
+	"milk", "curd", "butter", "ghee", "lassi", "paneer",
+	"jaggery", "khand", "oil", "atta", "burfi",
 }
 
 type RouteResource struct {
@@ -37,17 +59,20 @@ func (rr RouteResource) Routes() chi.Router {
 		r.Put("/", rr.Update)
 		r.Delete("/", rr.Delete)
 
+		r.Put("/prices", rr.UpdatePrices)
 		r.Put("/sequence", rr.UpdateSequence)
 		r.Put("/driver", rr.UpdateDriver)
 
-		// Driver-facing: Who gets what TODAY
 		r.Get("/manifest", rr.GetManifest)
-		// Admin-facing: EVERYONE assigned to this route
 		r.Get("/roster", rr.GetRoster)
 	})
 
 	return r
 }
+
+// -------------------------------------------------------------------------
+// CRUD
+// -------------------------------------------------------------------------
 
 func (rr RouteResource) Create(w http.ResponseWriter, r *http.Request) {
 	var rt Route
@@ -56,21 +81,13 @@ func (rr RouteResource) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u, err := uuid.NewV7()
-	if err != nil {
-		http.Error(w, "Failed to generate ID", http.StatusInternalServerError)
-		return
-	}
+	u, _ := uuid.NewV7()
 	rt.Id = u
 
-	query := `
-		INSERT INTO routes (id, name, description)
-		VALUES ($1, $2, $3)
-	`
-
-	_, err = rr.DB.Exec(r.Context(), query, rt.Id, rt.Name, rt.Description)
+	query := `INSERT INTO routes (id, name, description) VALUES ($1, $2, $3)`
+	_, err := rr.DB.Exec(r.Context(), query, rt.Id, rt.Name, rt.Description)
 	if err != nil {
-		http.Error(w, "Failed to create route in DB: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed to create route: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -83,65 +100,76 @@ func (rr RouteResource) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rr RouteResource) List(w http.ResponseWriter, r *http.Request) {
-	page := r.Context().Value(middleware.PageKey).(int)
-	limit := r.Context().Value(middleware.LimitKey).(int)
-
+	page, _ := r.Context().Value(middleware.PageKey).(int)
+	limit, _ := r.Context().Value(middleware.LimitKey).(int)
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 {
+		limit = 20
+	}
 	offset := (page - 1) * limit
 
 	query := `
-		SELECT id, name, description, driver_id, created_at
+		SELECT id, name, COALESCE(description, ''), created_at,
+		       price_milk, price_curd, price_butter, price_ghee, price_lassi,
+		       price_paneer, price_jaggery, price_khand, price_oil, price_atta, price_burfi
 		FROM routes
 		ORDER BY created_at DESC
 		LIMIT $1 OFFSET $2
 	`
-
 	rows, err := rr.DB.Query(r.Context(), query, limit, offset)
 	if err != nil {
-		http.Error(w, "Row scan error:"+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
 	routes := []Route{}
-
 	for rows.Next() {
-		var rt Route
-		err := rows.Scan(&rt.Id, &rt.Name, &rt.Description, &rt.DriverId, &rt.CreatedAt)
+		rt, err := scanRoute(rows)
 		if err != nil {
-			http.Error(w, "Row scan error:"+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		routes = append(routes, rt)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(routes)
+
+	// Attach slot-driver info in one batch instead of N+1 queries.
+	if len(routes) > 0 {
+		if err := attachSlotDrivers(r.Context(), rr.DB, routes); err != nil {
+			http.Error(w, "Driver lookup error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, routes)
 }
 
 func (rr RouteResource) Get(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	query := `
-		SELECT id, name ,description, driver_id, created_at
-		FROM routes
-		WHERE id = $1
+		SELECT id, name, COALESCE(description, ''), created_at,
+		       price_milk, price_curd, price_butter, price_ghee, price_lassi,
+		       price_paneer, price_jaggery, price_khand, price_oil, price_atta, price_burfi
+		FROM routes WHERE id = $1
 	`
-	var rt Route
-
-	err := rr.DB.QueryRow(r.Context(), query, id).Scan(
-		&rt.Id, &rt.Name, &rt.Description, &rt.DriverId, &rt.CreatedAt,
-	)
-
+	rt, err := scanRoute(rr.DB.QueryRow(r.Context(), query, id))
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			http.Error(w, "Route not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, "Database error:"+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(rt)
+	routes := []Route{rt}
+	_ = attachSlotDrivers(r.Context(), rr.DB, routes)
+	rt = routes[0]
+
+	writeJSON(w, http.StatusOK, rt)
 }
 
 func (rr RouteResource) Update(w http.ResponseWriter, r *http.Request) {
@@ -153,85 +181,93 @@ func (rr RouteResource) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := `
-		UPDATE routes
-		SET name = $1, description = $2
-		WHERE id = $3
-	`
-
+	query := `UPDATE routes SET name = $1, description = $2 WHERE id = $3`
 	_, err := rr.DB.Exec(r.Context(), query, rt.Name, rt.Description, id)
 	if err != nil {
 		http.Error(w, "Update failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Route updated successfully"})
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Route updated successfully"})
 }
 
 func (rr RouteResource) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	query := `DELETE FROM routes WHERE id = $1`
-
-	_, err := rr.DB.Exec(r.Context(), query, id)
+	// Cascades through route_slot_drivers and nulls subscriptions.route_id
+	// via ON DELETE SET NULL.
+	_, err := rr.DB.Exec(r.Context(), `DELETE FROM routes WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, "Failed to delete route: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Route deleted and customers safely unassigned"})
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Route deleted and subscriptions safely unassigned"})
 }
 
-type SequencePayload struct {
-	CustomerIDs []string `json:"customerIds"`
+// -------------------------------------------------------------------------
+// Prices
+// -------------------------------------------------------------------------
+
+type PricePayload struct {
+	Prices map[string]float64 `json:"prices"`
 }
 
-func (rr RouteResource) UpdateSequence(w http.ResponseWriter, r *http.Request) {
-	routeId := chi.URLParam(r, "id")
+// UpdatePrices edits the current price list for a route. Partial maps are
+// fine — products you omit keep their current value.
+func (rr RouteResource) UpdatePrices(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
 
-	var payload SequencePayload
+	var payload PricePayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Invalid payload: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if len(payload.Prices) == 0 {
+		http.Error(w, "No prices provided", http.StatusBadRequest)
 		return
 	}
 
-	tx, err := rr.DB.Begin(r.Context())
-	if err != nil {
-		http.Error(w, "Failed to start transaction: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback(r.Context())
-
-	query := `
-		UPDATE customers
-		SET stop_order = $1
-		WHERE id = $2 AND route_id = $3
-	`
-
-	for index, customerId := range payload.CustomerIDs {
-		stopOrder := index + 1
-		_, err := tx.Exec(r.Context(), query, stopOrder, customerId, routeId)
-		if err != nil {
-			http.Error(w, "Failed updating sequence at customer "+customerId+": "+err.Error(), http.StatusInternalServerError)
+	sets := []string{}
+	args := []any{}
+	for _, p := range Products {
+		val, ok := payload.Prices[p]
+		if !ok {
+			continue
+		}
+		if val < 0 {
+			http.Error(w, "Price for "+p+" cannot be negative", http.StatusBadRequest)
 			return
 		}
+		args = append(args, val)
+		sets = append(sets, "price_"+p+" = $"+itoa(len(args)))
 	}
-
-	if err := tx.Commit(r.Context()); err != nil {
-		http.Error(w, "Failed to commit transaction: "+err.Error(), http.StatusInternalServerError)
+	if len(sets) == 0 {
+		http.Error(w, "No recognised products in payload", http.StatusBadRequest)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Route sequence updated successfully"})
+	args = append(args, id)
+	query := "UPDATE routes SET " + join(sets, ", ") + " WHERE id = $" + itoa(len(args))
+	_, err := rr.DB.Exec(r.Context(), query, args...)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Route prices updated"})
 }
+
+// -------------------------------------------------------------------------
+// Driver assignment (per slot)
+// -------------------------------------------------------------------------
 
 type DriverPayload struct {
-	DriverId *string `json:"driverId"`
+	Slot     string  `json:"slot"`     // "morning" or "evening"
+	DriverId *string `json:"driverId"` // null to unassign
 }
 
+// UpdateDriver assigns or clears the driver for one slot on a route.
 func (rr RouteResource) UpdateDriver(w http.ResponseWriter, r *http.Request) {
 	routeId := chi.URLParam(r, "id")
 
@@ -240,22 +276,30 @@ func (rr RouteResource) UpdateDriver(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-
-	query := `UPDATE routes SET driver_id = $1 WHERE id = $2`
-
-	_, err := rr.DB.Exec(r.Context(), query, payload.DriverId, routeId)
-	if err != nil {
-		http.Error(w, "Assignment execution failed: "+err.Error(), http.StatusInternalServerError)
+	if payload.Slot == "" {
+		payload.Slot = "morning"
+	}
+	if payload.Slot != "morning" && payload.Slot != "evening" {
+		http.Error(w, "slot must be 'morning' or 'evening'", http.StatusBadRequest)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Driver link updated on route"})
+	query := `
+		INSERT INTO route_slot_drivers (route_id, slot, driver_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (route_id, slot) DO UPDATE SET driver_id = EXCLUDED.driver_id, updated_at = NOW()
+	`
+	_, err := rr.DB.Exec(r.Context(), query, routeId, payload.Slot, payload.DriverId)
+	if err != nil {
+		http.Error(w, "Assignment failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Driver link updated on route for " + payload.Slot})
 }
 
 // -------------------------------------------------------------------------
-// GET /roster
-// Used by Admin for Drag & Drop sequence editing. Ignores daily schedules.
+// Roster — admin sequence editor
 // -------------------------------------------------------------------------
 
 type RosterStop struct {
@@ -270,15 +314,23 @@ type RosterStop struct {
 type RosterResponse struct {
 	RouteID   uuid.UUID    `json:"routeId"`
 	RouteName string       `json:"routeName"`
+	Slot      string       `json:"slot"`
 	Stops     []RosterStop `json:"stops"`
 }
 
+// GetRoster returns every subscription assigned to this route+slot, used by
+// the admin's drag-and-drop sequence editor. ?slot defaults to "morning".
 func (rr RouteResource) GetRoster(w http.ResponseWriter, r *http.Request) {
 	routeId := chi.URLParam(r, "id")
-	var response RosterResponse
+	slot := r.URL.Query().Get("slot")
+	if slot == "" {
+		slot = "morning"
+	}
 
-	metaQuery := `SELECT id, name FROM routes WHERE id = $1`
-	err := rr.DB.QueryRow(r.Context(), metaQuery, routeId).Scan(&response.RouteID, &response.RouteName)
+	var response RosterResponse
+	response.Slot = slot
+
+	err := rr.DB.QueryRow(r.Context(), `SELECT id, name FROM routes WHERE id = $1`, routeId).Scan(&response.RouteID, &response.RouteName)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			http.Error(w, "Route not found", http.StatusNotFound)
@@ -288,15 +340,16 @@ func (rr RouteResource) GetRoster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 🚀 CRITICAL FIX: COALESCE(house_address, '') prevents pgx from crashing
-	// if a customer record has a NULL house_address.
+	// Roster now reads from subscriptions (where route assignment lives)
+	// joined to customers (where identity lives).
 	customerQuery := `
-		SELECT id, name, phone_number, COALESCE(house_address, ''), stop_order, is_active
-		FROM customers
-		WHERE route_id = $1 AND status IN ('active', 'disabled')
-		ORDER BY stop_order ASC
+		SELECT c.id, c.name, c.phone_number, COALESCE(c.house_address, ''), s.stop_order, c.is_active
+		FROM subscriptions s
+		JOIN customers c ON c.id = s.customer_id
+		WHERE s.route_id = $1 AND s.slot = $2 AND c.status IN ('active', 'disabled')
+		ORDER BY s.stop_order ASC
 	`
-	rows, err := rr.DB.Query(r.Context(), customerQuery, routeId)
+	rows, err := rr.DB.Query(r.Context(), customerQuery, routeId, slot)
 	if err != nil {
 		http.Error(w, "Error fetching roster: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -307,23 +360,82 @@ func (rr RouteResource) GetRoster(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var stop RosterStop
 		if err := rows.Scan(&stop.Id, &stop.Name, &stop.PhoneNumber, &stop.HouseAddress, &stop.StopOrder, &stop.IsActive); err != nil {
-			http.Error(w, "Error scanning roster: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		response.Stops = append(response.Stops, stop)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	writeJSON(w, http.StatusOK, response)
 }
 
 // -------------------------------------------------------------------------
-// GET /manifest
-// Used by Drivers. Filters by target date and non-zero orders.
+// Sequence
+// -------------------------------------------------------------------------
+
+type SequencePayload struct {
+	Slot        string   `json:"slot"` // defaults to "morning"
+	CustomerIDs []string `json:"customerIds"`
+}
+
+// UpdateSequence reorders stops on a route+slot. stop_order now lives on
+// subscriptions, not customers.
+func (rr RouteResource) UpdateSequence(w http.ResponseWriter, r *http.Request) {
+	routeId := chi.URLParam(r, "id")
+
+	var payload SequencePayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid payload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if payload.Slot == "" {
+		payload.Slot = "morning"
+	}
+
+	tx, err := rr.DB.Begin(r.Context())
+	if err != nil {
+		http.Error(w, "Transaction start failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	query := `
+		UPDATE subscriptions
+		SET stop_order = $1, updated_at = NOW()
+		WHERE customer_id = $2 AND route_id = $3 AND slot = $4
+	`
+
+	for index, customerId := range payload.CustomerIDs {
+		stopOrder := index + 1
+		_, err := tx.Exec(r.Context(), query, stopOrder, customerId, routeId, payload.Slot)
+		if err != nil {
+			http.Error(w, "Failed at customer "+customerId+": "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		http.Error(w, "Commit failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Route sequence updated successfully"})
+}
+
+// -------------------------------------------------------------------------
+// Manifest — driver-facing, slot-aware
 // -------------------------------------------------------------------------
 
 type ManifestStop struct {
-	customer.Customer
+	CustomerId   uuid.UUID `json:"id"`
+	CustomerName string    `json:"customer"`
+	PhoneNumber  string    `json:"phoneNumber"`
+	HouseAddress string    `json:"houseAddress"`
+	GeoLatitude  string    `json:"geoLatitude"`
+	GeoLongitude string    `json:"geoLongitude"`
+	IsActive     bool      `json:"isActive"`
+	StopOrder    int       `json:"stopOrder"`
+
 	DeliveryOrder customer.Order `json:"deliveryOrder"`
 	Status        *string        `json:"status"`
 	ActualOrder   customer.Order `json:"actualOrder"`
@@ -332,6 +444,7 @@ type ManifestStop struct {
 type ManifestResponse struct {
 	RouteID     uuid.UUID      `json:"routeId"`
 	RouteName   string         `json:"routeName"`
+	Slot        string         `json:"slot"`
 	DriverName  *string        `json:"driverName"`
 	DriverPhone *string        `json:"driverPhone"`
 	TargetDate  string         `json:"targetDate"`
@@ -344,64 +457,89 @@ func (rr RouteResource) GetManifest(w http.ResponseWriter, r *http.Request) {
 	if targetDate == "" {
 		targetDate = time.Now().Format("2006-01-02")
 	}
+	slot := r.URL.Query().Get("slot")
+	if slot == "" {
+		slot = "morning"
+	}
 
-	manifest, err := GenerateManifest(rr.DB, r.Context(), routeId, targetDate)
+	manifest, err := GenerateManifest(rr.DB, r.Context(), routeId, targetDate, slot)
 	if err != nil {
 		http.Error(w, "Error generating manifest: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(manifest)
+	writeJSON(w, http.StatusOK, manifest)
 }
 
-func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, targetDate string) (ManifestResponse, error) {
+// GenerateManifest is the shared function used by both the admin route
+// endpoint and the driver's mobile manifest. It is now slot-aware:
+// subscriptions, overrides, and delivery logs all filter on the same slot.
+func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, targetDate string, slot string) (ManifestResponse, error) {
 	var manifest ManifestResponse
 	manifest.TargetDate = targetDate
+	manifest.Slot = slot
 
+	// Route meta + driver for this slot from route_slot_drivers.
 	metaQuery := `
 		SELECT r.id, r.name, d.name, d.phone_number
 		FROM routes r
-		LEFT JOIN drivers d ON r.driver_id = d.id
+		LEFT JOIN route_slot_drivers rsd ON rsd.route_id = r.id AND rsd.slot = $2
+		LEFT JOIN drivers d ON d.id = rsd.driver_id
 		WHERE r.id = $1
 	`
-	err := db.QueryRow(ctx, metaQuery, routeId).Scan(
+	err := db.QueryRow(ctx, metaQuery, routeId, slot).Scan(
 		&manifest.RouteID, &manifest.RouteName, &manifest.DriverName, &manifest.DriverPhone,
 	)
 	if err != nil {
 		return manifest, err
 	}
 
+	// The big manifest query. Reads from subscriptions (route/stop/schedule/
+	// quantities), with override and delivery-log left joins, all filtered to
+	// the same slot.
 	customerQuery := `
 		SELECT
-			c.id, c.name, c.phone_number, c.house_address, c.geo_latitude, c.geo_longitude, c.is_active, c.stop_order, c.route_id,
-			COALESCE(o.new_milk_qty, s.default_milk_qty, 0), COALESCE(o.new_curd_qty, s.default_curd_qty, 0),
-			COALESCE(o.new_butter_qty, s.default_butter_qty, 0), COALESCE(o.new_ghee_qty, s.default_ghee_qty, 0),
-			COALESCE(o.new_lassi_qty, s.default_lassi_qty, 0), COALESCE(o.new_paneer_qty, s.default_paneer_qty, 0),
-			COALESCE(o.new_jaggery_qty, s.default_jaggery_qty, 0), COALESCE(o.new_khand_qty, s.default_khand_qty, 0),
-			COALESCE(o.new_oil_qty, s.default_oil_qty, 0), COALESCE(o.new_atta_qty, s.default_atta_qty, 0),
+			c.id, c.name, c.phone_number, COALESCE(c.house_address, ''),
+			COALESCE(c.geo_latitude, ''), COALESCE(c.geo_longitude, ''),
+			c.is_active, s.stop_order,
+
+			COALESCE(o.new_milk_qty, s.default_milk_qty, 0),
+			COALESCE(o.new_curd_qty, s.default_curd_qty, 0),
+			COALESCE(o.new_butter_qty, s.default_butter_qty, 0),
+			COALESCE(o.new_ghee_qty, s.default_ghee_qty, 0),
+			COALESCE(o.new_lassi_qty, s.default_lassi_qty, 0),
+			COALESCE(o.new_paneer_qty, s.default_paneer_qty, 0),
+			COALESCE(o.new_jaggery_qty, s.default_jaggery_qty, 0),
+			COALESCE(o.new_khand_qty, s.default_khand_qty, 0),
+			COALESCE(o.new_oil_qty, s.default_oil_qty, 0),
+			COALESCE(o.new_atta_qty, s.default_atta_qty, 0),
 			COALESCE(o.new_burfi_qty, s.default_burfi_qty, 0),
+
 			dl.status,
+
 			COALESCE(dl.delivered_milk_qty, 0), COALESCE(dl.delivered_curd_qty, 0),
 			COALESCE(dl.delivered_butter_qty, 0), COALESCE(dl.delivered_ghee_qty, 0),
 			COALESCE(dl.delivered_lassi_qty, 0), COALESCE(dl.delivered_paneer_qty, 0),
 			COALESCE(dl.delivered_jaggery_qty, 0), COALESCE(dl.delivered_khand_qty, 0),
 			COALESCE(dl.delivered_oil_qty, 0), COALESCE(dl.delivered_atta_qty, 0),
 			COALESCE(dl.delivered_burfi_qty, 0)
-		FROM customers c
-		INNER JOIN subscriptions s ON c.id = s.customer_id
-		LEFT JOIN order_overrides o ON c.id = o.customer_id AND o.target_date = $2
-		LEFT JOIN delivery_logs dl ON c.id = dl.customer_id AND dl.delivery_date = $2
-		WHERE c.route_id = $1 AND c.is_active = TRUE AND c.stop_order > 0
-			AND (
-			s.schedule_type = 'daily'
-			OR (s.schedule_type = 'custom' AND EXTRACT(DOW FROM $2::date)::int = ANY(s.active_days))
-			OR (s.schedule_type = 'alternate' AND ($2::date - s.anchor_date) % 2 = 0)
-			OR o.id IS NOT NULL
-			)
-		ORDER BY c.stop_order ASC
+
+		FROM subscriptions s
+		JOIN customers c ON c.id = s.customer_id
+		LEFT JOIN order_overrides o ON o.customer_id = c.id AND o.target_date = $2 AND o.slot = $3
+		LEFT JOIN delivery_logs dl ON dl.customer_id = c.id AND dl.delivery_date = $2 AND dl.slot = $3
+		WHERE s.route_id = $1 AND s.slot = $3
+		  AND c.is_active = TRUE AND s.stop_order > 0
+		  AND (
+			  s.schedule_type = 'daily'
+			  OR (s.schedule_type = 'custom' AND EXTRACT(DOW FROM $2::date)::int = ANY(s.active_days))
+			  OR (s.schedule_type = 'alternate' AND ($2::date - s.anchor_date) % 2 = 0)
+			  OR o.id IS NOT NULL
+		  )
+		ORDER BY s.stop_order ASC
 	`
-	rows, err := db.Query(ctx, customerQuery, routeId, targetDate)
+
+	rows, err := db.Query(ctx, customerQuery, routeId, targetDate, slot)
 	if err != nil {
 		return manifest, err
 	}
@@ -411,11 +549,15 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 	for rows.Next() {
 		var stop ManifestStop
 		err := rows.Scan(
-			&stop.Id, &stop.Name, &stop.PhoneNumber, &stop.HouseAddress, &stop.GeoLatitude, &stop.GeoLongitude, &stop.IsActive, &stop.StopOrder, &stop.RouteId,
+			&stop.CustomerId, &stop.CustomerName, &stop.PhoneNumber, &stop.HouseAddress,
+			&stop.GeoLatitude, &stop.GeoLongitude, &stop.IsActive, &stop.StopOrder,
+
 			&stop.DeliveryOrder.Milk, &stop.DeliveryOrder.Curd, &stop.DeliveryOrder.Butter, &stop.DeliveryOrder.Ghee,
 			&stop.DeliveryOrder.Lassi, &stop.DeliveryOrder.Paneer, &stop.DeliveryOrder.Jaggery, &stop.DeliveryOrder.Khand,
 			&stop.DeliveryOrder.Oil, &stop.DeliveryOrder.Atta, &stop.DeliveryOrder.Burfi,
+
 			&stop.Status,
+
 			&stop.ActualOrder.Milk, &stop.ActualOrder.Curd, &stop.ActualOrder.Butter, &stop.ActualOrder.Ghee,
 			&stop.ActualOrder.Lassi, &stop.ActualOrder.Paneer, &stop.ActualOrder.Jaggery, &stop.ActualOrder.Khand,
 			&stop.ActualOrder.Oil, &stop.ActualOrder.Atta, &stop.ActualOrder.Burfi,
@@ -423,10 +565,99 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 		if err != nil {
 			return manifest, err
 		}
-		if stop.DeliveryOrder.Milk == 0 && stop.DeliveryOrder.Curd == 0 && stop.DeliveryOrder.Butter == 0 && stop.DeliveryOrder.Ghee == 0 && stop.DeliveryOrder.Lassi == 0 && stop.DeliveryOrder.Paneer == 0 && stop.DeliveryOrder.Jaggery == 0 && stop.DeliveryOrder.Khand == 0 && stop.DeliveryOrder.Oil == 0 && stop.DeliveryOrder.Atta == 0 && stop.DeliveryOrder.Burfi == 0 {
+
+		// Skip zero-quantity stops (customer paused for the day via override).
+		o := stop.DeliveryOrder
+		if o.Milk == 0 && o.Curd == 0 && o.Butter == 0 && o.Ghee == 0 && o.Lassi == 0 &&
+			o.Paneer == 0 && o.Jaggery == 0 && o.Khand == 0 && o.Oil == 0 && o.Atta == 0 && o.Burfi == 0 {
 			continue
 		}
+
 		manifest.Stops = append(manifest.Stops, stop)
 	}
+
 	return manifest, nil
+}
+
+// -------------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------------
+
+func scanRoute(row pgx.Row) (Route, error) {
+	var rt Route
+	prices := make([]float64, len(Products))
+	dest := []any{&rt.Id, &rt.Name, &rt.Description, &rt.CreatedAt}
+	for i := range prices {
+		dest = append(dest, &prices[i])
+	}
+	if err := row.Scan(dest...); err != nil {
+		return rt, err
+	}
+	rt.Prices = map[string]float64{}
+	for i, p := range Products {
+		rt.Prices[p] = prices[i]
+	}
+	return rt, nil
+}
+
+// attachSlotDrivers batch-loads driver info for a slice of routes — one query
+// for the whole page instead of N+1 individual lookups.
+func attachSlotDrivers(ctx context.Context, db *pgxpool.Pool, routes []Route) error {
+	ids := make([]uuid.UUID, len(routes))
+	byId := map[uuid.UUID]int{}
+	for i, rt := range routes {
+		ids[i] = rt.Id
+		byId[rt.Id] = i
+		routes[i].SlotDrivers = []SlotDriver{}
+	}
+
+	query := `
+		SELECT rsd.route_id, rsd.slot, d.id, d.name, d.phone_number
+		FROM route_slot_drivers rsd
+		LEFT JOIN drivers d ON d.id = rsd.driver_id
+		WHERE rsd.route_id = ANY($1)
+		ORDER BY rsd.route_id, rsd.slot
+	`
+	rows, err := db.Query(ctx, query, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var routeId uuid.UUID
+		var sd SlotDriver
+		if err := rows.Scan(&routeId, &sd.Slot, &sd.DriverId, &sd.DriverName, &sd.DriverPhone); err != nil {
+			return err
+		}
+		if idx, ok := byId[routeId]; ok {
+			routes[idx].SlotDrivers = append(routes[idx].SlotDrivers, sd)
+		}
+	}
+	return rows.Err()
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(body)
+}
+
+// Tiny helpers to avoid importing fmt/strconv just for query building.
+func itoa(n int) string {
+	if n < 10 {
+		return string(rune('0' + n))
+	}
+	return itoa(n/10) + string(rune('0'+n%10))
+}
+
+func join(ss []string, sep string) string {
+	out := ""
+	for i, s := range ss {
+		if i > 0 {
+			out += sep
+		}
+		out += s
+	}
+	return out
 }
