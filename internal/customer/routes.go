@@ -198,6 +198,23 @@ func (cr CustomerResource) Update(w http.ResponseWriter, r *http.Request) {
 func (cr CustomerResource) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
+	// Superficial v1 guard: block delete if any invoice for this customer is
+	// still unpaid. Admin can still resolve this by marking the invoice paid
+	// first — this is not a bypass-proof constraint, just a footgun-blocker.
+	var unpaidCount int
+	err := cr.DB.QueryRow(r.Context(),
+		`SELECT COUNT(*) FROM invoices WHERE customer_id = $1 AND status = 'PENDING'`,
+		id,
+	).Scan(&unpaidCount)
+	if err != nil {
+		http.Error(w, "Failed checking outstanding invoices: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if unpaidCount > 0 {
+		http.Error(w, "Cannot delete: customer has unpaid invoices. Mark them paid first.", http.StatusConflict)
+		return
+	}
+
 	tx, err := cr.DB.Begin(r.Context())
 	if err != nil {
 		http.Error(w, "Transaction error: "+err.Error(), http.StatusInternalServerError)

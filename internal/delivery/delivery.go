@@ -1,6 +1,7 @@
 package delivery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -280,9 +281,51 @@ func (dr DeliveryResource) LogDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Notify the customer. Fire-and-forget deliberately: a failed WhatsApp
+	// send must never fail the delivery log itself — the driver has already
+	// left the doorstep by the time this runs.
+	if dr.WhatsApp != nil && payload.Status == "DELIVERED" {
+		go dr.notifyDelivered(payload.CustomerId, payload.Slot, finalOrder)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{"message": "Delivery logged successfully", "status": payload.Status})
+}
+
+// notifyDelivered sends the post-delivery WhatsApp confirmation. Runs on its
+// own short-lived context since the parent request has already responded.
+func (dr DeliveryResource) notifyDelivered(customerID, slot string, order customer.Order) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var phone string
+	if err := dr.DB.QueryRow(ctx, `SELECT phone_number FROM customers WHERE id = $1`, customerID).Scan(&phone); err != nil {
+		fmt.Printf("⚠️ notifyDelivered: couldn't find phone for customer %s: %v\n", customerID, err)
+		return
+	}
+
+	items := []struct {
+		label string
+		qty   int
+	}{
+		{"Milk", order.Milk}, {"Curd", order.Curd}, {"Butter", order.Butter}, {"Ghee", order.Ghee},
+		{"Buttermilk", order.Lassi}, {"Paneer", order.Paneer}, {"Jaggery", order.Jaggery},
+		{"Desi Khand", order.Khand}, {"Mustard Oil", order.Oil}, {"Atta", order.Atta}, {"Burfi", order.Burfi},
+	}
+	var lines []string
+	for _, it := range items {
+		if it.qty > 0 {
+			lines = append(lines, fmt.Sprintf("%s: %d", it.label, it.qty))
+		}
+	}
+
+	slotLabel := "Morning"
+	if slot == "evening" {
+		slotLabel = "Evening"
+	}
+	msg := fmt.Sprintf("✅ Your %s delivery is complete!\n\n%s", slotLabel, strings.Join(lines, "\n"))
+	dr.WhatsApp.SendDeliveryUpdate(phone, msg)
 }
 
 // -------------------------------------------------------------------------
