@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Report an Issue — PGS Direct</title>
+<style>
+  :root {
+    --accent: #1a7a4c;
+    --accent-light: #e6f4ec;
+    --ink: #1c2321;
+    --ink-soft: #5c6a63;
+    --bg: #f9f9f9;
+    --card: #ffffff;
+    --border: #eaeaea;
+    --danger: #dc2626;
+    --danger-light: #fef2f2;
+    --amber: #d97706;
+    --amber-light: #fef3c7;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    padding-bottom: 120px;
+  }
+
+  header {
+    background: var(--card);
+    padding: 20px 20px 16px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { margin: 0 0 4px; font-size: 20px; font-weight: 700; }
+  header p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+
+  main { padding: 20px 16px; }
+
+  .section-label {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--ink-soft);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 4px 4px 12px;
+  }
+
+  .delivery-list { display: flex; flex-direction: column; gap: 10px; }
+
+  .delivery-card {
+    background: var(--card);
+    border: 2px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .delivery-card:active { transform: scale(0.995); }
+  .delivery-card.selected { border-color: var(--accent); background: var(--accent-light); }
+  .delivery-card.disabled { opacity: 0.55; cursor: not-allowed; }
+
+  .row-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .slot-label { font-weight: 700; font-size: 15px; text-transform: capitalize; }
+  .date-label { font-size: 13px; color: var(--ink-soft); }
+  .flagged-chip {
+    display: inline-block; background: var(--amber-light); color: var(--amber);
+    padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
+    margin-left: 8px; text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .items { font-size: 13px; color: var(--ink-soft); line-height: 1.5; }
+
+  .empty {
+    background: var(--card);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 32px 20px;
+    text-align: center;
+    color: var(--ink-soft);
+  }
+  .empty h3 { margin: 0 0 4px; color: var(--ink); font-size: 16px; }
+  .empty p { margin: 0; font-size: 13px; }
+
+  .feedback-block { margin-top: 24px; }
+  textarea {
+    width: 100%;
+    min-height: 120px;
+    padding: 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    font-family: inherit;
+    font-size: 15px;
+    resize: vertical;
+    background: var(--card);
+    color: var(--ink);
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .char-count { font-size: 12px; color: var(--ink-soft); text-align: right; margin-top: 6px; }
+
+  .bottom-bar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    padding: 16px;
+    background: var(--card);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 -2px 12px rgba(0,0,0,0.04);
+  }
+  button.submit {
+    width: 100%;
+    padding: 16px;
+    border: none;
+    border-radius: 14px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  button.submit:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .toast {
+    position: fixed;
+    top: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--ink); color: #fff;
+    padding: 12px 20px; border-radius: 12px;
+    font-size: 14px; font-weight: 500;
+    z-index: 100;
+    opacity: 0; pointer-events: none;
+    transition: opacity .2s;
+    max-width: calc(100% - 32px);
+    text-align: center;
+  }
+  .toast.show { opacity: 1; }
+  .toast.error { background: var(--danger); }
+
+  .success-screen {
+    display: none;
+    padding: 60px 24px;
+    text-align: center;
+  }
+  .success-screen.show { display: block; }
+  .success-screen .check {
+    width: 64px; height: 64px; margin: 0 auto 20px;
+    background: var(--accent-light);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent); font-size: 32px;
+  }
+  .success-screen h2 { margin: 0 0 8px; font-size: 22px; }
+  .success-screen p { margin: 0; color: var(--ink-soft); font-size: 15px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Report an Issue</h1>
+  <p>Select the delivery you'd like to report</p>
+</header>
+
+<main id="main">
+  <div class="section-label">Recent deliveries</div>
+  <div id="deliveryList" class="delivery-list">
+    <div class="empty"><p>Loading…</p></div>
+  </div>
+
+  <div id="feedbackBlock" class="feedback-block" style="display:none">
+    <div class="section-label">What went wrong?</div>
+    <textarea id="feedback" placeholder="Describe the issue in a few words — e.g. 'Milk was spoiled', 'Quantity was less than ordered', 'Delivered to wrong door'..." maxlength="500"></textarea>
+    <div class="char-count"><span id="charCount">0</span> / 500</div>
+  </div>
+</main>
+
+<div id="successScreen" class="success-screen">
+  <div class="check">✓</div>
+  <h2>Thanks — we've logged your report</h2>
+  <p>Our team will look into this and get back to you on WhatsApp shortly. You can close this page.</p>
+</div>
+
+<div class="bottom-bar" id="bottomBar">
+  <button class="submit" id="submitBtn" disabled>Submit Report</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get('token');
+
+  const LABELS = {
+    milk: 'Milk', curd: 'Curd', butter: 'Butter', ghee: 'Ghee',
+    lassi: 'Buttermilk', paneer: 'Paneer', jaggery: 'Jaggery', khand: 'Desi Khand',
+    oil: 'Mustard Oil', atta: 'Atta', burfi: 'Burfi'
+  };
+  const LITRE = new Set(['milk', 'curd', 'lassi', 'oil']);
+
+  function formatQty(val, product) {
+    const litre = LITRE.has(product);
+    if (val < 1000) return val + (litre ? ' ml' : ' g');
+    return parseFloat((val / 1000).toFixed(2)) + (litre ? ' L' : ' kg');
+  }
+
+  function prettyDate(iso) {
+    const d = new Date(iso + 'T00:00:00');
+    const today = new Date(); today.setHours(0,0,0,0);
+    const yest = new Date(today); yest.setDate(yest.getDate() - 1);
+    if (d.getTime() === today.getTime()) return 'Today';
+    if (d.getTime() === yest.getTime()) return 'Yesterday';
+    return d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+  }
+
+  function showToast(msg, isError) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isError ? ' error' : '');
+    setTimeout(() => { t.className = 'toast'; }, 3000);
+  }
+
+  let selectedLogId = null;
+
+  async function load() {
+    try {
+      const res = await fetch('/delivery/issue/deliveries?token=' + encodeURIComponent(token));
+      if (!res.ok) throw new Error(await res.text() || 'Failed to load deliveries');
+      const data = await res.json();
+      render(data.deliveries || []);
+    } catch (err) {
+      document.getElementById('deliveryList').innerHTML =
+        '<div class="empty"><h3>Couldn\'t load deliveries</h3><p>' + (err.message || 'Please refresh and try again.') + '</p></div>';
+    }
+  }
+
+  function render(deliveries) {
+    const list = document.getElementById('deliveryList');
+    if (deliveries.length === 0) {
+      list.innerHTML = '<div class="empty"><h3>Nothing to report</h3><p>You have no recent deliveries within the reporting window.</p></div>';
+      // Hide the feedback + submit area entirely when nothing's actionable.
+      document.getElementById('bottomBar').style.display = 'none';
+      return;
+    }
+
+    list.innerHTML = deliveries.map(d => {
+      const items = Object.entries(d.items)
+        .filter(([, q]) => q > 0)
+        .map(([p, q]) => (LABELS[p] || p) + ' ' + formatQty(q, p))
+        .join(' · ') || 'No items recorded';
+
+      const disabled = d.alreadyFlagged;
+      const flaggedChip = disabled ? '<span class="flagged-chip">Already reported</span>' : '';
+
+      return `
+        <div class="delivery-card ${disabled ? 'disabled' : ''}" data-log="${d.logId}" data-disabled="${disabled}">
+          <div class="row-top">
+            <div><span class="slot-label">${d.slot}</span>${flaggedChip}</div>
+            <span class="date-label">${prettyDate(d.date)}</span>
+          </div>
+          <div class="items">${items}</div>
+        </div>
+      `;
+    }).join('');
+
+    list.querySelectorAll('.delivery-card').forEach(card => {
+      card.addEventListener('click', () => {
+        if (card.dataset.disabled === 'true') return;
+        list.querySelectorAll('.delivery-card').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        selectedLogId = card.dataset.log;
+        document.getElementById('feedbackBlock').style.display = 'block';
+        updateSubmitState();
+      });
+    });
+  }
+
+  function updateSubmitState() {
+    const btn = document.getElementById('submitBtn');
+    const feedback = document.getElementById('feedback').value.trim();
+    btn.disabled = !selectedLogId || feedback.length < 5;
+  }
+
+  document.getElementById('feedback').addEventListener('input', (e) => {
+    document.getElementById('charCount').textContent = e.target.value.length;
+    updateSubmitState();
+  });
+
+  document.getElementById('submitBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('submitBtn');
+    const feedback = document.getElementById('feedback').value.trim();
+    if (!selectedLogId || feedback.length < 5) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Submitting…';
+
+    try {
+      const res = await fetch('/delivery/issue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, logId: selectedLogId, feedback })
+      });
+      if (!res.ok) throw new Error((await res.text()) || 'Submission failed');
+
+      document.getElementById('main').style.display = 'none';
+      document.getElementById('bottomBar').style.display = 'none';
+      document.getElementById('successScreen').classList.add('show');
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Submit Report';
+      showToast(err.message || 'Something went wrong', true);
+    }
+  });
+
+  load();
+</script>
+</body>
+</html>

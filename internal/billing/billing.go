@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/0xjuicebox/pgsBackend/internal/notification"
 	"github.com/0xjuicebox/pgsBackend/middleware"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
@@ -55,7 +56,13 @@ type MarkPaidRequest struct {
 	Status string `json:"status"`
 }
 
-type BillingResource struct{ DB *pgxpool.Pool }
+// BillingResource now carries a WhatsApp handle so Generate can notify each
+// customer whose invoice was just created. main.go needs to construct it
+// with both fields — see the note at the bottom of this file.
+type BillingResource struct {
+	DB       *pgxpool.Pool
+	WhatsApp *notification.WhatsAppService
+}
 
 func (br BillingResource) Routes() chi.Router {
 	r := chi.NewRouter()
@@ -252,6 +259,9 @@ func (br BillingResource) GetCustomerBill(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"customerId": customerID, "month": month, "days": days})
 }
 
+// Generate creates invoices for a completed month and — new in this version —
+// fires off a WhatsApp bill to each customer whose invoice was just created.
+// Pre-existing invoices are not re-messaged (see notifyFreshInvoices below).
 func (br BillingResource) Generate(w http.ResponseWriter, r *http.Request) {
 	var req GenerateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -299,7 +309,124 @@ func (br BillingResource) Generate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Commit failed", http.StatusInternalServerError)
 		return
 	}
+
+	// Fire-and-forget notifications for the invoices we just inserted. Serial
+	// Twilio calls at ~500ms each × N customers can take a long time, so we
+	// don't want to hold the admin's HTTP request open while it runs. Any
+	// failures get logged; admin can re-notify a specific customer manually
+	// via the billing drill-down.
+	if br.WhatsApp != nil && generated > 0 {
+		go br.notifyFreshInvoices(req.Month, tallies)
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{"message": "Billing cycle processed", "month": req.Month, "invoicesGenerated": generated, "alreadyExisted": skipped})
+}
+
+// notifyFreshInvoices sends the month-end bill to customers whose invoice
+// was created within the last minute — i.e. by the Generate call that just
+// finished. Filtering by created_at avoids re-messaging customers whose
+// invoices already existed from a previous Generate run.
+func (br BillingResource) notifyFreshInvoices(month string, tallies []CustomerTally) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	rows, err := br.DB.Query(ctx, `
+		SELECT customer_id FROM invoices
+		WHERE billing_month = $1
+		  AND created_at > NOW() - INTERVAL '1 minute'
+	`, month)
+	if err != nil {
+		fmt.Printf("⚠️ notifyFreshInvoices: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	fresh := map[uuid.UUID]bool{}
+	for rows.Next() {
+		var id uuid.UUID
+		rows.Scan(&id)
+		fresh[id] = true
+	}
+
+	for _, t := range tallies {
+		if t.TotalAmount <= 0 || !fresh[t.CustomerId] {
+			continue
+		}
+		br.notifyBill(t, month)
+	}
+}
+
+// notifyBill sends the month-end bill total to a single customer over
+// WhatsApp. Uses a free-form text message via SendDeliveryUpdate rather than
+// a Twilio Content Template — templates would need Meta approval for every
+// tweak to the wording, and this message body changes with the product mix
+// each month. Once the format is stable we can switch to a template.
+//
+// UPI reconciliation is deliberately out of scope for v1. The message ends
+// with a manual "Reply PAID once transferred" nudge; auto-reconciliation
+// via a payment gateway comes in v1.1.
+func (br BillingResource) notifyBill(t CustomerTally, month string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var phone string
+	if err := br.DB.QueryRow(ctx, `SELECT phone_number FROM customers WHERE id = $1`, t.CustomerId).Scan(&phone); err != nil {
+		fmt.Printf("⚠️ notifyBill: couldn't find phone for %s: %v\n", t.CustomerId, err)
+		return
+	}
+
+	// Pretty product breakdown, only for lines that actually contributed.
+	// Same LABEL and unit conventions used by the customer-facing HTML pages.
+	labels := map[string]string{
+		"milk": "Milk", "curd": "Curd", "butter": "Butter", "ghee": "Ghee",
+		"lassi": "Buttermilk", "paneer": "Paneer", "jaggery": "Jaggery",
+		"khand": "Desi Khand", "oil": "Mustard Oil", "atta": "Atta", "burfi": "Burfi",
+	}
+	litre := map[string]bool{"milk": true, "curd": true, "lassi": true, "oil": true}
+
+	var lines []string
+	for _, p := range Products {
+		total := t.Breakdown.LineTotals[p]
+		qty := t.Breakdown.Quantities[p]
+		if total <= 0 {
+			continue
+		}
+		unit := "g"
+		display := float64(qty)
+		if qty >= 1000 {
+			display = float64(qty) / 1000
+			if litre[p] {
+				unit = "L"
+			} else {
+				unit = "kg"
+			}
+		} else if litre[p] {
+			unit = "ml"
+		}
+		lines = append(lines, fmt.Sprintf("• %s %g%s — ₹%.0f", labels[p], display, unit, total))
+	}
+
+	msg := fmt.Sprintf(
+		"🧾 *Your PGS Direct bill — %s*\n\n"+
+			"Hello %s,\n\n"+
+			"%s\n\n"+
+			"*Total: ₹%.0f*\n\n"+
+			"To pay, please transfer to our UPI ID and reply PAID once done. "+
+			"Our team will confirm and mark your bill as settled.",
+		labelForMonth(month), t.CustomerName, strings.Join(lines, "\n"), t.TotalAmount,
+	)
+
+	if err := br.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {
+		fmt.Printf("⚠️ notifyBill: WhatsApp send failed for %s: %v\n", phone, err)
+	}
+}
+
+// labelForMonth turns "2026-07" into "July 2026" for human-friendly headers.
+func labelForMonth(m string) string {
+	if t, err := time.Parse("2006-01", m); err == nil {
+		return t.Format("January 2006")
+	}
+	return m
 }
 
 type InvoiceRow struct {
@@ -389,3 +516,16 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(body)
 }
+
+// -------------------------------------------------------------------------
+// main.go change required:
+//
+// Where you currently have:
+//     br := billing.BillingResource{DB: pool}
+//
+// Change to:
+//     br := billing.BillingResource{DB: pool, WhatsApp: whatsappService}
+//
+// Use whatever variable name your Twilio/WhatsApp service is bound to in
+// main.go — it's the same one you already pass to DeliveryResource.
+// -------------------------------------------------------------------------

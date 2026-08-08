@@ -86,10 +86,7 @@ func (wr WhatsAppResource) HandleIncomingMessage(w http.ResponseWriter, r *http.
 			}
 
 		case message == "test" || message == "3" || strings.Contains(message, "report issue"):
-			err := wr.WhatsApp.SendIssueFlow(rawSender)
-			if err != nil {
-				fmt.Printf("❌ Failed to send issue flow: %v\n", err)
-			}
+			wr.handleIssueRequest(rawSender, cleanPhone)
 
 		case message == "1" || strings.Contains(message, "override"):
 			wr.handleOverrideRequest(rawSender, cleanPhone)

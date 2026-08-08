@@ -100,6 +100,11 @@ func (s *WhatsAppService) SendOverrideLink(toPhone, token string) error {
 	return s.SendContentTemplate(toPhone, "HX40cbc193ae82c16ffcc1d47a31dda48c", variables)
 }
 
+func (s *WhatsAppService) SendIssueLink(toPhone, token string) error {
+	variables := fmt.Sprintf(`{"1":"%s"}`, token)
+	return s.SendContentTemplate(toPhone, "REPLACE_WITH_ISSUE_TEMPLATE_SID", variables)
+}
+
 // -------------------------------------------------------------------------
 // Twilio Template functions
 // -------------------------------------------------------------------------

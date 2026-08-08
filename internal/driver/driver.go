@@ -45,6 +45,14 @@ func (dr DriverResource) Routes() chi.Router {
 		r.Post("/sync", dr.Sync)
 		r.Get("/manifest", dr.GetMobileManifest)
 		r.Post("/route/close", dr.CloseRoute)
+
+		// Shift lifecycle
+		r.Get("/shift/today", dr.GetTodayShifts)
+		r.Post("/shift/start", dr.StartShift)
+		r.Post("/shift/end", dr.EndShift)
+
+		// Offline-queue sync failure reporting
+		r.Post("/sync-failures", dr.ReportSyncFailure)
 	})
 
 	return r

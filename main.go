@@ -59,6 +59,8 @@ func main() {
 	}
 	log.Println("Successfully connected and pinged Supabase PostgreSQL engine.")
 
+	go driver.StartAutoEndSweeper(pool)
+
 	// WhatsApp
 	// WhatsApp — NewWhatsAppService reads Twilio creds from env itself
 	whatsApp := notification.NewWhatsAppService()
@@ -76,7 +78,7 @@ func main() {
 	statsResource := stats.StatsResource{DB: pool}
 
 	// NEW: billing and config — these were never mounted before
-	br := billing.BillingResource{DB: pool}
+	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp}
 	cfgR := config.ConfigResource{DB: pool}
 
 	// Router

@@ -2,8 +2,10 @@ package delivery
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"math"
 	"net/http"
 	"strconv"
@@ -12,12 +14,17 @@ import (
 
 	"github.com/0xjuicebox/pgsBackend/internal/customer"
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
+	"github.com/0xjuicebox/pgsBackend/internal/registration"
 	"github.com/0xjuicebox/pgsBackend/middleware"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+//go:embed templates/issue.html
+var issueTemplateFS embed.FS
+var issueTmpl = template.Must(template.ParseFS(issueTemplateFS, "templates/issue.html"))
 
 var Products = []string{
 	"milk", "curd", "butter", "ghee", "lassi", "paneer",
@@ -122,6 +129,11 @@ func (dr DeliveryResource) Routes() chi.Router {
 	r.Post("/admin", dr.AdminUpsert)
 	r.With(middleware.Paginate).Get("/flagged", dr.ListFlagged)
 	r.Post("/{id}/resolve", dr.Resolve)
+
+	// Customer issue-reporting (token-gated HTML page, not admin, not driver)
+	r.Get("/issue", dr.ShowIssueForm)
+	r.Get("/issue/deliveries", dr.ListReportable)
+	r.Post("/issue", dr.SubmitIssue)
 
 	// Mobile routes
 	r.Group(func(r chi.Router) {
@@ -295,7 +307,7 @@ func (dr DeliveryResource) LogDelivery(w http.ResponseWriter, r *http.Request) {
 
 // notifyDelivered sends the post-delivery WhatsApp confirmation. Runs on its
 // own short-lived context since the parent request has already responded.
-func (dr DeliveryResource) notifyDelivered(customerID, slot string, order customer.Order) {
+func (dr DeliveryResource) notifyDelivered(customerID uuid.UUID, slot string, order customer.Order) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -749,6 +761,188 @@ func (dr DeliveryResource) Resolve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Marked as resolved"})
+}
+
+// -------------------------------------------------------------------------
+// Customer: Issue Reporting
+//
+// A customer taps "Report an issue" in WhatsApp → webhook generates a token
+// and sends the link to /delivery/issue?token=... → this file serves the HTML,
+// lists the customer's recent DELIVERED logs still inside the complaint
+// window, and accepts a submission that writes to is_flagged +
+// customer_feedback. The admin dashboard's flagged list reads the same
+// columns, so nothing on the admin side needed changing.
+// -------------------------------------------------------------------------
+
+func (dr DeliveryResource) ShowIssueForm(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Missing token", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if _, err := registration.ValidatePhone(ctx, dr.DB, token); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusGone)
+		w.Write([]byte(`<h2 style="font-family:sans-serif;padding:24px">This link has expired.</h2><p style="font-family:sans-serif;padding:0 24px">Please tap "Report an issue" from the main menu again to get a fresh link.</p>`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	issueTmpl.Execute(w, map[string]string{"Token": token})
+}
+
+// reportableDelivery is what the page renders as a picker option.
+type reportableDelivery struct {
+	LogId          uuid.UUID      `json:"logId"`
+	Date           string         `json:"date"`
+	Slot           string         `json:"slot"`
+	Status         string         `json:"status"`
+	AlreadyFlagged bool           `json:"alreadyFlagged"`
+	Items          map[string]int `json:"items"`
+}
+
+// ListReportable returns the customer's recent DELIVERED logs that are still
+// inside the complaint window. The cutoff hour lives in system_config as
+// complaint_cutoff_time and is interpreted as "this hour on the day AFTER
+// delivery" — so a 2 AM value gives evening customers ~8 hours and morning
+// customers ~22 hours. A NULL cutoff disables the window entirely.
+func (dr DeliveryResource) ListReportable(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	phone, err := registration.ValidatePhone(ctx, dr.DB, token)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	loc, _ := time.LoadLocation("Asia/Kolkata")
+	now := time.Now().In(loc)
+	today := now.Format("2006-01-02")
+	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
+
+	var cutoffTimeStr *string
+	dr.DB.QueryRow(ctx, `SELECT complaint_cutoff_time::text FROM system_config LIMIT 1`).Scan(&cutoffTimeStr)
+
+	// Always allow today. Allow yesterday only if we haven't crossed today's
+	// cutoff yet. NULL cutoff = no window enforcement (useful for launch).
+	dates := []string{today}
+	includeYesterday := cutoffTimeStr == nil
+	if cutoffTimeStr != nil {
+		if cutoff, err := time.ParseInLocation("15:04:05", *cutoffTimeStr, loc); err == nil {
+			cutoffToday := time.Date(now.Year(), now.Month(), now.Day(), cutoff.Hour(), cutoff.Minute(), 0, 0, loc)
+			if now.Before(cutoffToday) {
+				includeYesterday = true
+			}
+		}
+	}
+	if includeYesterday {
+		dates = append(dates, yesterday)
+	}
+
+	// Only DELIVERED rows are surfaced — there's nothing meaningful to
+	// complain about on a skipped/unattempted stop. Ordering: newest first.
+	q := `
+		SELECT dl.id, dl.delivery_date::text, dl.slot, dl.status, COALESCE(dl.is_flagged, false),
+		       dl.delivered_milk_qty, dl.delivered_curd_qty, dl.delivered_butter_qty,
+		       dl.delivered_ghee_qty, dl.delivered_lassi_qty, dl.delivered_paneer_qty,
+		       dl.delivered_jaggery_qty, dl.delivered_khand_qty, dl.delivered_oil_qty,
+		       dl.delivered_atta_qty, dl.delivered_burfi_qty
+		FROM delivery_logs dl
+		JOIN customers c ON c.id = dl.customer_id
+		WHERE c.phone_number = $1
+		  AND dl.status = 'DELIVERED'
+		  AND dl.delivery_date::text = ANY($2)
+		ORDER BY dl.delivery_date DESC, dl.slot ASC
+	`
+	rows, err := dr.DB.Query(ctx, q, phone, dates)
+	if err != nil {
+		http.Error(w, "Failed to load deliveries: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	out := []reportableDelivery{}
+	for rows.Next() {
+		var d reportableDelivery
+		var milk, curd, butter, ghee, lassi, paneer, jaggery, khand, oil, atta, burfi int
+		if err := rows.Scan(&d.LogId, &d.Date, &d.Slot, &d.Status, &d.AlreadyFlagged,
+			&milk, &curd, &butter, &ghee, &lassi, &paneer, &jaggery, &khand, &oil, &atta, &burfi); err != nil {
+			continue
+		}
+		d.Items = map[string]int{
+			"milk": milk, "curd": curd, "butter": butter, "ghee": ghee,
+			"lassi": lassi, "paneer": paneer, "jaggery": jaggery, "khand": khand,
+			"oil": oil, "atta": atta, "burfi": burfi,
+		}
+		out = append(out, d)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"deliveries": out})
+}
+
+type issueSubmitPayload struct {
+	Token    string `json:"token"`
+	LogId    string `json:"logId"`
+	Feedback string `json:"feedback"`
+}
+
+// SubmitIssue flags the chosen log. The token authorises the phone; we
+// re-check ownership on the log row itself so a leaked or replayed token
+// can't be used to flag deliveries belonging to a different customer.
+func (dr DeliveryResource) SubmitIssue(w http.ResponseWriter, r *http.Request) {
+	var p issueSubmitPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if p.LogId == "" || p.Feedback == "" {
+		http.Error(w, "logId and feedback are both required", http.StatusBadRequest)
+		return
+	}
+	if len(p.Feedback) > 500 {
+		p.Feedback = p.Feedback[:500]
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	phone, err := registration.ValidatePhone(ctx, dr.DB, p.Token)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	// One statement, one round trip: the WHERE clause both scopes to the
+	// caller's customer_id (via phone) and guards against cross-customer
+	// flagging via a leaked logId.
+	tag, err := dr.DB.Exec(ctx, `
+		UPDATE delivery_logs
+		SET is_flagged = true, customer_feedback = $1, updated_at = NOW()
+		WHERE id = $2
+		  AND customer_id = (SELECT id FROM customers WHERE phone_number = $3)
+	`, p.Feedback, p.LogId, phone)
+	if err != nil {
+		http.Error(w, "Failed to log issue: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		http.Error(w, "That delivery couldn't be found or doesn't belong to you.", http.StatusNotFound)
+		return
+	}
+
+	registration.MarkUsed(ctx, dr.DB, p.Token)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	fmt.Printf("✅ Issue logged for %s on log %s: %q\n", phone, p.LogId, p.Feedback)
 }
 
 // -------------------------------------------------------------------------
