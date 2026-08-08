@@ -16,6 +16,7 @@ import (
 	"github.com/0xjuicebox/pgsBackend/internal/override"
 	"github.com/0xjuicebox/pgsBackend/internal/registration"
 	"github.com/0xjuicebox/pgsBackend/internal/route"
+	"github.com/0xjuicebox/pgsBackend/internal/stats"
 	"github.com/0xjuicebox/pgsBackend/internal/subscription"
 	"github.com/0xjuicebox/pgsBackend/internal/update"
 	"github.com/0xjuicebox/pgsBackend/internal/webhook"
@@ -72,6 +73,7 @@ func main() {
 	wr := webhook.WhatsAppResource{WhatsApp: whatsApp, DB: pool}
 	regr := registration.Resource{DB: pool, WhatsApp: whatsApp}
 	ur := update.UpdateResource{DB: pool, WhatsApp: whatsApp}
+	statsResource := stats.StatsResource{DB: pool}
 
 	// NEW: billing and config — these were never mounted before
 	br := billing.BillingResource{DB: pool}
@@ -106,6 +108,7 @@ func main() {
 	r.Mount("/webhook", wr.Routes())
 	r.Mount("/register", regr.Routes())
 	r.Mount("/update", ur.Routes())
+	r.Mount("/stats", statsResource.Routes())
 
 	// NEW mounts
 	r.Mount("/billing", br.Routes())
