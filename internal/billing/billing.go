@@ -71,6 +71,8 @@ func (br BillingResource) Routes() chi.Router {
 	r.Post("/generate", br.Generate)
 	r.With(middleware.Paginate).Get("/invoices", br.ListInvoices)
 	r.Put("/invoices/{id}/status", br.MarkPaid)
+	r.Post("/final/{customerId}", br.FinalInvoice)
+	r.Post("/invoices/{id}/regenerate", br.RegenerateInvoice)
 	return r
 }
 

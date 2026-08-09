@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/customer"
@@ -28,9 +29,17 @@ type UpdateResource struct {
 
 func (ur UpdateResource) Routes() chi.Router {
 	r := chi.NewRouter()
+
+	// Customer-facing (token-gated)
 	r.Get("/", ur.ShowForm)
 	r.Get("/state", ur.GetState)
 	r.Post("/", ur.Submit)
+
+	// Admin: staged change review
+	r.Get("/changes", ur.ListPendingChanges)
+	r.Post("/changes/{id}/approve", ur.ApprovePendingChange)
+	r.Post("/changes/{id}/reject", ur.RejectPendingChange)
+
 	return r
 }
 
@@ -70,6 +79,14 @@ type SlotSubscription struct {
 	Items        customer.Order `json:"items"`
 }
 
+// PendingSummary tells the page a change is already under review, so it can
+// show a banner and disable the form rather than letting the customer submit
+// something that will just be refused.
+type PendingSummary struct {
+	SubmittedAt time.Time `json:"submittedAt"`
+	Status      string    `json:"status"`
+}
+
 type FullState struct {
 	Name      string `json:"name"`
 	Address   string `json:"address"`
@@ -78,6 +95,8 @@ type FullState struct {
 
 	Morning SlotSubscription `json:"morning"`
 	Evening SlotSubscription `json:"evening"`
+
+	Pending *PendingSummary `json:"pending"`
 }
 
 func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
@@ -105,9 +124,7 @@ func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// One row per slot. Previously this used QueryRow with no slot filter,
-	// which returned whichever row Postgres happened to hand back first —
-	// so a two-slot customer saw a random slot's data in the form.
+	// One row per slot.
 	rows, err := ur.DB.Query(ctx, `
         SELECT slot, schedule_type, active_days, TO_CHAR(anchor_date, 'YYYY-MM-DD'),
                default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
@@ -140,6 +157,18 @@ func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Is something already under review?
+	var ps PendingSummary
+	err = ur.DB.QueryRow(ctx, `
+		SELECT submitted_at, review_status
+		FROM pending_subscription_changes
+		WHERE customer_id = $1 AND review_status = 'PENDING'
+		LIMIT 1
+	`, customerID).Scan(&ps.SubmittedAt, &ps.Status)
+	if err == nil {
+		state.Pending = &ps
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(state)
 }
@@ -147,8 +176,8 @@ func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
 // UpdatePayload is what update.html submits.
 //
 // Subscriptions is authoritative: any slot NOT present in the array is
-// removed. That's how a customer cancels just their evening delivery while
-// keeping morning — they submit with only the morning entry.
+// removed when the change is eventually applied. That's how a customer
+// cancels just their evening delivery while keeping morning.
 type UpdatePayload struct {
 	Token     string `json:"token"`
 	Name      string `json:"name"`
@@ -187,6 +216,20 @@ func orderTotal(o customer.Order) int {
 		o.Jaggery + o.Khand + o.Oil + o.Atta + o.Burfi
 }
 
+// Submit stages a change for admin review. It does NOT modify the customer's
+// live subscription, address, or active status.
+//
+// The previous version wrote straight into subscriptions and set
+// is_active=false, which meant a customer editing their order at 10 AM lost
+// that day's delivery entirely (the manifest filters on is_active) and had
+// their account suspended. It also handed them a back door around the
+// override cutoff: they couldn't legitimately change today's order, but they
+// could silently cancel it.
+//
+// Now the request parks in pending_subscription_changes and the customer
+// carries on receiving deliveries on their existing order until an admin
+// approves it — at which point it takes effect from the following day,
+// because production for today has already been planned.
 func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 	var payload UpdatePayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -209,8 +252,8 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Drop empty slots — a slot submitted with all zeros means "cancel this
-	// slot", which the delete step below handles.
+	// Drop empty slots — submitting a slot with all zeros means "cancel this
+	// slot", which the apply step handles by deleting it.
 	kept := payload.Subscriptions[:0]
 	for _, s := range payload.Subscriptions {
 		if orderTotal(s.Items) > 0 {
@@ -224,110 +267,64 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := ur.DB.Begin(ctx)
-	if err != nil {
-		http.Error(w, "Failed to update profile", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback(ctx)
-
 	var customerID string
-	// 1. Update Customer AND set them to pending, dropping their route_id
-	custQuery := `
-		UPDATE customers
-		SET name = $1, house_address = $2, geo_latitude = $3, geo_longitude = $4,
-		    status = 'pending', is_active = false, route_id = NULL
-		WHERE phone_number = $5 RETURNING id`
-	err = tx.QueryRow(ctx, custQuery, payload.Name, payload.Address, payload.Latitude, payload.Longitude, phone).Scan(&customerID)
+	var currentAddress, currentLat, currentLng string
+	err = ur.DB.QueryRow(ctx, `
+		SELECT id, house_address, COALESCE(geo_latitude, ''), COALESCE(geo_longitude, '')
+		FROM customers WHERE phone_number = $1
+	`, phone).Scan(&customerID, &currentAddress, &currentLat, &currentLng)
 	if err != nil {
-		http.Error(w, "Failed to update profile", http.StatusInternalServerError)
+		http.Error(w, "Customer not found", http.StatusNotFound)
 		return
 	}
 
-	// 2. Upsert each submitted slot. Scoped by (customer_id, slot) — the old
-	// statement filtered on customer_id alone and overwrote BOTH slots with
-	// the same values for anyone subscribed to morning and evening.
-	subQuery := `
-		INSERT INTO subscriptions (
-			id, customer_id, slot, schedule_type, active_days, anchor_date,
-			default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
-			default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
-			default_oil_qty, default_atta_qty, default_burfi_qty
-		) VALUES (
-			$1, $2, $3, $4, $5, $6,
-			$7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
-		)
-		ON CONFLICT (customer_id, slot) DO UPDATE SET
-			schedule_type = EXCLUDED.schedule_type, active_days = EXCLUDED.active_days,
-			anchor_date = EXCLUDED.anchor_date,
-			default_milk_qty = EXCLUDED.default_milk_qty, default_curd_qty = EXCLUDED.default_curd_qty,
-			default_butter_qty = EXCLUDED.default_butter_qty, default_ghee_qty = EXCLUDED.default_ghee_qty,
-			default_lassi_qty = EXCLUDED.default_lassi_qty, default_paneer_qty = EXCLUDED.default_paneer_qty,
-			default_jaggery_qty = EXCLUDED.default_jaggery_qty, default_khand_qty = EXCLUDED.default_khand_qty,
-			default_oil_qty = EXCLUDED.default_oil_qty, default_atta_qty = EXCLUDED.default_atta_qty,
-			default_burfi_qty = EXCLUDED.default_burfi_qty`
+	// Flagged for the admin review screen so an address move is obvious
+	// without diffing two blobs by eye — those are the ones needing a
+	// re-route, not just a quantity tweak.
+	addressChanged := payload.Address != currentAddress ||
+		payload.Latitude != currentLat ||
+		payload.Longitude != currentLng
 
-	submitted := map[string]bool{}
-	for _, s := range payload.Subscriptions {
-		submitted[s.Slot] = true
-
-		activeDays := s.ActiveDays
-		if s.ScheduleType != "custom" {
-			activeDays = []int{0, 1, 2, 3, 4, 5, 6}
-		}
-		anchorDate := time.Now().Format("2006-01-02")
-		if s.ScheduleType == "alternate" && s.StartDate != "" {
-			anchorDate = s.StartDate
-		}
-
-		subID, _ := uuid.NewV7()
-		_, err = tx.Exec(ctx, subQuery,
-			subID, customerID, s.Slot, s.ScheduleType, activeDays, anchorDate,
-			s.Items.Milk, s.Items.Curd, s.Items.Butter, s.Items.Ghee,
-			s.Items.Lassi, s.Items.Paneer, s.Items.Jaggery, s.Items.Khand,
-			s.Items.Oil, s.Items.Atta, s.Items.Burfi,
-		)
-		if err != nil {
-			http.Error(w, "Failed to update subscription", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	// 3. Remove slots the customer dropped. Future overrides for that slot go
-	// too — leaving them would resurrect deliveries for a slot with no
-	// standing order. Past delivery_logs are untouched: they're billing
-	// history and must survive a subscription change.
-	for _, slot := range []string{"morning", "evening"} {
-		if submitted[slot] {
-			continue
-		}
-		if _, err := tx.Exec(ctx,
-			`DELETE FROM order_overrides WHERE customer_id = $1 AND slot = $2 AND target_date >= CURRENT_DATE`,
-			customerID, slot,
-		); err != nil {
-			http.Error(w, "Failed to clear old schedule", http.StatusInternalServerError)
-			return
-		}
-		if _, err := tx.Exec(ctx,
-			`DELETE FROM subscriptions WHERE customer_id = $1 AND slot = $2`,
-			customerID, slot,
-		); err != nil {
-			http.Error(w, "Failed to update subscription", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		http.Error(w, "Failed to update subscription", http.StatusInternalServerError)
+	subsJSON, err := json.Marshal(payload.Subscriptions)
+	if err != nil {
+		http.Error(w, "Could not save your changes", http.StatusInternalServerError)
 		return
 	}
+
+	changeID, _ := uuid.NewV7()
+	_, err = ur.DB.Exec(ctx, `
+		INSERT INTO pending_subscription_changes
+			(id, customer_id, name, house_address, geo_latitude, geo_longitude,
+			 subscriptions, address_changed)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, changeID, customerID, payload.Name, payload.Address,
+		payload.Latitude, payload.Longitude, subsJSON, addressChanged)
+
+	if err != nil {
+		// The partial unique index on (customer_id) WHERE review_status =
+		// 'PENDING' is what rejects a second open request. Catching it here
+		// rather than pre-checking avoids a read-then-write race.
+		if strings.Contains(err.Error(), "idx_pending_change_one_per_customer") ||
+			strings.Contains(err.Error(), "duplicate key") {
+			http.Error(w, "You already have a change under review. Please wait for our team to confirm it before submitting another.", http.StatusConflict)
+			return
+		}
+		http.Error(w, "Could not save your changes: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	registration.MarkUsed(ctx, ur.DB, payload.Token)
 
-	// Send WhatsApp confirmation
 	if ur.WhatsApp != nil {
-		msg := "✅ Your details have been updated successfully.\n\nBecause your address or schedule changed, your account is temporarily pending while our team reviews the changes to assign your delivery route.\n\nWe will notify you once deliveries are ready to resume!"
-		ur.WhatsApp.SendDeliveryUpdate(phone, msg)
+		msg := "📝 We've received your requested changes.\n\n" +
+			"*Your deliveries continue as normal in the meantime* — nothing changes until our team reviews this.\n\n" +
+			"Once approved, your new order starts from the following day. We'll message you either way."
+		go ur.WhatsApp.SendDeliveryUpdate(phone, msg)
 	}
 
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "pending_review",
+		"message": "Change request submitted for review",
+	})
 }

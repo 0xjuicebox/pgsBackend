@@ -59,7 +59,9 @@ func (rr RouteResource) Routes() chi.Router {
 		r.Put("/", rr.Update)
 		r.Delete("/", rr.Delete)
 
-		r.Put("/prices", rr.UpdatePrices)
+		r.Put("/prices", rr.SetPrices)
+		r.Get("/prices/pending", rr.GetPendingPrices)
+		r.Delete("/prices/pending", rr.CancelPendingPrices)
 		r.Put("/sequence", rr.UpdateSequence)
 		r.Put("/driver", rr.UpdateDriver)
 

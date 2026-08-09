@@ -60,6 +60,8 @@ func main() {
 	log.Println("Successfully connected and pinged Supabase PostgreSQL engine.")
 
 	go driver.StartAutoEndSweeper(pool)
+	go route.StartPricePromotionSweeper(pool)
+	go update.StartChangeSweeper(pool)
 
 	// WhatsApp
 	// WhatsApp — NewWhatsAppService reads Twilio creds from env itself

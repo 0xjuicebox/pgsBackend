@@ -565,6 +565,11 @@ func (dr DeliveryResource) List(w http.ResponseWriter, r *http.Request) {
 
 // -------------------------------------------------------------------------
 // Admin: Update (partial correction to a log)
+//
+// Note this deliberately never touches unit_price_*. Those are the snapshot
+// of what the customer was actually charged; re-reading today's route price
+// while correcting a quantity would silently rewrite history if the route's
+// price had moved since the delivery happened.
 // -------------------------------------------------------------------------
 
 func (dr DeliveryResource) Update(w http.ResponseWriter, r *http.Request) {
@@ -662,6 +667,49 @@ func (dr DeliveryResource) AdminUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the price list to snapshot onto this log.
+	//
+	// Without this the unit_price_* columns fall back to their NUMERIC NOT
+	// NULL DEFAULT 0, and billing — which computes delivered_qty ×
+	// unit_price — silently produces ₹0 for every admin-created delivery.
+	// That hit exactly the recovery path meant to prevent lost revenue: a
+	// driver's offline delivery that permanently failed to sync and got
+	// recreated by an admin from the sync-failures bucket.
+	//
+	// Prefer the route named on the request; fall back to whatever route the
+	// customer's subscription for this slot points at, so an admin who
+	// doesn't specify one still gets correct pricing.
+	var routeArg any
+	if req.RouteId != nil && *req.RouteId != "" {
+		routeArg = *req.RouteId
+	}
+
+	prices := make([]float64, len(Products))
+	priceCols := make([]string, 0, len(Products))
+	priceDest := make([]any, 0, len(Products))
+	for i, p := range Products {
+		priceCols = append(priceCols, "COALESCE(rt.price_"+p+", 0)")
+		priceDest = append(priceDest, &prices[i])
+	}
+
+	priceQuery := `
+		SELECT ` + strings.Join(priceCols, ", ") + `
+		FROM subscriptions s
+		LEFT JOIN routes rt ON rt.id = COALESCE($2::uuid, s.route_id)
+		WHERE s.customer_id = $1 AND s.slot = $3
+		LIMIT 1
+	`
+	if err := dr.DB.QueryRow(r.Context(), priceQuery, req.CustomerId, routeArg, req.Slot).Scan(priceDest...); err != nil {
+		if err == pgx.ErrNoRows {
+			// Admin authority is absolute elsewhere, but a log we can't price
+			// is worse than no log at all — it looks correct and bills nothing.
+			http.Error(w, "Cannot determine pricing: this customer has no "+req.Slot+" subscription. Assign one first, or use a different slot.", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "Failed to resolve pricing: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	cols := []string{"id", "customer_id", "route_id", "slot", "delivery_date", "status", "customer_feedback"}
 	logID, _ := uuid.NewV7()
 	vals := []any{logID, req.CustomerId, req.RouteId, req.Slot, req.Date, req.Status, req.Feedback}
@@ -670,12 +718,18 @@ func (dr DeliveryResource) AdminUpsert(w http.ResponseWriter, r *http.Request) {
 		cols = append(cols, "delivered_"+p+"_qty")
 		vals = append(vals, req.Quantities[p])
 	}
+	for i, p := range Products {
+		cols = append(cols, "unit_price_"+p)
+		vals = append(vals, prices[i])
+	}
 
 	placeholders := make([]string, len(vals))
 	updates := make([]string, 0, len(cols))
 	for i, c := range cols {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		if c != "id" && c != "customer_id" {
+		// Prices are written on INSERT but never on UPDATE. Editing an
+		// existing log must not reprice it — see the note on Update above.
+		if c != "id" && c != "customer_id" && !strings.HasPrefix(c, "unit_price_") {
 			updates = append(updates, c+" = EXCLUDED."+c)
 		}
 	}

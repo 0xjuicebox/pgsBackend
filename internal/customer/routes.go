@@ -198,20 +198,43 @@ func (cr CustomerResource) Update(w http.ResponseWriter, r *http.Request) {
 func (cr CustomerResource) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	// Superficial v1 guard: block delete if any invoice for this customer is
-	// still unpaid. Admin can still resolve this by marking the invoice paid
-	// first — this is not a bypass-proof constraint, just a footgun-blocker.
-	var unpaidCount int
-	err := cr.DB.QueryRow(r.Context(),
-		`SELECT COUNT(*) FROM invoices WHERE customer_id = $1 AND status = 'PENDING'`,
-		id,
-	).Scan(&unpaidCount)
+	// Two separate blockers, reported separately so the admin knows which
+	// action to take: settle a bill, or raise a final invoice.
+	//
+	// The second check exists because deletion cascades through
+	// delivery_logs. A customer removed mid-month takes their uninvoiced
+	// DELIVERED rows with them — revenue that was earned and then vanished
+	// with no record anywhere. The WhatsApp self-service delete has always
+	// checked this; the admin endpoint didn't, which meant the safer path
+	// was the customer's and the riskier one was the admin's.
+	var unpaidCount, unbilledDeliveries int
+	err := cr.DB.QueryRow(r.Context(), `
+		SELECT
+			(SELECT COUNT(*) FROM invoices
+			  WHERE customer_id = $1 AND status = 'PENDING'),
+			(SELECT COUNT(*) FROM delivery_logs
+			  WHERE customer_id = $1
+			    AND status = 'DELIVERED'
+			    AND delivery_date >= date_trunc('month', CURRENT_DATE)
+			    AND NOT EXISTS (
+			        SELECT 1 FROM invoices i
+			        WHERE i.customer_id = $1
+			          AND i.billing_month = TO_CHAR(CURRENT_DATE, 'YYYY-MM')
+			    ))
+	`, id).Scan(&unpaidCount, &unbilledDeliveries)
 	if err != nil {
-		http.Error(w, "Failed checking outstanding invoices: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed checking outstanding balance: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if unpaidCount > 0 {
 		http.Error(w, "Cannot delete: customer has unpaid invoices. Mark them paid first.", http.StatusConflict)
+		return
+	}
+	if unbilledDeliveries > 0 {
+		http.Error(w, fmt.Sprintf(
+			"Cannot delete: %d delivery(s) this month haven't been billed yet. Raise a final invoice for this customer first, then delete once it's settled.",
+			unbilledDeliveries,
+		), http.StatusConflict)
 		return
 	}
 
