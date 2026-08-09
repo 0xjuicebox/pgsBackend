@@ -51,6 +51,9 @@ func (dr DriverResource) Routes() chi.Router {
 		r.Post("/shift/start", dr.StartShift)
 		r.Post("/shift/end", dr.EndShift)
 
+		r.Get("/sync-failures", dr.ListSyncFailures)
+		r.Post("/sync-failures/{id}/resolve", dr.ResolveSyncFailure)
+
 		// Offline-queue sync failure reporting
 		r.Post("/sync-failures", dr.ReportSyncFailure)
 	})
