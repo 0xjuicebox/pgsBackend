@@ -13,6 +13,7 @@ import (
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
 	"github.com/0xjuicebox/pgsBackend/internal/registration"
 	"github.com/go-chi/chi/v5"
+	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -57,15 +58,26 @@ func (ur UpdateResource) ShowForm(w http.ResponseWriter, r *http.Request) {
 	updateTmpl.Execute(w, map[string]string{"Token": token})
 }
 
-type FullState struct {
-	Name         string         `json:"name"`
-	Address      string         `json:"address"`
-	Latitude     string         `json:"latitude"`
-	Longitude    string         `json:"longitude"`
+// SlotSubscription is one slot's standing order as the page reads and writes
+// it. Subscribed=false means the customer has no subscription for that slot;
+// the page renders it as an "Add evening delivery" prompt.
+type SlotSubscription struct {
+	Slot         string         `json:"slot"`
+	Subscribed   bool           `json:"subscribed"`
 	ScheduleType string         `json:"scheduleType"`
 	ActiveDays   []int          `json:"activeDays"`
 	StartDate    string         `json:"startDate"`
-	DefaultOrder customer.Order `json:"defaultOrder"`
+	Items        customer.Order `json:"items"`
+}
+
+type FullState struct {
+	Name      string `json:"name"`
+	Address   string `json:"address"`
+	Latitude  string `json:"latitude"`
+	Longitude string `json:"longitude"`
+
+	Morning SlotSubscription `json:"morning"`
+	Evening SlotSubscription `json:"evening"`
 }
 
 func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +91,10 @@ func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var state FullState
+	state := FullState{
+		Morning: SlotSubscription{Slot: "morning"},
+		Evening: SlotSubscription{Slot: "evening"},
+	}
 	var customerID string
 
 	err = ur.DB.QueryRow(ctx, "SELECT id, name, house_address, geo_latitude, geo_longitude FROM customers WHERE phone_number = $1", phone).Scan(
@@ -90,34 +105,86 @@ func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subQuery := `
-        SELECT schedule_type, active_days, TO_CHAR(anchor_date, 'YYYY-MM-DD'),
+	// One row per slot. Previously this used QueryRow with no slot filter,
+	// which returned whichever row Postgres happened to hand back first —
+	// so a two-slot customer saw a random slot's data in the form.
+	rows, err := ur.DB.Query(ctx, `
+        SELECT slot, schedule_type, active_days, TO_CHAR(anchor_date, 'YYYY-MM-DD'),
                default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
                default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
                default_oil_qty, default_atta_qty, default_burfi_qty
-        FROM subscriptions WHERE customer_id = $1`
-	ur.DB.QueryRow(ctx, subQuery, customerID).Scan(
-		&state.ScheduleType, &state.ActiveDays, &state.StartDate,
-		&state.DefaultOrder.Milk, &state.DefaultOrder.Curd, &state.DefaultOrder.Butter, &state.DefaultOrder.Ghee,
-		&state.DefaultOrder.Lassi, &state.DefaultOrder.Paneer, &state.DefaultOrder.Jaggery, &state.DefaultOrder.Khand,
-		&state.DefaultOrder.Oil, &state.DefaultOrder.Atta, &state.DefaultOrder.Burfi,
-	)
+        FROM subscriptions WHERE customer_id = $1`, customerID)
+	if err != nil {
+		http.Error(w, "Failed to load subscriptions", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var slot string
+		var s SlotSubscription
+		if err := rows.Scan(
+			&slot, &s.ScheduleType, &s.ActiveDays, &s.StartDate,
+			&s.Items.Milk, &s.Items.Curd, &s.Items.Butter, &s.Items.Ghee,
+			&s.Items.Lassi, &s.Items.Paneer, &s.Items.Jaggery, &s.Items.Khand,
+			&s.Items.Oil, &s.Items.Atta, &s.Items.Burfi,
+		); err != nil {
+			continue
+		}
+		s.Subscribed = true
+		s.Slot = slot
+		if slot == "evening" {
+			state.Evening = s
+		} else {
+			state.Morning = s
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(state)
 }
 
-// Reuses the SubmitPayload structure from registration
+// UpdatePayload is what update.html submits.
+//
+// Subscriptions is authoritative: any slot NOT present in the array is
+// removed. That's how a customer cancels just their evening delivery while
+// keeping morning — they submit with only the morning entry.
 type UpdatePayload struct {
-	Token        string         `json:"token"`
-	Name         string         `json:"name"`
-	Address      string         `json:"address"`
-	Latitude     string         `json:"latitude"`
-	Longitude    string         `json:"longitude"`
+	Token     string `json:"token"`
+	Name      string `json:"name"`
+	Address   string `json:"address"`
+	Latitude  string `json:"latitude"`
+	Longitude string `json:"longitude"`
+
+	Subscriptions []SlotSubscription `json:"subscriptions"`
+
+	// Legacy (pre-slots) fields, normalized into Subscriptions on decode.
 	ScheduleType string         `json:"scheduleType"`
 	ActiveDays   []int          `json:"activeDays"`
 	StartDate    string         `json:"startDate"`
 	Items        customer.Order `json:"items"`
+}
+
+func (p *UpdatePayload) normalize() {
+	if len(p.Subscriptions) == 0 {
+		p.Subscriptions = []SlotSubscription{{
+			Slot:         "morning",
+			ScheduleType: p.ScheduleType,
+			ActiveDays:   p.ActiveDays,
+			StartDate:    p.StartDate,
+			Items:        p.Items,
+		}}
+	}
+	for i := range p.Subscriptions {
+		if p.Subscriptions[i].Slot != "evening" {
+			p.Subscriptions[i].Slot = "morning"
+		}
+	}
+}
+
+func orderTotal(o customer.Order) int {
+	return o.Milk + o.Curd + o.Butter + o.Ghee + o.Lassi + o.Paneer +
+		o.Jaggery + o.Khand + o.Oil + o.Atta + o.Burfi
 }
 
 func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
@@ -126,6 +193,7 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
+	payload.normalize()
 
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
@@ -136,7 +204,31 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, _ := ur.DB.Begin(ctx)
+	if payload.Name == "" || payload.Address == "" {
+		http.Error(w, "Name and address are required", http.StatusBadRequest)
+		return
+	}
+
+	// Drop empty slots — a slot submitted with all zeros means "cancel this
+	// slot", which the delete step below handles.
+	kept := payload.Subscriptions[:0]
+	for _, s := range payload.Subscriptions {
+		if orderTotal(s.Items) > 0 {
+			kept = append(kept, s)
+		}
+	}
+	payload.Subscriptions = kept
+
+	if len(payload.Subscriptions) == 0 {
+		http.Error(w, "Please keep at least one item on at least one delivery slot. To stop deliveries entirely, reply PAUSE on WhatsApp.", http.StatusBadRequest)
+		return
+	}
+
+	tx, err := ur.DB.Begin(ctx)
+	if err != nil {
+		http.Error(w, "Failed to update profile", http.StatusInternalServerError)
+		return
+	}
 	defer tx.Rollback(ctx)
 
 	var customerID string
@@ -152,32 +244,83 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Update Subscription
-	anchorDate := time.Now().Format("2006-01-02")
-	if payload.ScheduleType == "alternate" && payload.StartDate != "" {
-		anchorDate = payload.StartDate
+	// 2. Upsert each submitted slot. Scoped by (customer_id, slot) — the old
+	// statement filtered on customer_id alone and overwrote BOTH slots with
+	// the same values for anyone subscribed to morning and evening.
+	subQuery := `
+		INSERT INTO subscriptions (
+			id, customer_id, slot, schedule_type, active_days, anchor_date,
+			default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
+			default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
+			default_oil_qty, default_atta_qty, default_burfi_qty
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+		)
+		ON CONFLICT (customer_id, slot) DO UPDATE SET
+			schedule_type = EXCLUDED.schedule_type, active_days = EXCLUDED.active_days,
+			anchor_date = EXCLUDED.anchor_date,
+			default_milk_qty = EXCLUDED.default_milk_qty, default_curd_qty = EXCLUDED.default_curd_qty,
+			default_butter_qty = EXCLUDED.default_butter_qty, default_ghee_qty = EXCLUDED.default_ghee_qty,
+			default_lassi_qty = EXCLUDED.default_lassi_qty, default_paneer_qty = EXCLUDED.default_paneer_qty,
+			default_jaggery_qty = EXCLUDED.default_jaggery_qty, default_khand_qty = EXCLUDED.default_khand_qty,
+			default_oil_qty = EXCLUDED.default_oil_qty, default_atta_qty = EXCLUDED.default_atta_qty,
+			default_burfi_qty = EXCLUDED.default_burfi_qty`
+
+	submitted := map[string]bool{}
+	for _, s := range payload.Subscriptions {
+		submitted[s.Slot] = true
+
+		activeDays := s.ActiveDays
+		if s.ScheduleType != "custom" {
+			activeDays = []int{0, 1, 2, 3, 4, 5, 6}
+		}
+		anchorDate := time.Now().Format("2006-01-02")
+		if s.ScheduleType == "alternate" && s.StartDate != "" {
+			anchorDate = s.StartDate
+		}
+
+		subID, _ := uuid.NewV7()
+		_, err = tx.Exec(ctx, subQuery,
+			subID, customerID, s.Slot, s.ScheduleType, activeDays, anchorDate,
+			s.Items.Milk, s.Items.Curd, s.Items.Butter, s.Items.Ghee,
+			s.Items.Lassi, s.Items.Paneer, s.Items.Jaggery, s.Items.Khand,
+			s.Items.Oil, s.Items.Atta, s.Items.Burfi,
+		)
+		if err != nil {
+			http.Error(w, "Failed to update subscription", http.StatusInternalServerError)
+			return
+		}
 	}
 
-	subQuery := `
-		UPDATE subscriptions SET
-			schedule_type = $1, active_days = $2, anchor_date = $3,
-			default_milk_qty = $4, default_curd_qty = $5, default_butter_qty = $6, default_ghee_qty = $7,
-			default_lassi_qty = $8, default_paneer_qty = $9, default_jaggery_qty = $10, default_khand_qty = $11,
-			default_oil_qty = $12, default_atta_qty = $13, default_burfi_qty = $14
-		WHERE customer_id = $15`
-	_, err = tx.Exec(ctx, subQuery,
-		payload.ScheduleType, payload.ActiveDays, anchorDate,
-		payload.Items.Milk, payload.Items.Curd, payload.Items.Butter, payload.Items.Ghee,
-		payload.Items.Lassi, payload.Items.Paneer, payload.Items.Jaggery, payload.Items.Khand,
-		payload.Items.Oil, payload.Items.Atta, payload.Items.Burfi,
-		customerID,
-	)
-	if err != nil {
+	// 3. Remove slots the customer dropped. Future overrides for that slot go
+	// too — leaving them would resurrect deliveries for a slot with no
+	// standing order. Past delivery_logs are untouched: they're billing
+	// history and must survive a subscription change.
+	for _, slot := range []string{"morning", "evening"} {
+		if submitted[slot] {
+			continue
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM order_overrides WHERE customer_id = $1 AND slot = $2 AND target_date >= CURRENT_DATE`,
+			customerID, slot,
+		); err != nil {
+			http.Error(w, "Failed to clear old schedule", http.StatusInternalServerError)
+			return
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM subscriptions WHERE customer_id = $1 AND slot = $2`,
+			customerID, slot,
+		); err != nil {
+			http.Error(w, "Failed to update subscription", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
 		http.Error(w, "Failed to update subscription", http.StatusInternalServerError)
 		return
 	}
-
-	tx.Commit(ctx)
 	registration.MarkUsed(ctx, ur.DB, payload.Token)
 
 	// Send WhatsApp confirmation

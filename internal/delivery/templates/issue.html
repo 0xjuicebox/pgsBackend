@@ -6,314 +6,349 @@
 <title>Report an Issue — PGS Direct</title>
 <style>
   :root {
-    --accent: #1a7a4c;
-    --accent-light: #e6f4ec;
-    --ink: #1c2321;
-    --ink-soft: #5c6a63;
-    --bg: #f9f9f9;
-    --card: #ffffff;
-    --border: #eaeaea;
-    --danger: #dc2626;
-    --danger-light: #fef2f2;
-    --amber: #d97706;
-    --amber-light: #fef3c7;
-    --radius: 16px;
+    --accent: #1a7a4c; --accent-dark: #14603c; --accent-light: #e8f5ee;
+    --ink: #16211d; --ink-soft: #5c6a63; --ink-faint: #94a3a0;
+    --bg: #f7f8f7; --card: #fff; --line: #e8eae9; --line-strong: #d4d8d6;
+    --danger: #dc2626; --amber: #d97706; --amber-light: #fffbeb;
+    --r-sm: 10px; --r: 16px; --r-lg: 22px;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; }
   body {
-    margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--ink);
-    padding-bottom: 120px;
+    background: var(--bg); color: var(--ink); font-size: 16px; line-height: 1.5;
+    padding-bottom: 140px;
   }
-
   header {
-    background: var(--card);
-    padding: 20px 20px 16px;
-    text-align: center;
-    border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
-    z-index: 10;
+    background: var(--card); border-bottom: 1px solid var(--line);
+    padding: 18px 20px 16px; text-align: center; position: sticky; top: 0; z-index: 500;
   }
-  header h1 { margin: 0 0 4px; font-size: 20px; font-weight: 700; }
-  header p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  header h1 { margin: 0; font-size: 19px; font-weight: 750; letter-spacing: -0.02em; }
+  header p { margin: 3px 0 0; font-size: 13px; color: var(--ink-soft); }
 
-  main { padding: 20px 16px; }
+  main { padding: 20px 16px 0; max-width: 560px; margin: 0 auto; }
 
   .section-label {
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--ink-soft);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin: 4px 4px 12px;
+    font-size: 12px; font-weight: 700; color: var(--ink-soft);
+    text-transform: uppercase; letter-spacing: .05em; margin: 0 4px 10px;
   }
 
-  .delivery-list { display: flex; flex-direction: column; gap: 10px; }
-
-  .delivery-card {
-    background: var(--card);
-    border: 2px solid var(--border);
-    border-radius: var(--radius);
-    padding: 16px;
-    cursor: pointer;
-    transition: border-color .15s, background .15s;
+  /* ---------- Delivery cards ---------- */
+  .delivery {
+    background: var(--card); border: 2px solid var(--line);
+    border-radius: var(--r); padding: 16px; margin-bottom: 10px;
+    cursor: pointer; transition: border-color .15s, background .15s;
   }
-  .delivery-card:active { transform: scale(0.995); }
-  .delivery-card.selected { border-color: var(--accent); background: var(--accent-light); }
-  .delivery-card.disabled { opacity: 0.55; cursor: not-allowed; }
+  .delivery.selected { border-color: var(--accent); background: var(--accent-light); }
+  .delivery.disabled { opacity: .55; cursor: not-allowed; }
 
-  .row-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-  .slot-label { font-weight: 700; font-size: 15px; text-transform: capitalize; }
-  .date-label { font-size: 13px; color: var(--ink-soft); }
-  .flagged-chip {
+  .del-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .del-slot { display: flex; align-items: center; gap: 8px; }
+  .del-slot .ico { font-size: 18px; }
+  .del-slot strong { font-size: 15px; font-weight: 700; }
+  .del-date { font-size: 12.5px; color: var(--ink-soft); font-weight: 600; }
+  .chip {
     display: inline-block; background: var(--amber-light); color: var(--amber);
-    padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
-    margin-left: 8px; text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 2px 8px; border-radius: 99px; font-size: 10.5px; font-weight: 700;
+    margin-left: 8px; text-transform: uppercase; letter-spacing: .04em;
+    border: 1px solid #fde68a;
   }
-  .items { font-size: 13px; color: var(--ink-soft); line-height: 1.5; }
+  .del-items { font-size: 13px; color: var(--ink-soft); line-height: 1.5; }
 
-  .empty {
-    background: var(--card);
-    border: 1px dashed var(--border);
-    border-radius: var(--radius);
-    padding: 32px 20px;
-    text-align: center;
-    color: var(--ink-soft);
-  }
-  .empty h3 { margin: 0 0 4px; color: var(--ink); font-size: 16px; }
-  .empty p { margin: 0; font-size: 13px; }
-
-  .feedback-block { margin-top: 24px; }
-  textarea {
-    width: 100%;
-    min-height: 120px;
-    padding: 14px;
-    border: 1px solid var(--border);
-    border-radius: 12px;
+  /* ---------- Reason picker ---------- */
+  .reasons { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 16px; }
+  .reason {
+    border: 2px solid var(--line); background: var(--card); border-radius: 14px;
+    padding: 13px 10px; cursor: pointer; text-align: center; transition: all .15s;
     font-family: inherit;
-    font-size: 15px;
-    resize: vertical;
-    background: var(--card);
-    color: var(--ink);
+  }
+  .reason .ico { font-size: 19px; display: block; margin-bottom: 4px; }
+  .reason strong { display: block; font-size: 13px; font-weight: 650; }
+  .reason.active { border-color: var(--accent); background: var(--accent-light); }
+
+  section.card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--r-lg); padding: 20px 18px; margin-bottom: 16px;
+  }
+  section.card > h2 { margin: 0 0 4px; font-size: 16.5px; font-weight: 750; letter-spacing: -0.02em; }
+  section.card > .hint { margin: 0 0 16px; font-size: 13px; color: var(--ink-soft); }
+
+  textarea {
+    width: 100%; min-height: 110px; padding: 13px 14px;
+    border: 1.5px solid var(--line-strong); border-radius: var(--r-sm);
+    font-family: inherit; font-size: 15px; color: var(--ink);
+    resize: vertical; background: var(--card); line-height: 1.5;
   }
   textarea:focus { outline: none; border-color: var(--accent); }
-  .char-count { font-size: 12px; color: var(--ink-soft); text-align: right; margin-top: 6px; }
+  .char-count { font-size: 11.5px; color: var(--ink-faint); text-align: right; margin-top: 6px; }
 
-  .bottom-bar {
-    position: fixed;
-    left: 0; right: 0; bottom: 0;
-    padding: 16px;
-    background: var(--card);
-    border-top: 1px solid var(--border);
-    box-shadow: 0 -2px 12px rgba(0,0,0,0.04);
-  }
-  button.submit {
-    width: 100%;
-    padding: 16px;
-    border: none;
-    border-radius: 14px;
-    background: var(--accent);
-    color: #fff;
-    font-size: 16px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: opacity .15s;
-  }
-  button.submit:disabled { opacity: 0.4; cursor: not-allowed; }
+  .notice { display: flex; gap: 10px; padding: 13px 14px; border-radius: var(--r-sm); font-size: 13px; line-height: 1.5; }
+  .notice.plain { background: var(--bg); border: 1px solid var(--line); color: var(--ink-soft); }
 
-  .toast {
-    position: fixed;
-    top: 20px; left: 50%; transform: translateX(-50%);
-    background: var(--ink); color: #fff;
-    padding: 12px 20px; border-radius: 12px;
-    font-size: 14px; font-weight: 500;
-    z-index: 100;
-    opacity: 0; pointer-events: none;
-    transition: opacity .2s;
-    max-width: calc(100% - 32px);
-    text-align: center;
-  }
-  .toast.show { opacity: 1; }
+  .empty-state { text-align: center; padding: 50px 24px; color: var(--ink-soft); }
+  .empty-state .ico { font-size: 36px; display: block; margin-bottom: 12px; }
+  .empty-state strong { display: block; color: var(--ink); font-size: 16px; margin-bottom: 4px; }
+  .empty-state p { margin: 0; font-size: 13.5px; }
+
+  .bottom { position: fixed; left: 0; right: 0; bottom: 0; z-index: 700; background: var(--card); border-top: 1px solid var(--line); padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); }
+  .bottom-inner { max-width: 560px; margin: 0 auto; }
+  .submit-btn { width: 100%; padding: 17px; border: none; border-radius: 14px; background: var(--accent); color: #fff; font-family: inherit; font-size: 16px; font-weight: 700; cursor: pointer; transition: background .15s; }
+  .submit-btn:active { background: var(--accent-dark); }
+  .submit-btn:disabled { background: var(--line-strong); cursor: not-allowed; }
+  .bottom-note { text-align: center; font-size: 12px; color: var(--ink-faint); margin-top: 8px; }
+
+  .toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%) translateY(-140%); background: var(--ink); color: #fff; padding: 12px 20px; border-radius: 12px; font-size: 14px; z-index: 900; max-width: calc(100% - 32px); text-align: center; transition: transform .28s cubic-bezier(.4,0,.2,1); box-shadow: 0 8px 24px rgba(0,0,0,.2); }
+  .toast.show { transform: translateX(-50%) translateY(0); }
   .toast.error { background: var(--danger); }
 
-  .success-screen {
-    display: none;
-    padding: 60px 24px;
-    text-align: center;
-  }
-  .success-screen.show { display: block; }
-  .success-screen .check {
-    width: 64px; height: 64px; margin: 0 auto 20px;
-    background: var(--accent-light);
-    border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    color: var(--accent); font-size: 32px;
-  }
-  .success-screen h2 { margin: 0 0 8px; font-size: 22px; }
-  .success-screen p { margin: 0; color: var(--ink-soft); font-size: 15px; line-height: 1.5; }
+  #loader { padding: 80px 20px; text-align: center; color: var(--ink-soft); }
+  .spinner-lg { width: 32px; height: 32px; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 14px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #successScreen { display: none; padding: 70px 28px; text-align: center; }
+  #successScreen.show { display: block; }
+  .success-mark { width: 72px; height: 72px; margin: 0 auto 22px; background: var(--accent-light); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 36px; color: var(--accent); }
+  #successScreen h2 { margin: 0 0 10px; font-size: 23px; letter-spacing: -0.02em; }
+  #successScreen p { margin: 0; color: var(--ink-soft); font-size: 15px; line-height: 1.6; }
 </style>
 </head>
 <body>
 
 <header>
   <h1>Report an Issue</h1>
-  <p>Select the delivery you'd like to report</p>
+  <p>Tell us what went wrong and we'll put it right</p>
 </header>
 
-<main id="main">
-  <div class="section-label">Recent deliveries</div>
-  <div id="deliveryList" class="delivery-list">
-    <div class="empty"><p>Loading…</p></div>
-  </div>
+<div id="loader"><div class="spinner-lg"></div>Loading your deliveries…</div>
 
-  <div id="feedbackBlock" class="feedback-block" style="display:none">
-    <div class="section-label">What went wrong?</div>
-    <textarea id="feedback" placeholder="Describe the issue in a few words — e.g. 'Milk was spoiled', 'Quantity was less than ordered', 'Delivered to wrong door'..." maxlength="500"></textarea>
-    <div class="char-count"><span id="charCount">0</span> / 500</div>
+<main id="root" style="display:none">
+  <div class="section-label">Which delivery?</div>
+  <div id="deliveryList"></div>
+
+  <div id="detailBlock" style="display:none">
+    <section class="card">
+      <h2>What was the problem?</h2>
+      <p class="hint">Pick the closest match, then add any detail below.</p>
+      <div class="reasons" id="reasons"></div>
+
+      <textarea id="feedback" maxlength="500"
+        placeholder="Tell us what happened — e.g. 'Only 1L arrived instead of 2L', or 'The curd smelled off'…"></textarea>
+      <div class="char-count"><span id="charCount">0</span> / 500</div>
+    </section>
+
+    <div class="notice plain" style="margin-bottom:20px">
+      <span>💬</span>
+      <div>Our team reviews every report and will follow up on WhatsApp. If something was missing or spoiled, we'll adjust your bill.</div>
+    </div>
   </div>
 </main>
 
-<div id="successScreen" class="success-screen">
-  <div class="check">✓</div>
-  <h2>Thanks — we've logged your report</h2>
-  <p>Our team will look into this and get back to you on WhatsApp shortly. You can close this page.</p>
+<div id="successScreen">
+  <div class="success-mark">✓</div>
+  <h2>Thanks — we've logged it</h2>
+  <p>Our team will look into this and get back to you on WhatsApp shortly. You can close this page now.</p>
 </div>
 
-<div class="bottom-bar" id="bottomBar">
-  <button class="submit" id="submitBtn" disabled>Submit Report</button>
+<div class="bottom" id="bottomBar" style="display:none">
+  <div class="bottom-inner">
+    <button class="submit-btn" id="submitBtn" disabled>Submit Report</button>
+    <div class="bottom-note" id="bottomNote">Choose a delivery to continue</div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
-  const params = new URLSearchParams(window.location.search);
-  const token = params.get('token');
+const TOKEN = new URLSearchParams(location.search).get('token');
 
-  const LABELS = {
-    milk: 'Milk', curd: 'Curd', butter: 'Butter', ghee: 'Ghee',
-    lassi: 'Buttermilk', paneer: 'Paneer', jaggery: 'Jaggery', khand: 'Desi Khand',
-    oil: 'Mustard Oil', atta: 'Atta', burfi: 'Burfi'
-  };
-  const LITRE = new Set(['milk', 'curd', 'lassi', 'oil']);
+const LABELS = {
+  milk: 'Milk', curd: 'Curd', butter: 'Butter', ghee: 'Ghee',
+  lassi: 'Buttermilk', paneer: 'Paneer', jaggery: 'Jaggery',
+  khand: 'Desi Khand', oil: 'Mustard Oil', atta: 'Atta', burfi: 'Burfi',
+};
+const LITRE = new Set(['milk', 'curd', 'lassi', 'oil']);
 
-  function formatQty(val, product) {
-    const litre = LITRE.has(product);
-    if (val < 1000) return val + (litre ? ' ml' : ' g');
-    return parseFloat((val / 1000).toFixed(2)) + (litre ? ' L' : ' kg');
-  }
+// Preset reasons keep reports consistent enough to spot patterns (e.g. one
+// route generating all the "quantity was short" complaints), while the free
+// text field still captures anything unusual.
+const REASONS = [
+  { key: 'quantity', ico: '⚖️', label: 'Wrong quantity' },
+  { key: 'quality',  ico: '🥛', label: 'Quality problem' },
+  { key: 'missing',  ico: '📭', label: "Didn't arrive" },
+  { key: 'other',    ico: '💬', label: 'Something else' },
+];
 
-  function prettyDate(iso) {
-    const d = new Date(iso + 'T00:00:00');
-    const today = new Date(); today.setHours(0,0,0,0);
-    const yest = new Date(today); yest.setDate(yest.getDate() - 1);
-    if (d.getTime() === today.getTime()) return 'Today';
-    if (d.getTime() === yest.getTime()) return 'Yesterday';
-    return d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
-  }
+const SLOT_META = {
+  morning: { ico: '🌅', label: 'Morning' },
+  evening: { ico: '🌆', label: 'Evening' },
+};
 
-  function showToast(msg, isError) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className = 'toast show' + (isError ? ' error' : '');
-    setTimeout(() => { t.className = 'toast'; }, 3000);
-  }
+let selectedLogId = null;
+let selectedReason = null;
 
-  let selectedLogId = null;
+function formatQty(v, product) {
+  const litre = LITRE.has(product);
+  if (v < 1000) return v + (litre ? ' ml' : ' g');
+  return parseFloat((v / 1000).toFixed(2)) + (litre ? ' L' : ' kg');
+}
 
-  async function load() {
-    try {
-      const res = await fetch('/delivery/issue/deliveries?token=' + encodeURIComponent(token));
-      if (!res.ok) throw new Error(await res.text() || 'Failed to load deliveries');
-      const data = await res.json();
-      render(data.deliveries || []);
-    } catch (err) {
-      document.getElementById('deliveryList').innerHTML =
-        '<div class="empty"><h3>Couldn\'t load deliveries</h3><p>' + (err.message || 'Please refresh and try again.') + '</p></div>';
-    }
-  }
+function prettyDate(iso) {
+  const d = new Date(iso + 'T00:00:00');
+  const today = new Date(); today.setHours(0,0,0,0);
+  const yest = new Date(today); yest.setDate(yest.getDate() - 1);
+  if (d.getTime() === today.getTime()) return 'Today';
+  if (d.getTime() === yest.getTime()) return 'Yesterday';
+  return d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+}
 
-  function render(deliveries) {
-    const list = document.getElementById('deliveryList');
-    if (deliveries.length === 0) {
-      list.innerHTML = '<div class="empty"><h3>Nothing to report</h3><p>You have no recent deliveries within the reporting window.</p></div>';
-      // Hide the feedback + submit area entirely when nothing's actionable.
-      document.getElementById('bottomBar').style.display = 'none';
-      return;
-    }
+function toast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' error' : '');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.className = 'toast'; }, 3200);
+}
 
-    list.innerHTML = deliveries.map(d => {
-      const items = Object.entries(d.items)
-        .filter(([, q]) => q > 0)
-        .map(([p, q]) => (LABELS[p] || p) + ' ' + formatQty(q, p))
-        .join(' · ') || 'No items recorded';
-
-      const disabled = d.alreadyFlagged;
-      const flaggedChip = disabled ? '<span class="flagged-chip">Already reported</span>' : '';
-
-      return `
-        <div class="delivery-card ${disabled ? 'disabled' : ''}" data-log="${d.logId}" data-disabled="${disabled}">
-          <div class="row-top">
-            <div><span class="slot-label">${d.slot}</span>${flaggedChip}</div>
-            <span class="date-label">${prettyDate(d.date)}</span>
-          </div>
-          <div class="items">${items}</div>
-        </div>
-      `;
-    }).join('');
-
-    list.querySelectorAll('.delivery-card').forEach(card => {
-      card.addEventListener('click', () => {
-        if (card.dataset.disabled === 'true') return;
-        list.querySelectorAll('.delivery-card').forEach(c => c.classList.remove('selected'));
-        card.classList.add('selected');
-        selectedLogId = card.dataset.log;
-        document.getElementById('feedbackBlock').style.display = 'block';
-        updateSubmitState();
-      });
+function buildReasons() {
+  const box = document.getElementById('reasons');
+  box.innerHTML = '';
+  REASONS.forEach(r => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'reason';
+    b.innerHTML = '<span class="ico">' + r.ico + '</span><strong></strong>';
+    b.querySelector('strong').textContent = r.label;
+    b.addEventListener('click', () => {
+      selectedReason = r;
+      document.querySelectorAll('.reason').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      updateSubmit();
     });
-  }
-
-  function updateSubmitState() {
-    const btn = document.getElementById('submitBtn');
-    const feedback = document.getElementById('feedback').value.trim();
-    btn.disabled = !selectedLogId || feedback.length < 5;
-  }
-
-  document.getElementById('feedback').addEventListener('input', (e) => {
-    document.getElementById('charCount').textContent = e.target.value.length;
-    updateSubmitState();
+    box.appendChild(b);
   });
+}
 
-  document.getElementById('submitBtn').addEventListener('click', async () => {
-    const btn = document.getElementById('submitBtn');
-    const feedback = document.getElementById('feedback').value.trim();
-    if (!selectedLogId || feedback.length < 5) return;
+function render(deliveries) {
+  const list = document.getElementById('deliveryList');
 
-    btn.disabled = true;
-    btn.textContent = 'Submitting…';
+  if (!deliveries.length) {
+    document.getElementById('loader').innerHTML =
+      '<div class="empty-state"><span class="ico">✅</span>' +
+      '<strong>Nothing to report</strong>' +
+      '<p>You have no recent deliveries inside the reporting window. If something went wrong with an older delivery, message us on WhatsApp and our team will help.</p></div>';
+    return;
+  }
 
-    try {
-      const res = await fetch('/delivery/issue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token, logId: selectedLogId, feedback })
+  list.innerHTML = '';
+  deliveries.forEach(d => {
+    const meta = SLOT_META[d.slot] || { ico: '📦', label: d.slot };
+    const items = Object.entries(d.items)
+      .filter(([, q]) => q > 0)
+      .map(([p, q]) => (LABELS[p] || p) + ' ' + formatQty(q, p))
+      .join(' · ') || 'No items recorded';
+
+    const card = document.createElement('div');
+    card.className = 'delivery' + (d.alreadyFlagged ? ' disabled' : '');
+
+    card.innerHTML =
+      '<div class="del-top">' +
+        '<div class="del-slot"><span class="ico">' + meta.ico + '</span><strong>' + meta.label + '</strong>' +
+          (d.alreadyFlagged ? '<span class="chip">Already reported</span>' : '') +
+        '</div>' +
+        '<span class="del-date"></span>' +
+      '</div>' +
+      '<div class="del-items"></div>';
+
+    card.querySelector('.del-date').textContent = prettyDate(d.date);
+    card.querySelector('.del-items').textContent = items;
+
+    if (!d.alreadyFlagged) {
+      card.addEventListener('click', () => {
+        document.querySelectorAll('.delivery').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        selectedLogId = d.logId;
+        document.getElementById('detailBlock').style.display = 'block';
+        updateSubmit();
       });
-      if (!res.ok) throw new Error((await res.text()) || 'Submission failed');
-
-      document.getElementById('main').style.display = 'none';
-      document.getElementById('bottomBar').style.display = 'none';
-      document.getElementById('successScreen').classList.add('show');
-    } catch (err) {
-      btn.disabled = false;
-      btn.textContent = 'Submit Report';
-      showToast(err.message || 'Something went wrong', true);
     }
+
+    list.appendChild(card);
   });
 
-  load();
+  document.getElementById('loader').style.display = 'none';
+  document.getElementById('root').style.display = 'block';
+  document.getElementById('bottomBar').style.display = 'block';
+}
+
+function updateSubmit() {
+  const btn = document.getElementById('submitBtn');
+  const note = document.getElementById('bottomNote');
+  const text = document.getElementById('feedback').value.trim();
+
+  if (!selectedLogId) {
+    btn.disabled = true; note.textContent = 'Choose a delivery to continue'; return;
+  }
+  if (!selectedReason) {
+    btn.disabled = true; note.textContent = 'Pick what kind of problem it was'; return;
+  }
+  if (text.length < 5) {
+    btn.disabled = true; note.textContent = 'Add a few words describing what happened'; return;
+  }
+  btn.disabled = false;
+  note.textContent = 'Our team will follow up on WhatsApp';
+}
+
+async function load() {
+  try {
+    const res = await fetch('/delivery/issue/deliveries?token=' + encodeURIComponent(TOKEN));
+    if (!res.ok) throw new Error(await res.text() || 'Failed to load');
+    const data = await res.json();
+    render(data.deliveries || []);
+  } catch (err) {
+    document.getElementById('loader').innerHTML =
+      '<p style="color:var(--danger);font-weight:600">Couldn\'t load your deliveries.</p>' +
+      '<p style="font-size:14px">This link may have expired. Please tap "Report an issue" on WhatsApp again.</p>';
+  }
+}
+
+async function submit() {
+  const text = document.getElementById('feedback').value.trim();
+  if (!selectedLogId || !selectedReason || text.length < 5) return;
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+
+  // The reason is prefixed onto the free text rather than sent as its own
+  // field — the backend stores a single customer_feedback string, and this
+  // keeps the admin dashboard's flagged list scannable at a glance.
+  const feedback = '[' + selectedReason.label + '] ' + text;
+
+  try {
+    const res = await fetch('/delivery/issue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN, logId: selectedLogId, feedback }),
+    });
+    if (!res.ok) throw new Error((await res.text()) || 'Submission failed');
+
+    document.getElementById('root').style.display = 'none';
+    document.getElementById('bottomBar').style.display = 'none';
+    document.querySelector('header').style.display = 'none';
+    document.getElementById('successScreen').classList.add('show');
+    window.scrollTo(0,0);
+  } catch (err) {
+    btn.disabled = false; btn.textContent = 'Submit Report';
+    toast(err.message || 'Something went wrong', true);
+  }
+}
+
+buildReasons();
+document.getElementById('feedback').addEventListener('input', e => {
+  document.getElementById('charCount').textContent = e.target.value.length;
+  updateSubmit();
+});
+document.getElementById('submitBtn').addEventListener('click', submit);
+load();
 </script>
 </body>
 </html>

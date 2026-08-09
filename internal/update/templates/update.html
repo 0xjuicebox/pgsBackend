@@ -3,397 +3,663 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>Update Details — PGS Direct</title>
+<title>Update Your Details — PGS Direct</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
   :root {
-    --accent: #1a7a4c;
-    --accent-light: #e6f4ec;
-    --ink: #1c2321;
-    --ink-soft: #5c6a63;
-    --bg: #f9f9f9;
-    --card: #ffffff;
-    --border: #eaeaea;
-    --danger: #dc2626;
-    --radius: 16px;
+    --accent: #1a7a4c; --accent-dark: #14603c; --accent-light: #e8f5ee;
+    --ink: #16211d; --ink-soft: #5c6a63; --ink-faint: #94a3a0;
+    --bg: #f7f8f7; --card: #fff; --line: #e8eae9; --line-strong: #d4d8d6;
+    --danger: #dc2626; --amber-light: #fffbeb;
+    --r-sm: 10px; --r: 16px; --r-lg: 22px;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; }
   body {
-    margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--ink);
-    padding-bottom: 40px;
+    background: var(--bg); color: var(--ink); font-size: 16px; line-height: 1.5;
+    padding-bottom: 140px;
+  }
+  header {
+    background: var(--card); border-bottom: 1px solid var(--line);
+    padding: 18px 20px 16px; text-align: center; position: sticky; top: 0; z-index: 500;
+  }
+  header h1 { margin: 0; font-size: 19px; font-weight: 750; letter-spacing: -0.02em; }
+  header p { margin: 3px 0 0; font-size: 13px; color: var(--ink-soft); }
+
+  main { padding: 20px 16px 0; max-width: 560px; margin: 0 auto; }
+  section.card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--r-lg); padding: 22px 18px; margin-bottom: 16px;
+  }
+  section.card > h2 { margin: 0 0 4px; font-size: 17px; font-weight: 750; letter-spacing: -0.02em; }
+  section.card > .hint { margin: 0 0 18px; font-size: 13px; color: var(--ink-soft); }
+
+  label.field { display: block; margin-bottom: 14px; }
+  label.field > span {
+    display: block; font-size: 12px; font-weight: 700; color: var(--ink-soft);
+    text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px;
+  }
+  label.field > span .opt { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--ink-faint); }
+  input[type=text], input[type=date] {
+    width: 100%; padding: 13px 14px; border: 1.5px solid var(--line-strong);
+    border-radius: var(--r-sm); font-family: inherit; font-size: 16px;
+    color: var(--ink); background: var(--card); transition: border-color .15s;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+
+  .segmented { display: flex; background: var(--bg); border-radius: 12px; padding: 4px; gap: 4px; }
+  .segmented button {
+    flex: 1; border: none; background: transparent; padding: 11px 6px; border-radius: 9px;
+    font-family: inherit; font-size: 14px; font-weight: 650; color: var(--ink-soft);
+    cursor: pointer; transition: all .15s;
+  }
+  .segmented button.active { background: var(--card); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+
+  .slot-card { border: 2px solid var(--line); border-radius: var(--r); margin-bottom: 14px; overflow: hidden; transition: border-color .18s; }
+  .slot-card.on { border-color: var(--accent); }
+  .slot-head { display: flex; align-items: center; gap: 12px; padding: 16px; cursor: pointer; user-select: none; background: var(--card); }
+  .slot-card.on .slot-head { background: var(--accent-light); }
+  .slot-icon { font-size: 22px; line-height: 1; }
+  .slot-title { flex: 1; }
+  .slot-title strong { display: block; font-size: 15px; font-weight: 700; }
+  .slot-title small { font-size: 12.5px; color: var(--ink-soft); }
+  .switch { width: 48px; height: 29px; border-radius: 99px; background: var(--line-strong); position: relative; transition: background .2s; flex-shrink: 0; }
+  .slot-card.on .switch { background: var(--accent); }
+  .switch::after { content:''; position:absolute; top:3px; left:3px; width:23px; height:23px; border-radius:50%; background:#fff; transition: transform .2s cubic-bezier(.4,0,.2,1); box-shadow: 0 1px 3px rgba(0,0,0,.2); }
+  .slot-card.on .switch::after { transform: translateX(19px); }
+  .slot-body { display: none; padding: 4px 16px 18px; border-top: 1px solid var(--line); }
+  .slot-card.on .slot-body { display: block; }
+
+  .sub-label { font-size: 12px; font-weight: 700; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .05em; margin: 18px 0 8px; }
+
+  .days { display: flex; gap: 6px; }
+  .days button {
+    flex: 1; aspect-ratio: 1; border: 1.5px solid var(--line-strong); background: var(--card);
+    border-radius: 9px; font-family: inherit; font-size: 12px; font-weight: 650;
+    color: var(--ink-soft); cursor: pointer; transition: all .15s; padding: 0;
+  }
+  .days button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .product { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+  .product:last-child { border-bottom: none; }
+  .product-emoji { font-size: 22px; width: 28px; text-align: center; flex-shrink: 0; }
+  .product-name { flex: 1; min-width: 0; }
+  .product-name strong { display: block; font-size: 14.5px; font-weight: 650; }
+  .product-name small { font-size: 12px; color: var(--ink-faint); }
+  .qty-ctrl { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .qty-btn {
+    width: 34px; height: 34px; border-radius: 9px; border: 1.5px solid var(--line-strong);
+    background: var(--card); font-size: 19px; line-height: 1; color: var(--ink);
+    cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all .12s; padding: 0;
+  }
+  .qty-btn:active { transform: scale(.92); }
+  .qty-btn:disabled { opacity: .3; cursor: not-allowed; }
+  .qty-val { min-width: 62px; text-align: center; font-size: 14px; font-weight: 700; }
+  .qty-val.zero { color: var(--ink-faint); font-weight: 500; }
+
+  .map-wrap { position: relative; border-radius: var(--r); overflow: hidden; border: 1.5px solid var(--line-strong); }
+  #map { height: 240px; width: 100%; background: #e9edeb; }
+  #centerPin { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -100%); font-size: 34px; pointer-events: none; z-index: 400; filter: drop-shadow(0 3px 4px rgba(0,0,0,.3)); transition: transform .16s; }
+  .map-wrap.dragging #centerPin { transform: translate(-50%, -118%); }
+  .map-tools { display: flex; gap: 8px; margin-top: 10px; }
+  .map-tools button {
+    flex: 1; padding: 11px; border-radius: var(--r-sm); border: 1.5px solid var(--line-strong);
+    background: var(--card); font-family: inherit; font-size: 13.5px; font-weight: 650;
+    color: var(--ink); cursor: pointer;
   }
 
-  header.hero {
-    background: linear-gradient(135deg, #1a7a4c, #0f4d30);
-    color: white;
-    padding: 24px 20px 32px;
-    text-align: center;
-    border-bottom-left-radius: 24px;
-    border-bottom-right-radius: 24px;
-  }
-  header.hero h1 { margin: 0 0 6px; font-size: 22px; font-weight: 700; }
-  header.hero p { margin: 0; opacity: 0.9; font-size: 14px; }
+  .search-wrap { position: relative; margin-bottom: 10px; }
+  .search-wrap input { padding-right: 40px; }
+  .search-spinner { position: absolute; right: 13px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; border: 2px solid var(--line-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; display: none; }
+  .search-wrap.busy .search-spinner { display: block; }
+  @keyframes spin { to { transform: translateY(-50%) rotate(360deg); } }
+  .results { position: absolute; top: calc(100% + 6px); left: 0; right: 0; background: var(--card); border: 1px solid var(--line-strong); border-radius: var(--r); overflow: hidden; z-index: 600; box-shadow: 0 8px 28px rgba(0,0,0,.13); max-height: 280px; overflow-y: auto; display: none; }
+  .results.show { display: block; }
+  .results button { display: block; width: 100%; text-align: left; padding: 12px 14px; border: none; background: none; border-bottom: 1px solid var(--line); cursor: pointer; font-family: inherit; font-size: 14px; color: var(--ink); }
+  .results button:last-child { border-bottom: none; }
+  .results button strong { display: block; font-weight: 650; }
+  .results button small { color: var(--ink-soft); font-size: 12.5px; }
+  .results .empty { padding: 16px; text-align: center; color: var(--ink-faint); font-size: 13.5px; }
 
-  main { max-width: 600px; margin: -24px auto 0; padding: 0 16px; }
+  .notice { display: flex; gap: 10px; padding: 13px 14px; border-radius: var(--r-sm); font-size: 13px; line-height: 1.5; background: var(--amber-light); border: 1px solid #fde68a; color: #7c4a03; margin-top: 14px; }
 
-  .card {
-    background: var(--card);
-    border-radius: var(--radius);
-    padding: 20px;
-    margin-bottom: 16px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-    border: 1px solid var(--border);
-  }
-  .card h2 {
-    font-size: 15px; font-weight: 700; margin: 0 0 16px; color: var(--ink);
-    display: flex; align-items: center; gap: 8px; text-transform: uppercase; letter-spacing: 0.5px;
-  }
+  .bottom { position: fixed; left: 0; right: 0; bottom: 0; z-index: 700; background: var(--card); border-top: 1px solid var(--line); padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); }
+  .bottom-inner { max-width: 560px; margin: 0 auto; }
+  .submit-btn { width: 100%; padding: 17px; border: none; border-radius: 14px; background: var(--accent); color: #fff; font-family: inherit; font-size: 16px; font-weight: 700; cursor: pointer; transition: background .15s; }
+  .submit-btn:active { background: var(--accent-dark); }
+  .submit-btn:disabled { background: var(--line-strong); cursor: not-allowed; }
+  .bottom-note { text-align: center; font-size: 12px; color: var(--ink-faint); margin-top: 8px; }
 
-  label { display: block; font-size: 13px; font-weight: 600; color: var(--ink-soft); margin: 14px 0 6px; }
-  label:first-of-type { margin-top: 0; }
-  input[type="text"], input[type="date"], textarea {
-    width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 12px;
-    font-size: 15px; font-family: inherit; background: #fafafa; transition: 0.2s;
-  }
-  input:focus, textarea:focus { outline: none; border-color: var(--accent); background: white; box-shadow: 0 0 0 3px var(--accent-light); }
-  textarea { resize: vertical; min-height: 60px; }
-
-  /* MAP */
-  .map-wrapper { position: relative; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); margin-top: 8px; }
-  #map { height: 220px; width: 100%; }
-  .center-pin { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -100%); z-index: 1000; pointer-events: none; font-size: 32px; transition: transform 0.1s; }
-  .center-pin.dragging { transform: translate(-50%, -120%) scale(1.1); }
-  .map-toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
-  .locate-btn { padding: 8px 12px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent-light); color: var(--accent); font-weight: 600; font-size: 12px; cursor: pointer; }
-
-  /* SCHEDULE */
-  .segmented { display: flex; background: #f0f1ef; border-radius: 12px; padding: 4px; gap: 4px; }
-  .segmented button { flex: 1; padding: 10px 4px; border: none; background: transparent; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--ink-soft); cursor: pointer; transition: 0.15s; }
-  .segmented button.active { background: white; color: var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-  .conditional { display: none; margin-top: 14px; }
-  .conditional.visible { display: block; animation: fadeIn 0.2s ease-out; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
-
-  .days-row { display: flex; gap: 6px; margin-top: 8px; }
-  .day-toggle { flex: 1; aspect-ratio: 1; border-radius: 50%; border: 1px solid var(--border); background: white; font-size: 12px; font-weight: 700; color: var(--ink-soft); cursor: pointer; transition: 0.1s; }
-  .day-toggle.active { background: var(--accent); border-color: var(--accent); color: white; }
-
-  /* ITEMS (Clean UI) */
-  .items-list { display: flex; flex-direction: column; gap: 12px; }
-  .item-row { border: 1px solid var(--border); border-radius: 12px; padding: 14px; background: white; display: flex; align-items: center; justify-content: space-between; transition: 0.15s; }
-  .item-row.active { border-color: var(--accent); background: #fafdfb; }
-  .item-info { display: flex; align-items: center; gap: 10px; }
-  .item-info .emoji { font-size: 24px; }
-  .item-info .name { font-size: 15px; font-weight: 600; color: var(--ink); }
-
-  .btn-add { padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border); background: #fafafa; font-size: 13px; font-weight: 600; color: var(--ink); cursor: pointer; }
-  .stepper { display: none; align-items: center; gap: 10px; background: #f4f6f4; padding: 4px; border-radius: 10px; }
-  .stepper button { width: 32px; height: 32px; border-radius: 8px; border: none; background: white; color: var(--ink); font-size: 16px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
-  .stepper .qty { font-size: 14px; font-weight: 700; min-width: 40px; text-align: center; color: var(--accent); }
-  .item-row.active .btn-add { display: none; }
-  .item-row.active .stepper { display: flex; }
-
-  /* BUTTONS & TOAST */
-  .submit-btn { width: 100%; padding: 16px; border: none; border-radius: 14px; background: var(--accent); color: white; font-size: 16px; font-weight: 700; cursor: pointer; box-shadow: 0 4px 6px rgba(26,122,76,0.2); transition: 0.1s; margin-top: 8px; }
-  .submit-btn:disabled { opacity: 0.6; }
-  .submit-btn:active { transform: scale(0.98); }
-
-  .loader { text-align: center; padding: 60px 20px; font-weight: 600; color: var(--ink-soft); }
-  .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-100px); background: var(--danger); color: white; padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 600; box-shadow: 0 8px 16px rgba(0,0,0,0.15); transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); z-index: 999; }
+  .toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%) translateY(-140%); background: var(--ink); color: #fff; padding: 12px 20px; border-radius: 12px; font-size: 14px; z-index: 900; max-width: calc(100% - 32px); text-align: center; transition: transform .28s cubic-bezier(.4,0,.2,1); box-shadow: 0 8px 24px rgba(0,0,0,.2); }
   .toast.show { transform: translateX(-50%) translateY(0); }
-  .success-screen { display: none; text-align: center; padding: 60px 20px; }
-  .success-screen .emoji { font-size: 48px; }
+  .toast.error { background: var(--danger); }
+
+  #loader { padding: 80px 20px; text-align: center; color: var(--ink-soft); }
+  .spinner-lg { width: 32px; height: 32px; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin2 .8s linear infinite; margin: 0 auto 14px; }
+  @keyframes spin2 { to { transform: rotate(360deg); } }
+
+  #successScreen { display: none; padding: 70px 28px; text-align: center; }
+  #successScreen.show { display: block; }
+  .success-mark { width: 72px; height: 72px; margin: 0 auto 22px; background: var(--accent-light); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 36px; color: var(--accent); }
+  #successScreen h2 { margin: 0 0 10px; font-size: 23px; letter-spacing: -0.02em; }
+  #successScreen p { margin: 0; color: var(--ink-soft); font-size: 15px; line-height: 1.6; }
 </style>
 </head>
 <body>
 
-<div class="toast" id="toast"></div>
-
-<header class="hero">
-  <h1>✏️ Update Details</h1>
-  <p>Modify your profile or default subscription</p>
+<header>
+  <h1>Update Your Details</h1>
+  <p>Change your address, schedule, or order</p>
 </header>
 
-<main>
-  <div id="loader" class="loader">Loading your details...</div>
+<div id="loader"><div class="spinner-lg"></div>Loading your details…</div>
 
-  <div id="formRoot" style="display: none;">
-    <form id="updateForm">
+<main id="formRoot" style="display:none">
 
-      <!-- PROFILE -->
-      <div class="card">
-        <h2>👤 Your Profile</h2>
-        <label for="name">Full name</label>
-        <input type="text" id="name" required />
+  <section class="card">
+    <h2>Your Details</h2>
+    <label class="field">
+      <span>Full name</span>
+      <input type="text" id="name" autocomplete="name" />
+    </label>
+  </section>
 
-        <label for="address">House address</label>
-        <textarea id="address" required></textarea>
+  <section class="card">
+    <h2>Delivery Address</h2>
+    <p class="hint">Search for your area, then drag the map to place the pin at your door.</p>
 
-        <label>Delivery Location</label>
-        <div class="map-wrapper">
-          <div id="map"></div>
-          <div class="center-pin" id="centerPin">📍</div>
-        </div>
-        <div class="map-toolbar">
-          <button type="button" class="locate-btn" id="locateBtn">📍 Center on Me</button>
-        </div>
-      </div>
+    <div class="search-wrap" id="searchWrap">
+      <input type="text" id="locSearch" placeholder="Search area, colony, or landmark…" autocomplete="off" />
+      <div class="search-spinner"></div>
+      <div class="results" id="searchResults"></div>
+    </div>
 
-      <!-- SCHEDULE -->
-      <div class="card">
-        <h2>📅 Default Schedule</h2>
-        <div class="segmented" id="scheduleSegmented">
-          <button type="button" data-value="daily">Everyday</button>
-          <button type="button" data-value="alternate">Alternate Days</button>
-          <button type="button" data-value="custom">Custom Days</button>
-        </div>
+    <div class="map-wrap" id="mapWrap">
+      <div id="map"></div>
+      <div id="centerPin">📍</div>
+    </div>
+    <div class="map-tools"><button type="button" id="locateBtn">🎯 Use my location</button></div>
 
-        <div class="conditional" id="alternateSection">
-          <label for="startDate">Start from</label>
-          <input type="date" id="startDate" />
-        </div>
+    <div style="margin-top:20px">
+      <label class="field">
+        <span>House / Flat number</span>
+        <input type="text" id="addrHouse" placeholder="e.g. H.No 214, Flat 3B" />
+      </label>
+      <label class="field">
+        <span>Street / Colony / Area</span>
+        <input type="text" id="addrStreet" placeholder="e.g. Green Park Colony" />
+      </label>
+      <label class="field">
+        <span>Landmark <span class="opt">— optional</span></span>
+        <input type="text" id="addrLandmark" placeholder="e.g. Opposite the blue water tank" />
+      </label>
+    </div>
+  </section>
 
-        <div class="conditional" id="customSection">
-          <label>Which days should we deliver?</label>
-          <div class="days-row" id="daysRow"></div>
-        </div>
-      </div>
+  <section class="card">
+    <h2>Your Deliveries</h2>
+    <p class="hint">Turn a slot off to stop that delivery. Turn one on to add it.</p>
+    <div id="slotsContainer"></div>
+    <div class="notice">
+      <span>⏳</span>
+      <div>Saving changes puts your account back into review so our team can reassign your route. Deliveries pause briefly until that's done — usually the same day.</div>
+    </div>
+  </section>
 
-      <!-- ORDER -->
-      <div class="card">
-        <h2>🛒 Default Order</h2>
-        <div class="items-list" id="itemsList"></div>
-      </div>
-
-      <div style="text-align: center; font-size: 12px; color: var(--ink-soft); margin-bottom: 12px; padding: 0 10px;">
-        Note: Saving changes will temporarily pause your deliveries so our team can review your new details and assign a route.
-      </div>
-      <button type="submit" class="submit-btn" id="submitBtn">Save Changes</button>
-    </form>
-  </div>
-
-  <div class="success-screen" id="successScreen">
-    <div class="emoji">✅</div>
-    <h2>Updated Successfully!</h2>
-    <p style="color: var(--ink-soft); font-size: 14px;">Your details have been saved and your account is pending review. You can return to WhatsApp.</p>
-  </div>
 </main>
+
+<div id="successScreen">
+  <div class="success-mark">✓</div>
+  <h2>Changes saved</h2>
+  <p>Your account is under review while we reassign your delivery route. We'll message you on WhatsApp as soon as deliveries resume.</p>
+</div>
+
+<div class="bottom" id="bottomBar" style="display:none">
+  <div class="bottom-inner">
+    <button class="submit-btn" id="submitBtn">Save Changes</button>
+    <div class="bottom-note" id="bottomNote"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-  const TOKEN = "{{.Token}}";
+const TOKEN = new URLSearchParams(location.search).get('token');
+const FALLBACK_CENTER = [26.8467, 80.9462];
 
-  const ITEMS = [
-    { key: 'milkQuantity',    label: 'Milk',        emoji: '🥛', unit: 'L',  min: 500, step: 500 },
-    { key: 'curdQuantity',    label: 'Curd',        emoji: '🍶', unit: 'L',  min: 500, step: 500 },
-    { key: 'butterQuantity',  label: 'Butter',      emoji: '🧈', unit: 'kg', min: 250, step: 250 },
-    { key: 'gheeQuantity',    label: 'Desi Ghee',   emoji: '🫙', unit: 'kg', min: 250, step: 250 },
-    { key: 'lassiQuantity',   label: 'Buttermilk',  emoji: '🥤', unit: 'L',  min: 500, step: 500 },
-    { key: 'paneerQuantity',  label: 'Paneer',      emoji: '🧀', unit: 'kg', min: 250, step: 250 },
-    { key: 'jaggeryQuantity', label: 'Jaggery',     emoji: '🍯', unit: 'kg', min: 250, step: 250 },
-    { key: 'khandQuantity',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', min: 250, step: 250 },
-    { key: 'oilQuantity',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  min: 500, step: 500 },
-    { key: 'attaQuantity',    label: 'Atta',        emoji: '🌾', unit: 'kg', min: 250, step: 250 },
-    { key: 'burfiQuantity',   label: 'Milk Burfi',  emoji: '🍬', unit: 'kg', min: 250, step: 250 },
-  ];
+const PRODUCTS = [
+  { key: 'milk',    label: 'Milk',        emoji: '🥛', unit: 'L',  step: 500 },
+  { key: 'curd',    label: 'Curd',        emoji: '🍶', unit: 'L',  step: 500 },
+  { key: 'paneer',  label: 'Paneer',      emoji: '🧀', unit: 'kg', step: 250 },
+  { key: 'butter',  label: 'Butter',      emoji: '🧈', unit: 'kg', step: 250 },
+  { key: 'ghee',    label: 'Desi Ghee',   emoji: '🫙', unit: 'kg', step: 250 },
+  { key: 'lassi',   label: 'Buttermilk',  emoji: '🥤', unit: 'L',  step: 500 },
+  { key: 'jaggery', label: 'Jaggery',     emoji: '🍯', unit: 'kg', step: 250 },
+  { key: 'khand',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', step: 250 },
+  { key: 'oil',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  step: 500 },
+  { key: 'atta',    label: 'Atta',        emoji: '🌾', unit: 'kg', step: 1000 },
+  { key: 'burfi',   label: 'Milk Burfi',  emoji: '🍬', unit: 'kg', step: 250 },
+];
 
-  let serverState = null;
-  const itemState = {};
+const SLOTS = [
+  { key: 'morning', icon: '🌅', title: 'Morning delivery', sub: 'Arrives before 8 AM' },
+  { key: 'evening', icon: '🌆', title: 'Evening delivery', sub: 'Arrives before 7 PM' },
+];
 
-  // Maps & UI State
-  let map, selectedLat, selectedLng;
-  let scheduleType = 'daily';
-  const activeDays = new Set();
+const DAY_LABELS = ['S','M','T','W','T','F','S'];
 
-  async function loadState() {
-    try {
-      const res = await fetch(`/update/state?token=${TOKEN}`);
-      if (!res.ok) throw new Error("Link expired. Please request a new one.");
-      serverState = await res.json();
+// NOTE: /update/state and POST /update both use the customer.Order struct,
+// whose JSON keys carry a "Quantity" suffix (milkQuantity, curdQuantity…).
+// The registration endpoint uses plain keys instead. We convert at the edges
+// here so the rest of this file works in plain keys.
+function orderToPlain(order) {
+  const out = {};
+  PRODUCTS.forEach(p => { out[p.key] = (order && order[p.key + 'Quantity']) || 0; });
+  return out;
+}
+function plainToOrder(plain) {
+  const out = {};
+  PRODUCTS.forEach(p => { out[p.key + 'Quantity'] = plain[p.key] || 0; });
+  return out;
+}
 
-      document.getElementById('loader').style.display = 'none';
-      document.getElementById('formRoot').style.display = 'block';
+const state = {
+  lat: null, lng: null,
+  slots: {
+    morning: { on: false, scheduleType: 'daily', activeDays: new Set([0,1,2,3,4,5,6]), startDate: todayISO(), items: {} },
+    evening: { on: false, scheduleType: 'daily', activeDays: new Set([0,1,2,3,4,5,6]), startDate: todayISO(), items: {} },
+  },
+};
 
-      initForm();
-      initMap();
-    } catch (e) {
-      document.getElementById('loader').textContent = e.message;
-    }
+function todayISO() { return new Date().toISOString().slice(0,10); }
+
+function formatQty(v, unit) {
+  if (!v) return '—';
+  if (v < 1000) return v + (unit === 'L' ? ' ml' : ' g');
+  return parseFloat((v/1000).toFixed(2)) + ' ' + unit;
+}
+
+function toast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' error' : '');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.className = 'toast'; }, 3200);
+}
+
+// --- Geocoding (see register.html for the reasoning behind two services) ---
+async function searchPlaces(query) {
+  const res = await fetch('https://photon.komoot.io/api/?q=' + encodeURIComponent(query) + '&limit=6&lang=en');
+  if (!res.ok) throw new Error('Search failed');
+  const data = await res.json();
+  return (data.features || []).map(f => {
+    const p = f.properties || {};
+    const main = p.name || p.street || p.city || 'Unnamed place';
+    const detail = [p.street, p.district, p.city, p.state].filter(Boolean).filter(x => x !== main).join(', ');
+    return { label: main, detail: detail || p.country || '', lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] };
+  });
+}
+async function reverseGeocode(lat, lng) {
+  const res = await fetch('https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=' + lat + '&lon=' + lng + '&zoom=18&addressdetails=1', { headers: { 'Accept-Language': 'en' } });
+  if (!res.ok) throw new Error('Lookup failed');
+  const a = (await res.json()).address || {};
+  return {
+    street: [a.road, a.neighbourhood, a.suburb].filter(Boolean).join(', '),
+    area: [a.city || a.town || a.village, a.state].filter(Boolean).join(', '),
+  };
+}
+
+// Best-effort split of the single stored address string back into the three
+// fields. The backend stores "House, Street, (Landmark)" — that's what
+// register.html writes — so we reverse exactly that shape and fall back to
+// dumping everything into Street when the pattern doesn't match. Nothing is
+// lost either way: the customer sees the text and can re-split it.
+function splitAddress(full) {
+  const out = { house: '', street: '', landmark: '' };
+  if (!full) return out;
+  let rest = full.trim();
+
+  const lm = rest.match(/\(([^)]*)\)\s*$/);
+  if (lm) {
+    out.landmark = lm[1].trim();
+    rest = rest.slice(0, lm.index).replace(/,\s*$/, '').trim();
   }
 
-  function formatQty(val, unit) {
-    if (val === 0) return "0";
-    if (unit === 'L') return val < 1000 ? `${val} ml` : `${parseFloat((val/1000).toFixed(2))} L`;
-    return val < 1000 ? `${val} g` : `${parseFloat((val/1000).toFixed(2))} kg`;
+  const comma = rest.indexOf(',');
+  if (comma > -1) {
+    out.house = rest.slice(0, comma).trim();
+    out.street = rest.slice(comma + 1).trim();
+  } else {
+    out.street = rest;
   }
+  return out;
+}
 
-  function initMap() {
-    selectedLat = parseFloat(serverState.latitude) || 28.6139;
-    selectedLng = parseFloat(serverState.longitude) || 77.2090;
+// --- Map ---
+let map;
+function initMap(lat, lng) {
+  const center = (lat && lng) ? [parseFloat(lat), parseFloat(lng)] : FALLBACK_CENTER;
+  const zoom = (lat && lng) ? 17 : 12;
+  map = L.map('map', { zoomControl: true, attributionControl: false }).setView(center, zoom);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
 
-    map = L.map('map', { zoomControl: false }).setView([selectedLat, selectedLng], 15);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+  if (lat && lng) { state.lat = parseFloat(lat); state.lng = parseFloat(lng); }
 
-    const centerPin = document.getElementById('centerPin');
-    map.on('movestart', () => centerPin.classList.add('dragging'));
-    map.on('moveend', () => {
-      centerPin.classList.remove('dragging');
-      selectedLat = map.getCenter().lat.toFixed(6);
-      selectedLng = map.getCenter().lng.toFixed(6);
-    });
+  const wrap = document.getElementById('mapWrap');
+  map.on('movestart', () => wrap.classList.add('dragging'));
+  map.on('moveend', () => {
+    wrap.classList.remove('dragging');
+    const c = map.getCenter();
+    state.lat = c.lat; state.lng = c.lng;
+    validate();
+  });
+}
 
-    document.getElementById('locateBtn').onclick = () => {
-      if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(pos => {
-          map.flyTo([pos.coords.latitude, pos.coords.longitude], 16);
-        });
-      }
-    };
-    // Fix map rendering bug inside hidden div
-    setTimeout(() => map.invalidateSize(), 100);
-  }
+function locateMe() {
+  if (!navigator.geolocation) { toast('Location is not available on this device', true); return; }
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      map.setView([pos.coords.latitude, pos.coords.longitude], 17);
+      state.lat = pos.coords.latitude; state.lng = pos.coords.longitude;
+      validate();
+    },
+    () => toast('Could not get your location. Search or drag the map instead.', true),
+    { enableHighAccuracy: true, timeout: 8000 }
+  );
+}
 
-  function setScheduleType(type) {
-    scheduleType = type;
-    document.querySelectorAll('#scheduleSegmented button').forEach(b => {
-      b.classList.toggle('active', b.dataset.value === type);
-    });
-    document.getElementById('alternateSection').classList.toggle('visible', type === 'alternate');
-    document.getElementById('customSection').classList.toggle('visible', type === 'custom');
-  }
+function initSearch() {
+  const input = document.getElementById('locSearch');
+  const wrap = document.getElementById('searchWrap');
+  const results = document.getElementById('searchResults');
+  let timer = null, seq = 0;
+  const close = () => results.classList.remove('show');
 
-  function initForm() {
-    // 1. Profile
-    document.getElementById('name').value = serverState.name;
-    document.getElementById('address').value = serverState.address;
-
-    // 2. Schedule
-    document.querySelectorAll('#scheduleSegmented button').forEach(btn => {
-      btn.onclick = () => setScheduleType(btn.dataset.value);
-    });
-    setScheduleType(serverState.scheduleType);
-
-    if (serverState.startDate) document.getElementById('startDate').value = serverState.startDate;
-
-    const dayLabels = ['S','M','T','W','T','F','S'];
-    const daysRow = document.getElementById('daysRow');
-    if (serverState.activeDays) serverState.activeDays.forEach(d => activeDays.add(d));
-
-    dayLabels.forEach((label, idx) => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'day-toggle';
-      if (activeDays.has(idx)) btn.classList.add('active');
-      btn.textContent = label;
-      btn.onclick = () => {
-        if (activeDays.has(idx)) { activeDays.delete(idx); btn.classList.remove('active'); }
-        else { activeDays.add(idx); btn.classList.add('active'); }
-      };
-      daysRow.appendChild(btn);
-    });
-
-    // 3. Items
-    const list = document.getElementById('itemsList');
-    ITEMS.forEach(item => {
-      itemState[item.key] = serverState.defaultOrder[item.key] || 0;
-
-      const row = document.createElement('div');
-      row.className = 'item-row';
-      if (itemState[item.key] > 0) row.classList.add('active');
-
-      row.innerHTML = `
-        <div class="item-info">
-          <span class="emoji">${item.emoji}</span>
-          <span class="name">${item.label}</span>
-        </div>
-        <button type="button" class="btn-add">+ Add</button>
-        <div class="stepper">
-          <button type="button" class="dec">−</button>
-          <span class="qty">${formatQty(itemState[item.key], item.unit)}</span>
-          <button type="button" class="inc">+</button>
-        </div>
-      `;
-
-      const qtyDisplay = row.querySelector('.qty');
-
-      function updateItemUI(val) {
-        itemState[item.key] = val;
-        qtyDisplay.textContent = formatQty(val, item.unit);
-        if (val > 0) row.classList.add('active');
-        else row.classList.remove('active');
-      }
-
-      row.querySelector('.btn-add').onclick = () => updateItemUI(item.min);
-      row.querySelector('.dec').onclick = () => {
-        const next = itemState[item.key] - item.step;
-        updateItemUI(next >= item.min ? next : 0);
-      };
-      row.querySelector('.inc').onclick = () => {
-        const current = itemState[item.key];
-        const jump = current >= 5000 ? (item.unit === 'L' ? 1000 : 500) : item.step;
-        updateItemUI(current === 0 ? item.min : current + jump);
-      };
-
-      list.appendChild(row);
-    });
-  }
-
-  function showToast(msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg; t.classList.add('show');
-    setTimeout(() => t.classList.remove('show'), 3000);
-  }
-
-  document.getElementById('updateForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-
-    const name = document.getElementById('name').value.trim();
-    const address = document.getElementById('address').value.trim();
-    const totalQty = Object.values(itemState).reduce((a, b) => a + b, 0);
-
-    if (totalQty <= 0) return showToast("Please select at least one item.");
-    if (scheduleType === 'custom' && activeDays.size === 0) return showToast("Select at least one delivery day.");
-    if (scheduleType === 'alternate' && !document.getElementById('startDate').value) return showToast("Choose a start date.");
-
-    const payload = {
-      token: TOKEN,
-      name: name,
-      address: address,
-      latitude: String(selectedLat),
-      longitude: String(selectedLng),
-      scheduleType: scheduleType,
-      activeDays: Array.from(activeDays),
-      startDate: document.getElementById('startDate').value,
-      items: itemState,
-    };
-
-    const submitBtn = document.getElementById('submitBtn');
-    submitBtn.disabled = true;
-    submitBtn.textContent = "Saving...";
-
-    try {
-      const res = await fetch('/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) throw new Error(await res.text());
-
-      document.getElementById('formRoot').style.display = 'none';
-      document.getElementById('successScreen').style.display = 'block';
-      window.scrollTo(0,0);
-    } catch (err) {
-      showToast(err.message || "Error saving details.");
-      submitBtn.disabled = false;
-      submitBtn.textContent = "Save Changes";
-    }
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 3) { close(); wrap.classList.remove('busy'); return; }
+    timer = setTimeout(async () => {
+      const mySeq = ++seq;
+      wrap.classList.add('busy');
+      try {
+        const places = await searchPlaces(q);
+        if (mySeq !== seq) return;
+        render(places);
+      } catch (_) { if (mySeq === seq) render(null); }
+      finally { if (mySeq === seq) wrap.classList.remove('busy'); }
+    }, 350);
   });
 
-  loadState();
+  function render(places) {
+    if (places === null) { results.innerHTML = '<div class="empty">Search unavailable. Drag the map instead.</div>'; results.classList.add('show'); return; }
+    if (!places.length) { results.innerHTML = '<div class="empty">Nothing found. Try a nearby landmark.</div>'; results.classList.add('show'); return; }
+    results.innerHTML = '';
+    places.forEach(p => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.innerHTML = '<strong></strong><small></small>';
+      btn.querySelector('strong').textContent = p.label;
+      btn.querySelector('small').textContent = p.detail;
+      btn.addEventListener('click', () => {
+        map.setView([p.lat, p.lng], 17);
+        state.lat = p.lat; state.lng = p.lng;
+        input.value = p.label;
+        close(); validate();
+        toast('Now drag the map to your exact door');
+      });
+      results.appendChild(btn);
+    });
+    results.classList.add('show');
+  }
+
+  document.addEventListener('click', e => { if (!wrap.contains(e.target)) close(); });
+}
+
+// --- Slots ---
+function buildSlots() {
+  const container = document.getElementById('slotsContainer');
+  container.innerHTML = '';
+
+  SLOTS.forEach(slot => {
+    const s = state.slots[slot.key];
+    const card = document.createElement('div');
+    card.className = 'slot-card' + (s.on ? ' on' : '');
+
+    const head = document.createElement('div');
+    head.className = 'slot-head';
+    head.innerHTML = '<div class="slot-icon">' + slot.icon + '</div>' +
+      '<div class="slot-title"><strong>' + slot.title + '</strong><small>' + slot.sub + '</small></div>' +
+      '<div class="switch"></div>';
+    head.addEventListener('click', () => {
+      s.on = !s.on;
+      card.classList.toggle('on', s.on);
+      validate();
+    });
+    card.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'slot-body';
+
+    const schedLabel = document.createElement('div');
+    schedLabel.className = 'sub-label'; schedLabel.textContent = 'How often?';
+    body.appendChild(schedLabel);
+
+    const seg = document.createElement('div');
+    seg.className = 'segmented';
+    [['daily','Every day'],['alternate','Alternate days'],['custom','Pick days']].forEach(([val, text]) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = text;
+      b.className = s.scheduleType === val ? 'active' : '';
+      b.addEventListener('click', () => {
+        s.scheduleType = val;
+        seg.querySelectorAll('button').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        daysWrap.style.display = val === 'custom' ? 'block' : 'none';
+        altWrap.style.display = val === 'alternate' ? 'block' : 'none';
+        validate();
+      });
+      seg.appendChild(b);
+    });
+    body.appendChild(seg);
+
+    const daysWrap = document.createElement('div');
+    daysWrap.style.display = s.scheduleType === 'custom' ? 'block' : 'none';
+    const dl = document.createElement('div'); dl.className = 'sub-label'; dl.textContent = 'Which days?';
+    daysWrap.appendChild(dl);
+    const days = document.createElement('div'); days.className = 'days';
+    DAY_LABELS.forEach((lbl, idx) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = lbl;
+      b.className = s.activeDays.has(idx) ? 'on' : '';
+      b.addEventListener('click', () => {
+        if (s.activeDays.has(idx)) s.activeDays.delete(idx); else s.activeDays.add(idx);
+        b.classList.toggle('on'); validate();
+      });
+      days.appendChild(b);
+    });
+    daysWrap.appendChild(days);
+    body.appendChild(daysWrap);
+
+    const altWrap = document.createElement('div');
+    altWrap.style.display = s.scheduleType === 'alternate' ? 'block' : 'none';
+    const al = document.createElement('div'); al.className = 'sub-label'; al.textContent = 'Starting from';
+    altWrap.appendChild(al);
+    const dateInput = document.createElement('input');
+    dateInput.type = 'date'; dateInput.value = s.startDate; dateInput.min = todayISO();
+    dateInput.addEventListener('change', () => { s.startDate = dateInput.value; validate(); });
+    altWrap.appendChild(dateInput);
+    body.appendChild(altWrap);
+
+    const pl = document.createElement('div'); pl.className = 'sub-label'; pl.textContent = 'What should we bring?';
+    body.appendChild(pl);
+
+    PRODUCTS.forEach(p => {
+      const row = document.createElement('div'); row.className = 'product';
+      const val = document.createElement('div'); val.className = 'qty-val';
+      function sync() {
+        const q = s.items[p.key] || 0;
+        val.textContent = formatQty(q, p.unit);
+        val.classList.toggle('zero', q === 0);
+        minus.disabled = q === 0;
+      }
+      const minus = document.createElement('button');
+      minus.type = 'button'; minus.className = 'qty-btn'; minus.textContent = '−';
+      minus.addEventListener('click', () => { s.items[p.key] = Math.max(0, (s.items[p.key]||0) - p.step); sync(); validate(); });
+      const plus = document.createElement('button');
+      plus.type = 'button'; plus.className = 'qty-btn'; plus.textContent = '+';
+      plus.addEventListener('click', () => { s.items[p.key] = (s.items[p.key]||0) + p.step; sync(); validate(); });
+
+      row.innerHTML = '<div class="product-emoji">' + p.emoji + '</div>';
+      const nameEl = document.createElement('div');
+      nameEl.className = 'product-name';
+      nameEl.innerHTML = '<strong></strong><small></small>';
+      nameEl.querySelector('strong').textContent = p.label;
+      nameEl.querySelector('small').textContent = 'in steps of ' + formatQty(p.step, p.unit);
+      row.appendChild(nameEl);
+
+      const ctrl = document.createElement('div'); ctrl.className = 'qty-ctrl';
+      ctrl.appendChild(minus); ctrl.appendChild(val); ctrl.appendChild(plus);
+      row.appendChild(ctrl);
+      sync();
+      body.appendChild(row);
+    });
+
+    card.appendChild(body);
+    container.appendChild(card);
+  });
+}
+
+// --- Validation ---
+function problems() {
+  const list = [];
+  if (!document.getElementById('name').value.trim()) list.push('Enter your name');
+  if (!document.getElementById('addrHouse').value.trim()) list.push('Enter your house or flat number');
+  if (!document.getElementById('addrStreet').value.trim()) list.push('Enter your street or area');
+  if (state.lat === null) list.push('Set your location on the map');
+
+  const active = SLOTS.filter(sl => state.slots[sl.key].on);
+  if (!active.length) list.push('Keep at least one delivery slot on');
+
+  active.forEach(sl => {
+    const s = state.slots[sl.key];
+    const total = PRODUCTS.reduce((sum, p) => sum + (s.items[p.key] || 0), 0);
+    if (total === 0) list.push('Add at least one item to your ' + sl.key + ' delivery');
+    if (s.scheduleType === 'custom' && s.activeDays.size === 0) list.push('Pick at least one day for your ' + sl.key + ' delivery');
+  });
+  return list;
+}
+
+function validate() {
+  const issues = problems();
+  const btn = document.getElementById('submitBtn');
+  const note = document.getElementById('bottomNote');
+  btn.disabled = issues.length > 0;
+  note.textContent = issues.length ? issues[0] : 'Your account will go back into review after saving';
+}
+
+// --- Load ---
+async function load() {
+  try {
+    const res = await fetch('/update/state?token=' + encodeURIComponent(TOKEN));
+    if (!res.ok) throw new Error('Could not load your details');
+    const data = await res.json();
+
+    document.getElementById('name').value = data.name || '';
+    const parts = splitAddress(data.address || '');
+    document.getElementById('addrHouse').value = parts.house;
+    document.getElementById('addrStreet').value = parts.street;
+    document.getElementById('addrLandmark').value = parts.landmark;
+
+    SLOTS.forEach(sl => {
+      const incoming = data[sl.key];
+      if (!incoming || !incoming.subscribed) return;
+      const s = state.slots[sl.key];
+      s.on = true;
+      s.scheduleType = incoming.scheduleType || 'daily';
+      s.activeDays = new Set(incoming.activeDays || [0,1,2,3,4,5,6]);
+      s.startDate = incoming.startDate || todayISO();
+      s.items = orderToPlain(incoming.items);
+    });
+
+    document.getElementById('loader').style.display = 'none';
+    document.getElementById('formRoot').style.display = 'block';
+    document.getElementById('bottomBar').style.display = 'block';
+
+    initMap(data.latitude, data.longitude);
+    initSearch();
+    buildSlots();
+    validate();
+
+    ['name','addrHouse','addrStreet','addrLandmark'].forEach(id =>
+      document.getElementById(id).addEventListener('input', validate));
+    document.getElementById('locateBtn').addEventListener('click', locateMe);
+    document.getElementById('submitBtn').addEventListener('click', submit);
+  } catch (err) {
+    document.getElementById('loader').innerHTML =
+      '<p style="color:var(--danger);font-weight:600">Couldn\'t load your details.</p>' +
+      '<p style="font-size:14px">This link may have expired. Please request a new one from WhatsApp.</p>';
+  }
+}
+
+// --- Submit ---
+async function submit() {
+  const issues = problems();
+  if (issues.length) { toast(issues[0], true); return; }
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true; btn.textContent = 'Saving…';
+
+  const landmark = document.getElementById('addrLandmark').value.trim();
+  const address = [
+    document.getElementById('addrHouse').value.trim(),
+    document.getElementById('addrStreet').value.trim(),
+    landmark ? '(' + landmark + ')' : '',
+  ].filter(Boolean).join(', ');
+
+  // Only slots that are ON get sent. The backend treats the array as
+  // authoritative and deletes any slot missing from it — that's how turning
+  // a switch off actually cancels that delivery.
+  const subscriptions = SLOTS.filter(sl => state.slots[sl.key].on).map(sl => {
+    const s = state.slots[sl.key];
+    return {
+      slot: sl.key,
+      scheduleType: s.scheduleType,
+      activeDays: [...s.activeDays].sort(),
+      startDate: s.startDate,
+      items: plainToOrder(s.items),
+    };
+  });
+
+  try {
+    const res = await fetch('/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: TOKEN,
+        name: document.getElementById('name').value.trim(),
+        address,
+        latitude: String(state.lat),
+        longitude: String(state.lng),
+        subscriptions,
+      }),
+    });
+    if (!res.ok) throw new Error((await res.text()) || 'Save failed');
+
+    document.getElementById('formRoot').style.display = 'none';
+    document.getElementById('bottomBar').style.display = 'none';
+    document.querySelector('header').style.display = 'none';
+    document.getElementById('successScreen').classList.add('show');
+    window.scrollTo(0,0);
+  } catch (err) {
+    btn.disabled = false; btn.textContent = 'Save Changes';
+    toast(err.message || 'Something went wrong. Please try again.', true);
+  }
+}
+
+load();
 </script>
 </body>
 </html>

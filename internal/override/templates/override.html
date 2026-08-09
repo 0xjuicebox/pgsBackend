@@ -3,431 +3,631 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>Manage Deliveries — PGS Direct</title>
+<title>Change an Order — PGS Direct</title>
 <style>
   :root {
-    --accent: #1a7a4c;
-    --accent-light: #e6f4ec;
-    --ink: #1c2321;
-    --ink-soft: #5c6a63;
-    --bg: #f9f9f9;
-    --card: #ffffff;
-    --border: #eaeaea;
-    --danger: #dc2626;
-    --danger-light: #fef2f2;
-    --radius: 16px;
+    --accent: #1a7a4c; --accent-dark: #14603c; --accent-light: #e8f5ee;
+    --ink: #16211d; --ink-soft: #5c6a63; --ink-faint: #94a3a0;
+    --bg: #f7f8f7; --card: #fff; --line: #e8eae9; --line-strong: #d4d8d6;
+    --danger: #dc2626; --danger-light: #fef2f2;
+    --amber: #d97706; --amber-light: #fffbeb;
+    --r-sm: 10px; --r: 16px; --r-lg: 22px;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; }
   body {
-    margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--ink);
-    padding-bottom: 100px; /* Space for bottom bar */
+    background: var(--bg); color: var(--ink); font-size: 16px; line-height: 1.5;
+    padding-bottom: 150px;
   }
-
-  /* --- HEADER --- */
   header {
-    background: var(--card);
-    padding: 20px 20px 16px;
-    text-align: center;
-    border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
-    z-index: 10;
+    background: var(--card); border-bottom: 1px solid var(--line);
+    padding: 18px 20px 0; text-align: center; position: sticky; top: 0; z-index: 500;
   }
-  header h1 { margin: 0 0 4px; font-size: 20px; font-weight: 700; }
-  header p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  header h1 { margin: 0; font-size: 19px; font-weight: 750; letter-spacing: -0.02em; }
+  header p { margin: 3px 0 14px; font-size: 13px; color: var(--ink-soft); }
 
-  /* --- CALENDAR SCROLLER --- */
-  .date-scroller {
-    display: flex;
-    gap: 12px;
-    overflow-x: auto;
-    padding: 20px 16px;
-    scrollbar-width: none;
-    background: var(--card);
-    border-bottom: 1px solid var(--border);
+  /* Slot tabs live in the header so they stay visible while scrolling the
+     date list — switching slot is the single most important control here. */
+  .tabs { display: flex; gap: 0; }
+  .tabs button {
+    flex: 1; border: none; background: none; padding: 12px 8px 13px;
+    font-family: inherit; font-size: 14.5px; font-weight: 650; color: var(--ink-faint);
+    cursor: pointer; border-bottom: 2.5px solid transparent; transition: all .15s;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
   }
-  .date-scroller::-webkit-scrollbar { display: none; }
+  .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tabs button:disabled { opacity: .35; cursor: not-allowed; }
 
-  .date-pill {
-    flex: 0 0 68px;
-    padding: 12px 0;
-    border-radius: 20px;
-    border: 1px solid var(--border);
-    background: var(--card);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    cursor: pointer;
-    transition: 0.15s;
-    user-select: none;
-  }
-  .date-pill.disabled { opacity: 0.4; cursor: not-allowed; background: var(--bg); }
-  .date-pill.selected { background: var(--accent); border-color: var(--accent); color: white; }
+  main { padding: 20px 16px 0; max-width: 560px; margin: 0 auto; }
 
-  .date-pill .day { font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 4px; color: var(--ink-soft); }
-  .date-pill.selected .day { color: rgba(255,255,255,0.8); }
-  .date-pill .num { font-size: 20px; font-weight: 700; }
-
-  /* Status Indicators */
-  .status-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 6px; }
-  .status-custom { background: var(--warning, #d97706); }
-  .status-paused { background: var(--danger); }
-  .date-pill.selected .status-dot { background: white; }
-
-  /* --- CONTENT AREA --- */
-  main { max-width: 600px; margin: 0 auto; padding: 20px 16px; }
-
-  .empty-state {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--ink-soft);
-  }
-  .empty-state .icon { font-size: 48px; margin-bottom: 16px; display: block; }
-  .empty-state h3 { margin: 0 0 8px; font-size: 18px; color: var(--ink); }
-
-  .editor-section { display: none; animation: fadeIn 0.2s ease-out; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-
-  .editor-header { font-size: 14px; font-weight: 700; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 16px; letter-spacing: 0.5px; }
-
-  /* Big Action Buttons */
-  .action-btn {
-    width: 100%; padding: 16px; border-radius: 14px; border: none;
-    font-size: 16px; font-weight: 700; margin-bottom: 12px; cursor: pointer;
-    display: flex; align-items: center; justify-content: center; gap: 8px;
-    transition: 0.1s;
-  }
-  .action-btn:active { transform: scale(0.98); }
-  .action-pause { background: var(--danger-light); color: var(--danger); border: 1px solid #fecaca; }
-  .action-reset { background: white; color: var(--ink); border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
-
-  /* Clean Item List */
-  .items-list {
-    background: white;
-    border-radius: var(--radius);
-    border: 1px solid var(--border);
-    overflow: hidden;
-    margin-top: 24px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-  }
-  .item-row {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 16px; border-bottom: 1px solid var(--border);
-  }
-  .item-row:last-child { border-bottom: none; }
-
-  .item-info { display: flex; align-items: center; gap: 12px; }
-  .item-info .emoji { font-size: 24px; }
-  .item-info .name { font-size: 15px; font-weight: 600; color: var(--ink); }
-
-  .btn-add {
-    padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border);
-    background: var(--bg); font-size: 14px; font-weight: 600; color: var(--ink);
-    cursor: pointer;
+  .section-label {
+    font-size: 12px; font-weight: 700; color: var(--ink-soft);
+    text-transform: uppercase; letter-spacing: .05em; margin: 0 4px 10px;
   }
 
-  .stepper { display: none; align-items: center; gap: 12px; }
-  .stepper button {
-    width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--accent);
-    background: white; color: var(--accent); font-size: 18px; font-weight: 600;
-    line-height: 1; cursor: pointer;
+  /* ---------- Date strip ---------- */
+  .dates {
+    display: flex; gap: 8px; overflow-x: auto; padding: 2px 4px 12px;
+    scroll-snap-type: x proximity; -webkit-overflow-scrolling: touch;
   }
-  .stepper button:active { background: var(--accent-light); }
-  .stepper .qty { font-size: 15px; font-weight: 700; min-width: 44px; text-align: center; }
+  .dates::-webkit-scrollbar { display: none; }
+  .date-chip {
+    flex: 0 0 62px; scroll-snap-align: start;
+    border: 2px solid var(--line); background: var(--card);
+    border-radius: 14px; padding: 10px 4px 9px; cursor: pointer;
+    text-align: center; transition: all .15s; position: relative;
+    font-family: inherit;
+  }
+  .date-chip .dow { display: block; font-size: 10.5px; font-weight: 700; color: var(--ink-faint); text-transform: uppercase; letter-spacing: .04em; }
+  .date-chip .num { display: block; font-size: 20px; font-weight: 750; line-height: 1.25; letter-spacing: -0.02em; }
+  .date-chip .mon { display: block; font-size: 10px; color: var(--ink-faint); font-weight: 600; }
+  .date-chip.selected { border-color: var(--accent); background: var(--accent-light); }
+  .date-chip.selected .num { color: var(--accent-dark); }
+  .date-chip.locked { opacity: .38; cursor: not-allowed; background: var(--bg); }
+  .date-chip.has-override::after {
+    content: ''; position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%);
+    width: 5px; height: 5px; border-radius: 50%; background: var(--amber);
+  }
+  .date-chip.selected.has-override::after { background: var(--accent-dark); }
+  .date-chip.skip-day { opacity: .5; }
 
-  /* Show stepper, hide add btn when active */
-  .item-row.active .btn-add { display: none; }
-  .item-row.active .stepper { display: flex; }
+  .legend { display: flex; gap: 16px; font-size: 11.5px; color: var(--ink-faint); margin: 0 4px 20px; flex-wrap: wrap; }
+  .legend span { display: flex; align-items: center; gap: 5px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); }
+  .dot.grey { background: var(--line-strong); }
 
-  /* --- BOTTOM BAR --- */
-  .bottom-bar {
-    position: fixed; bottom: 0; left: 0; right: 0;
-    background: white; border-top: 1px solid var(--border);
-    padding: 16px 20px; box-shadow: 0 -4px 12px rgba(0,0,0,0.05);
-    display: none; align-items: center; justify-content: space-between; gap: 16px;
-    z-index: 100;
+  /* ---------- Cards ---------- */
+  section.card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--r-lg); padding: 20px 18px; margin-bottom: 16px;
   }
-  .bottom-summary { font-size: 13px; font-weight: 600; color: var(--ink-soft); line-height: 1.4; flex: 1; }
-  .bottom-summary strong { color: var(--ink); display: block; font-size: 16px; margin-bottom: 2px; }
-  .btn-primary {
-    background: var(--accent); color: white; border: none; border-radius: 24px;
-    padding: 14px 28px; font-size: 15px; font-weight: 700; cursor: pointer;
-  }
-  .btn-primary:disabled { opacity: 0.6; }
+  section.card > h2 { margin: 0 0 4px; font-size: 16.5px; font-weight: 750; letter-spacing: -0.02em; }
+  section.card > .hint { margin: 0 0 16px; font-size: 13px; color: var(--ink-soft); }
 
-  .toast {
-    position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-100px);
-    background: #1c2321; color: white; padding: 12px 24px; border-radius: 30px;
-    font-size: 14px; font-weight: 600; box-shadow: 0 8px 16px rgba(0,0,0,0.15);
-    transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); z-index: 999;
+  /* ---------- Mode buttons ---------- */
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 4px; }
+  .mode-btn {
+    border: 2px solid var(--line); background: var(--card); border-radius: 14px;
+    padding: 14px 10px; cursor: pointer; text-align: center; transition: all .15s;
+    font-family: inherit;
   }
+  .mode-btn .ico { font-size: 20px; display: block; margin-bottom: 4px; }
+  .mode-btn strong { display: block; font-size: 13.5px; font-weight: 700; }
+  .mode-btn small { display: block; font-size: 11.5px; color: var(--ink-soft); margin-top: 1px; }
+  .mode-btn.active { border-color: var(--accent); background: var(--accent-light); }
+  .mode-btn.danger.active { border-color: var(--danger); background: var(--danger-light); }
+
+  /* ---------- Products ---------- */
+  .product { display: flex; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+  .product:last-child { border-bottom: none; }
+  .product-emoji { font-size: 21px; width: 27px; text-align: center; flex-shrink: 0; }
+  .product-name { flex: 1; min-width: 0; }
+  .product-name strong { display: block; font-size: 14.5px; font-weight: 650; }
+  .product-name small { font-size: 11.5px; color: var(--ink-faint); }
+  .qty-ctrl { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .qty-btn {
+    width: 33px; height: 33px; border-radius: 9px; border: 1.5px solid var(--line-strong);
+    background: var(--card); font-size: 18px; line-height: 1; color: var(--ink);
+    cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; transition: transform .12s;
+  }
+  .qty-btn:active { transform: scale(.92); }
+  .qty-btn:disabled { opacity: .3; cursor: not-allowed; }
+  .qty-val { min-width: 60px; text-align: center; font-size: 13.5px; font-weight: 700; }
+  .qty-val.zero { color: var(--ink-faint); font-weight: 500; }
+  .qty-val.changed { color: var(--accent-dark); }
+
+  .reset-link {
+    display: block; width: 100%; margin-top: 14px; padding: 11px;
+    border: 1.5px dashed var(--line-strong); border-radius: var(--r-sm);
+    background: none; font-family: inherit; font-size: 13px; font-weight: 600;
+    color: var(--ink-soft); cursor: pointer;
+  }
+
+  /* ---------- Notices ---------- */
+  .notice { display: flex; gap: 10px; padding: 13px 14px; border-radius: var(--r-sm); font-size: 13px; line-height: 1.5; }
+  .notice.warn { background: var(--amber-light); border: 1px solid #fde68a; color: #7c4a03; }
+  .notice.info { background: var(--accent-light); border: 1px solid #b9e0cb; color: #14532d; }
+  .notice.plain { background: var(--bg); border: 1px solid var(--line); color: var(--ink-soft); }
+
+  .empty-state { text-align: center; padding: 50px 24px; color: var(--ink-soft); }
+  .empty-state .ico { font-size: 36px; display: block; margin-bottom: 12px; }
+  .empty-state strong { display: block; color: var(--ink); font-size: 16px; margin-bottom: 4px; }
+  .empty-state p { margin: 0; font-size: 13.5px; }
+
+  /* ---------- Bottom ---------- */
+  .bottom { position: fixed; left: 0; right: 0; bottom: 0; z-index: 700; background: var(--card); border-top: 1px solid var(--line); padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); }
+  .bottom-inner { max-width: 560px; margin: 0 auto; }
+  .submit-btn { width: 100%; padding: 17px; border: none; border-radius: 14px; background: var(--accent); color: #fff; font-family: inherit; font-size: 16px; font-weight: 700; cursor: pointer; transition: background .15s; }
+  .submit-btn:active { background: var(--accent-dark); }
+  .submit-btn:disabled { background: var(--line-strong); cursor: not-allowed; }
+  .submit-btn.danger { background: var(--danger); }
+  .bottom-note { text-align: center; font-size: 12px; color: var(--ink-faint); margin-top: 8px; }
+
+  .toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%) translateY(-140%); background: var(--ink); color: #fff; padding: 12px 20px; border-radius: 12px; font-size: 14px; z-index: 900; max-width: calc(100% - 32px); text-align: center; transition: transform .28s cubic-bezier(.4,0,.2,1); box-shadow: 0 8px 24px rgba(0,0,0,.2); }
   .toast.show { transform: translateX(-50%) translateY(0); }
+  .toast.error { background: var(--danger); }
+
+  #loader { padding: 80px 20px; text-align: center; color: var(--ink-soft); }
+  .spinner-lg { width: 32px; height: 32px; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 14px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #successScreen { display: none; padding: 70px 28px; text-align: center; }
+  #successScreen.show { display: block; }
+  .success-mark { width: 72px; height: 72px; margin: 0 auto 22px; background: var(--accent-light); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 36px; color: var(--accent); }
+  #successScreen h2 { margin: 0 0 10px; font-size: 23px; letter-spacing: -0.02em; }
+  #successScreen p { margin: 0; color: var(--ink-soft); font-size: 15px; line-height: 1.6; }
 </style>
 </head>
 <body>
 
-<div class="toast" id="toast">✅ Changes saved!</div>
-
 <header>
-  <h1>Manage Deliveries</h1>
-  <p>Modify or pause your upcoming orders</p>
+  <h1>Change an Order</h1>
+  <p>Pause or adjust deliveries for specific days</p>
+  <div class="tabs" id="tabs"></div>
 </header>
 
-<div class="date-scroller" id="dateScroller"></div>
+<div id="loader"><div class="spinner-lg"></div>Loading your schedule…</div>
 
-<main>
-  <div id="emptyState" class="empty-state">
-    <span class="icon">👆</span>
-    <h3>Select dates to edit</h3>
-    <p>Tap one or multiple dates above to view or change your schedule.</p>
+<main id="root" style="display:none">
+
+  <div class="section-label">Pick the days to change</div>
+  <div class="dates" id="dateStrip"></div>
+  <div class="legend">
+    <span><i class="dot"></i> Already changed</span>
+    <span><i class="dot grey"></i> No delivery scheduled</span>
   </div>
 
-  <div id="editorSection" class="editor-section">
-    <div class="editor-header" id="editorTitle">Editing 1 Date</div>
-
-    <button class="action-btn action-pause" onclick="pauseSelected()">
-      ⏸️ Pause Delivery
-    </button>
-    <button class="action-btn action-reset" onclick="submitAction('delete')" id="btnReset">
-      🔄 Revert to Default Order
-    </button>
-
-    <div class="items-list" id="itemsList"></div>
+  <div id="noSelection" class="notice plain" style="margin-bottom:16px">
+    <span>👆</span>
+    <div>Choose one or more days above. You can select several at once to apply the same change to all of them.</div>
   </div>
+
+  <div id="editor" style="display:none">
+    <section class="card">
+      <h2>What should we do?</h2>
+      <p class="hint" id="selectionSummary"></p>
+
+      <div class="modes">
+        <button type="button" class="mode-btn" data-mode="change">
+          <span class="ico">✏️</span><strong>Change order</strong><small>Different quantities</small>
+        </button>
+        <button type="button" class="mode-btn danger" data-mode="skip">
+          <span class="ico">⏸️</span><strong>Skip delivery</strong><small>Nothing this day</small>
+        </button>
+      </div>
+
+      <div id="restoreWrap" style="display:none; margin-top:9px">
+        <button type="button" class="reset-link" id="restoreBtn">↩️ Undo my change — go back to my usual order</button>
+      </div>
+    </section>
+
+    <section class="card" id="itemsCard">
+      <h2>Your order for these days</h2>
+      <p class="hint">Starts from your usual order — adjust anything that should be different.</p>
+      <div id="itemsList"></div>
+      <button type="button" class="reset-link" id="resetBtn">Reset to my usual order</button>
+    </section>
+  </div>
+
+  <div class="notice warn" id="cutoffNotice" style="display:none; margin-bottom:20px">
+    <span>⏰</span>
+    <div id="cutoffText"></div>
+  </div>
+
 </main>
 
-<div class="bottom-bar" id="bottomBar">
-  <div class="bottom-summary" id="bottomSummary">
-    <strong>Review Changes</strong>
-    To 1 date
-  </div>
-  <button class="btn-primary" id="btnApply" onclick="submitAction('set')">Save</button>
+<div id="successScreen">
+  <div class="success-mark">✓</div>
+  <h2>Saved</h2>
+  <p id="successText">We've updated your deliveries. You'll get a confirmation on WhatsApp shortly.</p>
 </div>
 
+<div class="bottom" id="bottomBar" style="display:none">
+  <div class="bottom-inner">
+    <button class="submit-btn" id="submitBtn" disabled>Save Changes</button>
+    <div class="bottom-note" id="bottomNote">Select a day to begin</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
 <script>
-  const TOKEN = "{{.Token}}";
+const TOKEN = new URLSearchParams(location.search).get('token');
 
-  const ITEMS = [
-    { key: 'milkQuantity',    label: 'Milk',        emoji: '🥛', unit: 'L',  min: 500, step: 500 },
-    { key: 'curdQuantity',    label: 'Curd',        emoji: '🍶', unit: 'L',  min: 500, step: 500 },
-    { key: 'butterQuantity',  label: 'Butter',      emoji: '🧈', unit: 'kg', min: 250, step: 250 },
-    { key: 'gheeQuantity',    label: 'Desi Ghee',   emoji: '🫙', unit: 'kg', min: 250, step: 250 },
-    { key: 'lassiQuantity',   label: 'Buttermilk',  emoji: '🥤', unit: 'L',  min: 500, step: 500 },
-    { key: 'paneerQuantity',  label: 'Paneer',      emoji: '🧀', unit: 'kg', min: 250, step: 250 },
-    { key: 'jaggeryQuantity', label: 'Jaggery',     emoji: '🍯', unit: 'kg', min: 250, step: 250 },
-    { key: 'khandQuantity',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', min: 250, step: 250 },
-    { key: 'oilQuantity',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  min: 500, step: 500 },
-    { key: 'attaQuantity',    label: 'Atta',        emoji: '🌾', unit: 'kg', min: 250, step: 250 },
-    { key: 'burfiQuantity',   label: 'Milk Burfi',  emoji: '🍬', unit: 'kg', min: 250, step: 250 },
-  ];
+const PRODUCTS = [
+  { key: 'milk',    label: 'Milk',        emoji: '🥛', unit: 'L',  step: 500 },
+  { key: 'curd',    label: 'Curd',        emoji: '🍶', unit: 'L',  step: 500 },
+  { key: 'paneer',  label: 'Paneer',      emoji: '🧀', unit: 'kg', step: 250 },
+  { key: 'butter',  label: 'Butter',      emoji: '🧈', unit: 'kg', step: 250 },
+  { key: 'ghee',    label: 'Desi Ghee',   emoji: '🫙', unit: 'kg', step: 250 },
+  { key: 'lassi',   label: 'Buttermilk',  emoji: '🥤', unit: 'L',  step: 500 },
+  { key: 'jaggery', label: 'Jaggery',     emoji: '🍯', unit: 'kg', step: 250 },
+  { key: 'khand',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', step: 250 },
+  { key: 'oil',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  step: 500 },
+  { key: 'atta',    label: 'Atta',        emoji: '🌾', unit: 'kg', step: 1000 },
+  { key: 'burfi',   label: 'Milk Burfi',  emoji: '🍬', unit: 'kg', step: 250 },
+];
 
-  let serverState = null;
-  let selectedDates = new Set();
-  const currentEditorState = {};
+const SLOT_META = {
+  morning: { icon: '🌅', label: 'Morning' },
+  evening: { icon: '🌆', label: 'Evening' },
+};
 
-  async function loadState() {
-    try {
-      const res = await fetch(`/override/state?token=${TOKEN}`);
-      if (!res.ok) throw new Error();
-      serverState = await res.json();
-      buildCalendar();
-      buildEditorItems();
-      syncEditor();
-    } catch (e) {
-      document.body.innerHTML = '<div style="padding:40px;text-align:center;">Link expired. Please request a new one on WhatsApp.</div>';
-    }
+// /override/state and POST /override both speak customer.Order, whose JSON
+// keys carry a "Quantity" suffix. Convert at the edges.
+function orderToPlain(o) {
+  const out = {};
+  PRODUCTS.forEach(p => { out[p.key] = (o && o[p.key + 'Quantity']) || 0; });
+  return out;
+}
+function plainToOrder(plain) {
+  const out = {};
+  PRODUCTS.forEach(p => { out[p.key + 'Quantity'] = plain[p.key] || 0; });
+  return out;
+}
+
+let serverState = null;      // full payload from /override/state
+let activeSlot = 'morning';
+let selected = new Set();    // date strings
+let mode = 'change';         // 'change' | 'skip'
+let draft = {};              // plain-key quantities being edited
+
+function todayISO() { return new Date().toISOString().slice(0,10); }
+
+function formatQty(v, unit) {
+  if (!v) return '—';
+  if (v < 1000) return v + (unit === 'L' ? ' ml' : ' g');
+  return parseFloat((v/1000).toFixed(2)) + ' ' + unit;
+}
+
+function toast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' error' : '');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.className = 'toast'; }, 3200);
+}
+
+// IST "now", regardless of the phone's timezone. The cutoff is a business
+// rule expressed in Indian time, so the comparison has to be too.
+function istNow() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+}
+
+// Does the customer's schedule actually include this date? A chip for a day
+// with no delivery is still tappable — that's how you ADD a one-off — but
+// it's dimmed so the usual pattern is visible at a glance.
+function isScheduledOn(slotState, dateStr) {
+  if (!slotState || !slotState.subscribed) return false;
+  const d = new Date(dateStr + 'T00:00:00');
+  if (slotState.scheduleType === 'daily') return true;
+  if (slotState.scheduleType === 'custom') {
+    return (slotState.activeDays || []).includes(d.getDay());
   }
-
-  function formatQty(val, unit) {
-    if (val === 0) return "0";
-    if (unit === 'L') return val < 1000 ? `${val} ml` : `${parseFloat((val/1000).toFixed(2))} L`;
-    return val < 1000 ? `${val} g` : `${parseFloat((val/1000).toFixed(2))} kg`;
+  if (slotState.scheduleType === 'alternate') {
+    const anchor = new Date((slotState.anchorDate || todayISO()) + 'T00:00:00');
+    const days = Math.round((d - anchor) / 86400000);
+    return days >= 0 && days % 2 === 0;
   }
+  return false;
+}
 
-  function getISTTime() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
+function cutoffPassedForToday() {
+  const cutoff = (serverState && serverState.morningCutoff) || '03:00';
+  const [h, m] = cutoff.split(':').map(Number);
+  const now = istNow();
+  const limit = new Date(now); limit.setHours(h, m, 0, 0);
+  return now > limit;
+}
 
-  function calculateTotalQty(orderObj) {
-    if (!orderObj) return 0;
-    return Object.values(orderObj).reduce((sum, val) => sum + (val || 0), 0);
-  }
-
-  // --- CALENDAR LOGIC ---
-  function buildCalendar() {
-    const scroller = document.getElementById('dateScroller');
-    scroller.innerHTML = '';
-    const today = getISTTime();
-    const cutoffPassed = today.getHours() >= 3;
-
-    for (let i = 0; i < 14; i++) {
-      const d = new Date(today);
-      d.setDate(today.getDate() + i);
-      const dateStr = [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-');
-
-      const card = document.createElement('div');
-      card.className = 'date-pill';
-
-      let statusClass = '';
-      if (serverState.overrides[dateStr]) {
-        statusClass = calculateTotalQty(serverState.overrides[dateStr]) === 0 ? 'status-paused' : 'status-custom';
-      }
-
-      if (i === 0 && cutoffPassed) card.classList.add('disabled');
-      if (selectedDates.has(dateStr)) card.classList.add('selected');
-
-      card.innerHTML = `
-        <div class="day">${i===0 ? 'TODAY' : d.toLocaleDateString('en-US', {weekday:'short'})}</div>
-        <div class="num">${d.getDate()}</div>
-        ${statusClass ? `<div class="status-dot ${statusClass}"></div>` : ''}
-      `;
-
-      card.addEventListener('click', () => {
-        if (card.classList.contains('disabled')) return showToast("Cannot edit today's order after 3:00 AM.");
-
-        if (selectedDates.has(dateStr)) selectedDates.delete(dateStr);
-        else selectedDates.add(dateStr);
-
-        buildCalendar(); // Cheap re-render to update classes
-        syncEditor();
-      });
-
-      scroller.appendChild(card);
-    }
-  }
-
-  // --- EDITOR UI LOGIC ---
-  function buildEditorItems() {
-    const list = document.getElementById('itemsList');
-    list.innerHTML = '';
-
-    ITEMS.forEach(item => {
-      currentEditorState[item.key] = 0;
-
-      const row = document.createElement('div');
-      row.className = 'item-row';
-      row.id = `row-${item.key}`;
-
-      row.innerHTML = `
-        <div class="item-info">
-          <span class="emoji">${item.emoji}</span>
-          <span class="name">${item.label}</span>
-        </div>
-        <button type="button" class="btn-add">+ Add</button>
-        <div class="stepper">
-          <button type="button" class="dec">−</button>
-          <span class="qty">0</span>
-          <button type="button" class="inc">+</button>
-        </div>
-      `;
-
-      const qtyDisplay = row.querySelector('.qty');
-
-      function updateItemUI(val) {
-        currentEditorState[item.key] = val;
-        qtyDisplay.textContent = formatQty(val, item.unit);
-        if (val > 0) row.classList.add('active');
-        else row.classList.remove('active');
-      }
-
-      row.querySelector('.btn-add').onclick = () => updateItemUI(item.min);
-      row.querySelector('.dec').onclick = () => {
-        const next = currentEditorState[item.key] - item.step;
-        updateItemUI(next >= item.min ? next : 0);
-      };
-      row.querySelector('.inc').onclick = () => {
-        const current = currentEditorState[item.key];
-        const jump = current >= 5000 ? (item.unit === 'L' ? 1000 : 500) : item.step;
-        updateItemUI(current === 0 ? item.min : current + jump);
-      };
-
-      row.updateRaw = updateItemUI;
-      list.appendChild(row);
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+function buildTabs() {
+  const tabs = document.getElementById('tabs');
+  tabs.innerHTML = '';
+  ['morning', 'evening'].forEach(key => {
+    const meta = SLOT_META[key];
+    const subscribed = serverState[key] && serverState[key].subscribed;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = meta.icon + ' ' + meta.label;
+    b.className = key === activeSlot ? 'active' : '';
+    b.disabled = !subscribed;
+    if (!subscribed) b.title = 'You have no ' + key + ' subscription';
+    b.addEventListener('click', () => {
+      if (!subscribed) return;
+      activeSlot = key;
+      selected.clear();
+      mode = 'change';
+      buildTabs(); buildDates(); refreshEditor();
     });
+    tabs.appendChild(b);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Date strip
+// ---------------------------------------------------------------------------
+function buildDates() {
+  const strip = document.getElementById('dateStrip');
+  strip.innerHTML = '';
+  const slotState = serverState[activeSlot];
+  const now = istNow();
+  const lockedToday = cutoffPassedForToday();
+
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(now);
+    d.setDate(now.getDate() + i);
+    const ds = [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-');
+
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'date-chip';
+
+    const isLocked = (i === 0 && lockedToday);
+    const hasOverride = slotState.overrides && Object.prototype.hasOwnProperty.call(slotState.overrides, ds);
+    const scheduled = isScheduledOn(slotState, ds);
+
+    if (isLocked) chip.classList.add('locked');
+    if (hasOverride) chip.classList.add('has-override');
+    if (!scheduled && !hasOverride) chip.classList.add('skip-day');
+    if (selected.has(ds)) chip.classList.add('selected');
+
+    chip.innerHTML =
+      '<span class="dow">' + (i === 0 ? 'Today' : d.toLocaleDateString('en-IN', { weekday: 'short' })) + '</span>' +
+      '<span class="num">' + d.getDate() + '</span>' +
+      '<span class="mon">' + d.toLocaleDateString('en-IN', { month: 'short' }) + '</span>';
+
+    if (!isLocked) {
+      chip.addEventListener('click', () => {
+        if (selected.has(ds)) selected.delete(ds); else selected.add(ds);
+        chip.classList.toggle('selected');
+        onSelectionChanged();
+      });
+    }
+
+    strip.appendChild(chip);
   }
 
-  function syncEditor() {
-    const emptyState = document.getElementById('emptyState');
-    const editor = document.getElementById('editorSection');
-    const bottomBar = document.getElementById('bottomBar');
+  const notice = document.getElementById('cutoffNotice');
+  if (lockedToday) {
+    const cutoff = (serverState.morningCutoff || '03:00');
+    document.getElementById('cutoffText').textContent =
+      "Today's deliveries are already loaded on the van, so they can't be changed after " + cutoff + ". You can still change any day from tomorrow onwards.";
+    notice.style.display = 'flex';
+  } else {
+    notice.style.display = 'none';
+  }
+}
 
-    if (selectedDates.size === 0) {
-      emptyState.style.display = 'block';
-      editor.style.display = 'none';
-      bottomBar.style.display = 'none';
+// ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+function onSelectionChanged() {
+  // Seed the draft from an existing override if exactly one day is selected
+  // and it already has one — otherwise from the standing order. Editing a
+  // single already-changed day should show what you previously chose.
+  const slotState = serverState[activeSlot];
+  if (selected.size === 1) {
+    const only = [...selected][0];
+    const existing = slotState.overrides && slotState.overrides[only];
+    draft = orderToPlain(existing || slotState.defaultOrder);
+    const isSkip = existing && PRODUCTS.every(p => (draft[p.key] || 0) === 0);
+    mode = isSkip ? 'skip' : 'change';
+  } else if (selected.size > 1) {
+    draft = orderToPlain(slotState.defaultOrder);
+    mode = 'change';
+  }
+  refreshEditor();
+}
+
+function refreshEditor() {
+  const editor = document.getElementById('editor');
+  const noSel = document.getElementById('noSelection');
+  const btn = document.getElementById('submitBtn');
+  const note = document.getElementById('bottomNote');
+
+  if (selected.size === 0) {
+    editor.style.display = 'none';
+    noSel.style.display = 'flex';
+    btn.disabled = true;
+    btn.className = 'submit-btn';
+    btn.textContent = 'Save Changes';
+    note.textContent = 'Select a day to begin';
+    return;
+  }
+
+  noSel.style.display = 'none';
+  editor.style.display = 'block';
+
+  const dates = [...selected].sort();
+  const pretty = dates.map(d => new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }));
+  document.getElementById('selectionSummary').textContent =
+    (dates.length === 1 ? pretty[0] : dates.length + ' days selected — ' + pretty.join(', '));
+
+  // Mode buttons
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+
+  document.getElementById('itemsCard').style.display = mode === 'change' ? 'block' : 'none';
+
+  // Restore option only makes sense when every selected day already has an
+  // override to remove.
+  const slotState = serverState[activeSlot];
+  const allHaveOverride = dates.every(d => slotState.overrides && slotState.overrides[d]);
+  document.getElementById('restoreWrap').style.display = allHaveOverride ? 'block' : 'none';
+
+  buildItems();
+
+  btn.disabled = false;
+  if (mode === 'skip') {
+    btn.className = 'submit-btn danger';
+    btn.textContent = dates.length === 1 ? 'Skip this day' : 'Skip these ' + dates.length + ' days';
+    note.textContent = 'No delivery will be made on the selected day' + (dates.length > 1 ? 's' : '');
+  } else {
+    btn.className = 'submit-btn';
+    btn.textContent = 'Save Changes';
+    const changed = PRODUCTS.some(p => (draft[p.key]||0) !== (orderToPlain(slotState.defaultOrder)[p.key]||0));
+    note.textContent = changed ? 'Applies to the selected day' + (dates.length > 1 ? 's' : '') + ' only' : 'Adjust quantities above to continue';
+  }
+}
+
+function buildItems() {
+  const list = document.getElementById('itemsList');
+  list.innerHTML = '';
+  const base = orderToPlain(serverState[activeSlot].defaultOrder);
+
+  PRODUCTS.forEach(p => {
+    const row = document.createElement('div'); row.className = 'product';
+    const val = document.createElement('div'); val.className = 'qty-val';
+
+    function sync() {
+      const q = draft[p.key] || 0;
+      val.textContent = formatQty(q, p.unit);
+      val.classList.toggle('zero', q === 0);
+      val.classList.toggle('changed', q !== (base[p.key] || 0) && q !== 0);
+      minus.disabled = q === 0;
+    }
+
+    const minus = document.createElement('button');
+    minus.type = 'button'; minus.className = 'qty-btn'; minus.textContent = '−';
+    minus.addEventListener('click', () => { draft[p.key] = Math.max(0, (draft[p.key]||0) - p.step); sync(); refreshNoteOnly(); });
+
+    const plus = document.createElement('button');
+    plus.type = 'button'; plus.className = 'qty-btn'; plus.textContent = '+';
+    plus.addEventListener('click', () => { draft[p.key] = (draft[p.key]||0) + p.step; sync(); refreshNoteOnly(); });
+
+    row.innerHTML = '<div class="product-emoji">' + p.emoji + '</div>';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'product-name';
+    nameEl.innerHTML = '<strong></strong><small></small>';
+    nameEl.querySelector('strong').textContent = p.label;
+    nameEl.querySelector('small').textContent = base[p.key] ? 'usually ' + formatQty(base[p.key], p.unit) : 'not in your usual order';
+    row.appendChild(nameEl);
+
+    const ctrl = document.createElement('div'); ctrl.className = 'qty-ctrl';
+    ctrl.appendChild(minus); ctrl.appendChild(val); ctrl.appendChild(plus);
+    row.appendChild(ctrl);
+    sync();
+    list.appendChild(row);
+  });
+}
+
+// Updates only the footer text — avoids rebuilding the whole product list on
+// every tap, which would lose scroll position.
+function refreshNoteOnly() {
+  if (mode !== 'change') return;
+  const base = orderToPlain(serverState[activeSlot].defaultOrder);
+  const changed = PRODUCTS.some(p => (draft[p.key]||0) !== (base[p.key]||0));
+  document.getElementById('bottomNote').textContent =
+    changed ? 'Applies to the selected day' + (selected.size > 1 ? 's' : '') + ' only' : 'Adjust quantities above to continue';
+}
+
+// ---------------------------------------------------------------------------
+// Submit
+// ---------------------------------------------------------------------------
+async function send(action, items, successMsg) {
+  const btn = document.getElementById('submitBtn');
+  const original = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Saving…';
+
+  try {
+    const res = await fetch('/override', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: TOKEN,
+        slot: activeSlot,
+        dates: [...selected].sort(),
+        action,
+        items: plainToOrder(items || {}),
+      }),
+    });
+    if (!res.ok) throw new Error((await res.text()) || 'Could not save');
+
+    document.getElementById('successText').textContent = successMsg;
+    document.getElementById('root').style.display = 'none';
+    document.getElementById('bottomBar').style.display = 'none';
+    document.querySelector('header').style.display = 'none';
+    document.getElementById('successScreen').classList.add('show');
+    window.scrollTo(0,0);
+  } catch (err) {
+    btn.disabled = false; btn.textContent = original;
+    toast(err.message || 'Something went wrong. Please try again.', true);
+  }
+}
+
+function submit() {
+  if (selected.size === 0) return;
+  const n = selected.size;
+  const dayWord = n === 1 ? 'day' : n + ' days';
+
+  if (mode === 'skip') {
+    send('set', {}, 'Your ' + activeSlot + ' delivery is paused for the selected ' + dayWord + '.');
+    return;
+  }
+  const total = PRODUCTS.reduce((s, p) => s + (draft[p.key]||0), 0);
+  if (total === 0) {
+    toast('Add at least one item, or choose "Skip delivery" instead', true);
+    return;
+  }
+  send('set', draft, 'Your ' + activeSlot + ' order has been updated for the selected ' + dayWord + '.');
+}
+
+// ---------------------------------------------------------------------------
+// Load
+// ---------------------------------------------------------------------------
+async function load() {
+  try {
+    const res = await fetch('/override/state?token=' + encodeURIComponent(TOKEN));
+    if (!res.ok) throw new Error('Could not load your schedule');
+    serverState = await res.json();
+
+    const hasMorning = serverState.morning && serverState.morning.subscribed;
+    const hasEvening = serverState.evening && serverState.evening.subscribed;
+
+    if (!hasMorning && !hasEvening) {
+      document.getElementById('loader').innerHTML =
+        '<div class="empty-state"><span class="ico">📭</span>' +
+        '<strong>No active deliveries</strong>' +
+        '<p>You don\'t have a delivery schedule set up yet. Reply <b>2</b> on WhatsApp to create one.</p></div>';
       return;
     }
 
-    emptyState.style.display = 'none';
-    editor.style.display = 'block';
-    bottomBar.style.display = 'flex';
+    activeSlot = hasMorning ? 'morning' : 'evening';
 
-    const isSingle = selectedDates.size === 1;
-    document.getElementById('editorTitle').textContent = isSingle ? "Editing 1 Date" : `Editing ${selectedDates.size} Dates`;
-    document.getElementById('bottomSummary').innerHTML = `<strong>Review Changes</strong>Applying to ${selectedDates.size} date(s)`;
+    document.getElementById('loader').style.display = 'none';
+    document.getElementById('root').style.display = 'block';
+    document.getElementById('bottomBar').style.display = 'block';
 
-    let allHaveOverrides = true;
-    selectedDates.forEach(date => { if (!serverState.overrides[date]) allHaveOverrides = false; });
-    document.getElementById('btnReset').style.display = allHaveOverrides ? 'flex' : 'none';
+    buildTabs();
+    buildDates();
+    refreshEditor();
 
-    let dataSource = serverState.defaultOrder;
-    if (isSingle) {
-      const singleDate = Array.from(selectedDates)[0];
-      if (serverState.overrides[singleDate]) dataSource = serverState.overrides[singleDate];
-    }
-
-    ITEMS.forEach(item => {
-      document.getElementById(`row-${item.key}`).updateRaw(dataSource[item.key] || 0);
+    document.querySelectorAll('.mode-btn').forEach(b => {
+      b.addEventListener('click', () => { mode = b.dataset.mode; refreshEditor(); });
     });
+    document.getElementById('resetBtn').addEventListener('click', () => {
+      draft = orderToPlain(serverState[activeSlot].defaultOrder);
+      buildItems(); refreshNoteOnly();
+      toast('Reset to your usual order');
+    });
+    document.getElementById('restoreBtn').addEventListener('click', () => {
+      const n = selected.size;
+      send('delete', {}, 'Those ' + (n === 1 ? 'day goes' : n + ' days go') + ' back to your usual ' + activeSlot + ' order.');
+    });
+    document.getElementById('submitBtn').addEventListener('click', submit);
+  } catch (err) {
+    document.getElementById('loader').innerHTML =
+      '<p style="color:var(--danger);font-weight:600">Couldn\'t load your schedule.</p>' +
+      '<p style="font-size:14px">This link may have expired. Please request a new one from WhatsApp.</p>';
   }
+}
 
-  // --- ACTIONS ---
-  function pauseSelected() {
-    ITEMS.forEach(item => document.getElementById(`row-${item.key}`).updateRaw(0));
-  }
-
-  function showToast(msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.classList.add('show');
-    setTimeout(() => t.classList.remove('show'), 3000);
-  }
-
-  async function submitAction(action) {
-    const payload = {
-      token: TOKEN,
-      dates: Array.from(selectedDates),
-      action: action,
-      items: currentEditorState
-    };
-
-    const btn = document.getElementById('btnApply');
-    const originalText = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "Saving...";
-
-    try {
-      const res = await fetch('/override', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!res.ok) throw new Error(await res.text());
-
-      showToast("✅ Schedule updated & notification sent!");
-      selectedDates.clear();
-      await loadState();
-
-    } catch (e) {
-      showToast("❌ Error saving changes.");
-    } finally {
-      btn.disabled = false;
-      btn.textContent = originalText;
-    }
-  }
-
-  loadState();
+load();
 </script>
 </body>
 </html>

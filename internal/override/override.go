@@ -59,9 +59,32 @@ func (or OverrideResource) ShowForm(w http.ResponseWriter, r *http.Request) {
 	overrideTmpl.Execute(w, map[string]string{"Token": token})
 }
 
-type CustomerState struct {
+// SlotState is everything the page needs to render one slot: the customer's
+// standing order for it, and any overrides they've already scheduled.
+// Overrides are keyed by date string.
+type SlotState struct {
+	Subscribed   bool                      `json:"subscribed"`
+	ScheduleType string                    `json:"scheduleType"`
+	ActiveDays   []int                     `json:"activeDays"`
+	AnchorDate   string                    `json:"anchorDate"`
 	DefaultOrder customer.Order            `json:"defaultOrder"`
 	Overrides    map[string]customer.Order `json:"overrides"`
+}
+
+// CustomerState carries both slots. A customer subscribed to morning only
+// gets Evening.Subscribed = false, and the page hides that tab entirely.
+type CustomerState struct {
+	Morning SlotState `json:"morning"`
+	Evening SlotState `json:"evening"`
+
+	// Cutoff hour (HH:MM) after which today can no longer be changed. Sent
+	// so the page can grey out today's chip rather than letting the customer
+	// fill in a form that the server will reject.
+	MorningCutoff string `json:"morningCutoff"`
+}
+
+func newSlotState() SlotState {
+	return SlotState{Overrides: make(map[string]customer.Order)}
 }
 
 func (or OverrideResource) GetState(w http.ResponseWriter, r *http.Request) {
@@ -83,38 +106,84 @@ func (or OverrideResource) GetState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	state := CustomerState{
-		Overrides: make(map[string]customer.Order),
+		Morning:       newSlotState(),
+		Evening:       newSlotState(),
+		MorningCutoff: "03:00",
 	}
 
-	subQuery := `
-        SELECT default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
+	// Best-effort: if system_config is missing we keep the 03:00 default
+	// rather than failing the whole page.
+	var cutoff string
+	if err := or.DB.QueryRow(ctx,
+		`SELECT TO_CHAR(morning_cutoff_time, 'HH24:MI') FROM system_config LIMIT 1`,
+	).Scan(&cutoff); err == nil && cutoff != "" {
+		state.MorningCutoff = cutoff
+	}
+
+	// --- Subscriptions, one row per slot ---
+	subRows, err := or.DB.Query(ctx, `
+        SELECT slot, schedule_type, active_days, TO_CHAR(anchor_date, 'YYYY-MM-DD'),
+               default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
                default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
                default_oil_qty, default_atta_qty, default_burfi_qty
-        FROM subscriptions WHERE customer_id = $1`
-	or.DB.QueryRow(ctx, subQuery, customerID).Scan(
-		&state.DefaultOrder.Milk, &state.DefaultOrder.Curd, &state.DefaultOrder.Butter, &state.DefaultOrder.Ghee,
-		&state.DefaultOrder.Lassi, &state.DefaultOrder.Paneer, &state.DefaultOrder.Jaggery, &state.DefaultOrder.Khand,
-		&state.DefaultOrder.Oil, &state.DefaultOrder.Atta, &state.DefaultOrder.Burfi,
-	)
+        FROM subscriptions WHERE customer_id = $1`, customerID)
+	if err != nil {
+		http.Error(w, "Failed to load subscription", http.StatusInternalServerError)
+		return
+	}
+	defer subRows.Close()
 
-	overrideQuery := `
-        SELECT target_date, new_milk_qty, new_curd_qty, new_butter_qty, new_ghee_qty,
+	for subRows.Next() {
+		var slot string
+		s := newSlotState()
+		if err := subRows.Scan(
+			&slot, &s.ScheduleType, &s.ActiveDays, &s.AnchorDate,
+			&s.DefaultOrder.Milk, &s.DefaultOrder.Curd, &s.DefaultOrder.Butter, &s.DefaultOrder.Ghee,
+			&s.DefaultOrder.Lassi, &s.DefaultOrder.Paneer, &s.DefaultOrder.Jaggery, &s.DefaultOrder.Khand,
+			&s.DefaultOrder.Oil, &s.DefaultOrder.Atta, &s.DefaultOrder.Burfi,
+		); err != nil {
+			continue
+		}
+		s.Subscribed = true
+		if slot == "evening" {
+			s.Overrides = state.Evening.Overrides
+			state.Evening = s
+		} else {
+			s.Overrides = state.Morning.Overrides
+			state.Morning = s
+		}
+	}
+
+	// --- Existing overrides, also per slot ---
+	ovRows, err := or.DB.Query(ctx, `
+        SELECT slot, target_date, new_milk_qty, new_curd_qty, new_butter_qty, new_ghee_qty,
                new_lassi_qty, new_paneer_qty, new_jaggery_qty, new_khand_qty,
                new_oil_qty, new_atta_qty, new_burfi_qty
         FROM order_overrides
-        WHERE customer_id = $1 AND target_date >= CURRENT_DATE`
-	rows, _ := or.DB.Query(ctx, overrideQuery, customerID)
-	defer rows.Close()
+        WHERE customer_id = $1 AND target_date >= CURRENT_DATE`, customerID)
+	if err != nil {
+		http.Error(w, "Failed to load overrides", http.StatusInternalServerError)
+		return
+	}
+	defer ovRows.Close()
 
-	for rows.Next() {
+	for ovRows.Next() {
+		var slot string
 		var date time.Time
 		var o customer.Order
-		rows.Scan(
-			&date, &o.Milk, &o.Curd, &o.Butter, &o.Ghee,
+		if err := ovRows.Scan(
+			&slot, &date, &o.Milk, &o.Curd, &o.Butter, &o.Ghee,
 			&o.Lassi, &o.Paneer, &o.Jaggery, &o.Khand,
 			&o.Oil, &o.Atta, &o.Burfi,
-		)
-		state.Overrides[date.Format("2006-01-02")] = o
+		); err != nil {
+			continue
+		}
+		key := date.Format("2006-01-02")
+		if slot == "evening" {
+			state.Evening.Overrides[key] = o
+		} else {
+			state.Morning.Overrides[key] = o
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -123,6 +192,7 @@ func (or OverrideResource) GetState(w http.ResponseWriter, r *http.Request) {
 
 type WebSubmitPayload struct {
 	Token  string         `json:"token"`
+	Slot   string         `json:"slot"` // "morning" | "evening"; defaults to morning
 	Dates  []string       `json:"dates"`
 	Action string         `json:"action"` // "set" or "delete"
 	Items  customer.Order `json:"items"`
@@ -133,6 +203,13 @@ func (or OverrideResource) Submit(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
+	}
+
+	// Anything that isn't explicitly "evening" is treated as morning. Keeps
+	// a stale cached copy of the pre-slots page working instead of writing
+	// rows with an invalid slot that the CHECK constraint would reject.
+	if payload.Slot != "evening" {
+		payload.Slot = "morning"
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
@@ -148,36 +225,85 @@ func (or OverrideResource) Submit(w http.ResponseWriter, r *http.Request) {
 	var customerName string
 	or.DB.QueryRow(ctx, "SELECT id, name FROM customers WHERE phone_number = $1", phone).Scan(&customerID, &customerName)
 
+	// The customer must actually be subscribed to the slot they're editing —
+	// otherwise an override row would exist for a slot with no standing
+	// order, and the manifest would never pick it up.
+	var subscribed bool
+	or.DB.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM subscriptions WHERE customer_id = $1 AND slot = $2)`,
+		customerID, payload.Slot,
+	).Scan(&subscribed)
+	if !subscribed {
+		http.Error(w, "You don't have a "+payload.Slot+" subscription to change.", http.StatusBadRequest)
+		return
+	}
+
+	// Cutoff now comes from system_config rather than a hardcoded 03:00, so
+	// the admin settings screen actually controls it. Falls back to 3 AM if
+	// the row is missing.
 	loc, _ := time.LoadLocation("Asia/Kolkata")
 	now := time.Now().In(loc)
 	todayStr := now.Format("2006-01-02")
-	cutoffTime := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, loc)
+
+	cutoffHour, cutoffMin := 3, 0
+	var cutoffStr string
+	if err := or.DB.QueryRow(ctx,
+		`SELECT TO_CHAR(morning_cutoff_time, 'HH24:MI') FROM system_config LIMIT 1`,
+	).Scan(&cutoffStr); err == nil && cutoffStr != "" {
+		var h, m int
+		if _, err := fmt.Sscanf(cutoffStr, "%d:%d", &h, &m); err == nil {
+			cutoffHour, cutoffMin = h, m
+		}
+	}
+	cutoffTime := time.Date(now.Year(), now.Month(), now.Day(), cutoffHour, cutoffMin, 0, 0, loc)
 
 	for _, targetDate := range payload.Dates {
 		if targetDate == todayStr && now.After(cutoffTime) {
-			http.Error(w, "Cannot alter today's order after the 3:00 AM cutoff.", http.StatusForbidden)
+			http.Error(w, fmt.Sprintf("Cannot alter today's order after the %s cutoff.", cutoffTime.Format("3:04 PM")), http.StatusForbidden)
 			return
+		}
+		// Two-week horizon, enforced server-side. The page only renders 14
+		// chips, but the API shouldn't rely on the client for that.
+		if t, err := time.ParseInLocation("2006-01-02", targetDate, loc); err == nil {
+			if t.After(now.AddDate(0, 0, 14)) {
+				http.Error(w, "You can only change orders up to 2 weeks ahead.", http.StatusBadRequest)
+				return
+			}
 		}
 	}
 
-	tx, _ := or.DB.Begin(ctx)
+	tx, err := or.DB.Begin(ctx)
+	if err != nil {
+		http.Error(w, "Could not save your changes. Please try again.", http.StatusInternalServerError)
+		return
+	}
 	defer tx.Rollback(ctx)
 
 	if payload.Action == "delete" {
 		for _, date := range payload.Dates {
-			tx.Exec(ctx, "DELETE FROM order_overrides WHERE customer_id = $1 AND target_date = $2", customerID, date)
+			if _, err := tx.Exec(ctx,
+				"DELETE FROM order_overrides WHERE customer_id = $1 AND target_date = $2 AND slot = $3",
+				customerID, date, payload.Slot,
+			); err != nil {
+				http.Error(w, "Could not cancel that override.", http.StatusInternalServerError)
+				return
+			}
 		}
 	} else {
+		// Conflict target is (customer_id, target_date, slot), matching the
+		// unique_customer_target_date_slot constraint from the slots
+		// migration. The old two-column target no longer exists and made
+		// every override submission fail at plan time.
 		query := `
             INSERT INTO order_overrides (
-                id, customer_id, target_date,
+                id, customer_id, target_date, slot,
                 new_milk_qty, new_curd_qty, new_butter_qty, new_ghee_qty,
                 new_lassi_qty, new_paneer_qty, new_jaggery_qty, new_khand_qty,
                 new_oil_qty, new_atta_qty, new_burfi_qty
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
             )
-            ON CONFLICT (customer_id, target_date) DO UPDATE SET
+            ON CONFLICT (customer_id, target_date, slot) DO UPDATE SET
                 new_milk_qty = EXCLUDED.new_milk_qty, new_curd_qty = EXCLUDED.new_curd_qty,
                 new_butter_qty = EXCLUDED.new_butter_qty, new_ghee_qty = EXCLUDED.new_ghee_qty,
                 new_lassi_qty = EXCLUDED.new_lassi_qty, new_paneer_qty = EXCLUDED.new_paneer_qty,
@@ -187,20 +313,25 @@ func (or OverrideResource) Submit(w http.ResponseWriter, r *http.Request) {
 
 		for _, date := range payload.Dates {
 			u, _ := uuid.NewV7()
-			tx.Exec(ctx, query, u, customerID, date,
+			if _, err := tx.Exec(ctx, query, u, customerID, date, payload.Slot,
 				payload.Items.Milk, payload.Items.Curd, payload.Items.Butter, payload.Items.Ghee,
 				payload.Items.Lassi, payload.Items.Paneer, payload.Items.Jaggery, payload.Items.Khand,
 				payload.Items.Oil, payload.Items.Atta, payload.Items.Burfi,
-			)
+			); err != nil {
+				http.Error(w, "Could not save that change.", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
-	tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "Could not save your changes. Please try again.", http.StatusInternalServerError)
+		return
+	}
 	registration.MarkUsed(ctx, or.DB, payload.Token)
 
 	// --- GENERATE DETAILED WHATSAPP NOTIFICATION ---
 	if or.WhatsApp != nil {
-		// Format dates cleanly (e.g., "2026-08-04" -> "Aug 04")
 		var formattedDates []string
 		for _, d := range payload.Dates {
 			if t, err := time.Parse("2006-01-02", d); err == nil {
@@ -210,18 +341,18 @@ func (or OverrideResource) Submit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		dateStr := strings.Join(formattedDates, ", ")
+		slotLabel := strings.Title(payload.Slot)
 
 		var msg string
 		if payload.Action == "delete" {
-			msg = fmt.Sprintf("✅ Your override has been cancelled for: *%s*.\n\nThese dates will return to your default schedule.", dateStr)
+			msg = fmt.Sprintf("✅ Your %s override has been cancelled for: *%s*.\n\nThese dates will return to your default schedule.", strings.ToLower(slotLabel), dateStr)
 		} else {
-			// Check if this is a "Pause" (all items 0)
 			totalQty := payload.Items.Milk + payload.Items.Curd + payload.Items.Butter + payload.Items.Ghee + payload.Items.Lassi + payload.Items.Paneer + payload.Items.Jaggery + payload.Items.Khand + payload.Items.Oil + payload.Items.Atta + payload.Items.Burfi
 			if totalQty == 0 {
-				msg = fmt.Sprintf("⏸️ Your deliveries have been paused for: *%s*.", dateStr)
+				msg = fmt.Sprintf("⏸️ Your *%s* deliveries have been paused for: *%s*.", slotLabel, dateStr)
 			} else {
 				orderDetails := buildOrderString(payload.Items)
-				msg = fmt.Sprintf("✅ Your order has been updated for: *%s*.\n\n*New Order:*\n%s", dateStr, orderDetails)
+				msg = fmt.Sprintf("✅ Your *%s* order has been updated for: *%s*.\n\n*New Order:*\n%s", slotLabel, dateStr, orderDetails)
 			}
 		}
 		or.WhatsApp.SendDeliveryUpdate(phone, msg)
@@ -238,50 +369,43 @@ func formatUnit(qty int, isLiquid bool) string {
 	}
 	if isLiquid {
 		if qty >= 1000 {
-			return fmt.Sprintf("%.1f L", float64(qty)/1000)
+			return fmt.Sprintf("%.1fL", float64(qty)/1000)
 		}
-		return fmt.Sprintf("%d ml", qty)
+		return fmt.Sprintf("%dml", qty)
 	}
 	if qty >= 1000 {
-		return fmt.Sprintf("%.1f kg", float64(qty)/1000)
+		return fmt.Sprintf("%.1fkg", float64(qty)/1000)
 	}
-	return fmt.Sprintf("%d g", qty)
+	return fmt.Sprintf("%dg", qty)
 }
 
 func buildOrderString(o customer.Order) string {
-	var parts []string
-	if o.Milk > 0 {
-		parts = append(parts, "🥛 Milk: "+formatUnit(o.Milk, true))
+	items := []struct {
+		label    string
+		qty      int
+		isLiquid bool
+	}{
+		{"Milk", o.Milk, true},
+		{"Curd", o.Curd, false},
+		{"Butter", o.Butter, false},
+		{"Ghee", o.Ghee, false},
+		{"Buttermilk", o.Lassi, true},
+		{"Paneer", o.Paneer, false},
+		{"Jaggery", o.Jaggery, false},
+		{"Desi Khand", o.Khand, false},
+		{"Mustard Oil", o.Oil, true},
+		{"Atta", o.Atta, false},
+		{"Milk Burfi", o.Burfi, false},
 	}
-	if o.Curd > 0 {
-		parts = append(parts, "🍶 Curd: "+formatUnit(o.Curd, true))
+
+	var lines []string
+	for _, it := range items {
+		if it.qty > 0 {
+			lines = append(lines, fmt.Sprintf("• %s: %s", it.label, formatUnit(it.qty, it.isLiquid)))
+		}
 	}
-	if o.Butter > 0 {
-		parts = append(parts, "🧈 Butter: "+formatUnit(o.Butter, false))
+	if len(lines) == 0 {
+		return "• (No items)"
 	}
-	if o.Ghee > 0 {
-		parts = append(parts, "🫙 Ghee: "+formatUnit(o.Ghee, false))
-	}
-	if o.Lassi > 0 {
-		parts = append(parts, "🥤 Lassi: "+formatUnit(o.Lassi, true))
-	}
-	if o.Paneer > 0 {
-		parts = append(parts, "🧀 Paneer: "+formatUnit(o.Paneer, false))
-	}
-	if o.Jaggery > 0 {
-		parts = append(parts, "🍯 Jaggery: "+formatUnit(o.Jaggery, false))
-	}
-	if o.Khand > 0 {
-		parts = append(parts, "🍚 Khand: "+formatUnit(o.Khand, false))
-	}
-	if o.Oil > 0 {
-		parts = append(parts, "🫗 Oil: "+formatUnit(o.Oil, true))
-	}
-	if o.Atta > 0 {
-		parts = append(parts, "🌾 Atta: "+formatUnit(o.Atta, false))
-	}
-	if o.Burfi > 0 {
-		parts = append(parts, "🍬 Burfi: "+formatUnit(o.Burfi, false))
-	}
-	return strings.Join(parts, "\n")
+	return strings.Join(lines, "\n")
 }

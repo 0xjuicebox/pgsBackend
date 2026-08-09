@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -43,17 +42,14 @@ func (wr WhatsAppResource) HandleIncomingMessage(w http.ResponseWriter, r *http.
 	w.WriteHeader(http.StatusOK)
 
 	go func() {
-		// 1. CATCH FLOW SUBMISSIONS
-		flowPayload := interactiveData
-		if flowPayload == "" && strings.HasPrefix(body, "{") {
-			flowPayload = body
-		}
-		if flowPayload != "" {
-			wr.handleFlowSubmissions(rawSender, cleanPhone, flowPayload)
-			return
-		}
+		// NOTE: the old Flow-submission intercept used to sit here and
+		// short-circuit before the gatekeeper. It was removed when issue
+		// reporting moved to the token-gated HTML page (/delivery/issue).
+		// Keeping it meant any InteractiveData — including ordinary menu
+		// taps — bypassed routing entirely and got silently dropped when
+		// the JSON didn't parse.
 
-		// 2. THE GATEKEEPER (Now checks status!)
+		// --- THE GATEKEEPER ---
 		var customerID, status string
 		var isActive bool
 		err := wr.DB.QueryRow(context.Background(), "SELECT id, is_active, status FROM customers WHERE phone_number = $1", cleanPhone).Scan(&customerID, &isActive, &status)
@@ -77,7 +73,28 @@ func (wr WhatsAppResource) HandleIncomingMessage(w http.ResponseWriter, r *http.
 			return
 		}
 
-		// 3. REGISTERED USER ROUTING (Active & Disabled)
+		// --- DISABLED USERS: only reactivation or deletion make sense ---
+		//
+		// Previously a paused customer could still reach the override and
+		// update flows, which quietly did nothing useful — their deliveries
+		// were stopped either way. And there was no way back at all: once
+		// paused, only an admin could restore the account. Now the resume
+		// path is the default response for this state.
+		if status == "disabled" {
+			switch {
+			case strings.Contains(message, "resume") || strings.Contains(message, "reactivate") ||
+				strings.Contains(message, "restart") || strings.Contains(message, "unpause"):
+				wr.handleReactivateAccount(rawSender, cleanPhone)
+			case strings.Contains(message, "delete account"):
+				wr.handleDeleteAccount(rawSender, customerID, cleanPhone)
+			default:
+				wr.WhatsApp.SendDeliveryUpdate(rawSender,
+					"⏸️ Your deliveries are currently paused.\n\nReply *RESUME* to start them again, or *DELETE ACCOUNT* to close your account permanently.")
+			}
+			return
+		}
+
+		// --- ACTIVE USER ROUTING ---
 		switch {
 		case buttonPayload == "1" || strings.Contains(message, "main menu"):
 			err := wr.WhatsApp.SendInteractiveMenu(rawSender)
@@ -85,14 +102,15 @@ func (wr WhatsAppResource) HandleIncomingMessage(w http.ResponseWriter, r *http.
 				fmt.Printf("❌ Failed to send menu: %v\n", err)
 			}
 
-		case message == "test" || message == "3" || strings.Contains(message, "report issue"):
+		case message == "3" || strings.Contains(message, "report issue"):
 			wr.handleIssueRequest(rawSender, cleanPhone)
 
 		case message == "1" || strings.Contains(message, "override"):
 			wr.handleOverrideRequest(rawSender, cleanPhone)
 
-		case message == "2" || strings.Contains(message, "update_info") || strings.Contains(message, "update_info"):
+		case message == "2" || strings.Contains(message, "update_info"):
 			wr.handleUpdateRequest(rawSender, cleanPhone)
+
 		case strings.Contains(message, "disable") || strings.Contains(message, "pause"):
 			wr.handleDisableAccount(rawSender, cleanPhone)
 
@@ -142,89 +160,7 @@ func (wr WhatsAppResource) handleUnregisteredUser(rawSender, cleanPhone, message
 	}
 }
 
-// --- FLOW ROUTING (issue reporting only now) ---
-
-// flowPage / flowItem mirror the nested shape a native WhatsApp Flow submission
-// actually sends: {"pages":[{"pageId":"...","items":[{"label":"...","value":"..."}]}]}
-type flowPage struct {
-	PageID string     `json:"pageId"`
-	Items  []flowItem `json:"items"`
-}
-type flowItem struct {
-	Label string      `json:"label"`
-	Value interface{} `json:"value"`
-}
-type flowSubmission struct {
-	Pages []flowPage `json:"pages"`
-}
-
-func (wr *WhatsAppResource) handleFlowSubmissions(rawSender, cleanPhone, jsonBody string) {
-	var submission flowSubmission
-	if err := json.Unmarshal([]byte(jsonBody), &submission); err != nil {
-		fmt.Printf("❌ Failed to parse Flow JSON: %v\n", err)
-		return
-	}
-
-	// 🕵️ DEBUG: This prints the parsed structure Meta/Twilio sent back.
-	fmt.Printf("📦 Flow Payload Received: %+v\n", submission)
-
-	// Walk the nested pages/items structure into a clean, readable summary —
-	// e.g. "Issue Type: damaged_item | Describe the Issue: dansger" instead
-	// of a raw Go-map dump.
-	var feedbackBuilder strings.Builder
-	for _, page := range submission.Pages {
-		for _, item := range page.Items {
-			label := strings.ReplaceAll(item.Label, "_", " ")
-			feedbackBuilder.WriteString(fmt.Sprintf("%s: %v | ", label, item.Value))
-		}
-	}
-	complaintText := strings.TrimSuffix(feedbackBuilder.String(), " | ")
-
-	if complaintText == "" {
-		fmt.Printf("⚠️ Flow submission from %s had no parseable items — raw body: %s\n", cleanPhone, jsonBody)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	query := `
-		UPDATE delivery_logs
-		SET is_flagged = true, customer_feedback = $1, updated_at = NOW()
-		WHERE customer_id = (SELECT id FROM customers WHERE phone_number = $2)
-		AND delivery_date = CURRENT_DATE;
-	`
-	cmdTag, err := wr.DB.Exec(ctx, query, complaintText, cleanPhone)
-
-	if err != nil {
-		fmt.Printf("❌ DB Error logging complaint for %s: %v\n", cleanPhone, err)
-		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ We couldn't log your issue right now. Please try again or contact support.")
-		wr.WhatsApp.SendInteractiveMenu(rawSender)
-		return
-	}
-
-	if cmdTag.RowsAffected() == 0 {
-		fmt.Printf("⚠️ DB Warning: Complaint received for %s but no delivery log found today. Feedback: %q\n", cleanPhone, complaintText)
-		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ We couldn't find a delivery record for you today. Our team will look into this manually.")
-		wr.WhatsApp.SendInteractiveMenu(rawSender)
-		return
-	}
-
-	// ✅ Explicit success log for your terminal
-	fmt.Printf("✅ DB Success: Issue logged for %s. Form Data: %q\n", cleanPhone, complaintText)
-
-	// Send the issue confirmation template — it has its own "Main Menu" button (id "1"),
-	// so we no longer need to separately fire SendDeliveryUpdate + SendInteractiveMenu here.
-	err = wr.WhatsApp.SendIssueConfirmation(rawSender)
-	if err != nil {
-		fmt.Printf("❌ Failed to send issue confirmation: %v\n", err)
-		// Fall back to the old text + menu combo if the template send fails for any reason.
-		wr.WhatsApp.SendDeliveryUpdate(rawSender, "✅ We have recorded your feedback and our management team will take action promptly.")
-		wr.WhatsApp.SendInteractiveMenu(rawSender)
-	}
-}
-
-// --- ACCOUNT MANAGEMENT ---
+// --- ACCOUNT STATE CHANGES ---
 
 func (wr *WhatsAppResource) handleDisableAccount(rawSender, phone string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -236,7 +172,42 @@ func (wr *WhatsAppResource) handleDisableAccount(rawSender, phone string) {
 		return
 	}
 
-	wr.WhatsApp.SendDeliveryUpdate(rawSender, "⏸️ Your account is now disabled. Deliveries will stop tomorrow.\n\nNote: You will still receive a final bill at the end of the month for deliveries already made.")
+	wr.WhatsApp.SendDeliveryUpdate(rawSender, "⏸️ Your deliveries are now paused starting tomorrow.\n\nYou'll still receive a final bill at the end of the month for deliveries already made.\n\nReply *RESUME* any time to start again.")
+}
+
+// handleReactivateAccount is the return path for a customer who paused
+// themselves. Deliberately routes back through admin approval rather than
+// flipping straight to active: while they were paused their route slot may
+// have been reassigned, so someone has to confirm capacity before deliveries
+// restart.
+func (wr *WhatsAppResource) handleReactivateAccount(rawSender, phone string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var subCount int
+	if err := wr.DB.QueryRow(ctx, `
+		SELECT COUNT(*) FROM subscriptions s
+		JOIN customers c ON c.id = s.customer_id
+		WHERE c.phone_number = $1
+	`, phone).Scan(&subCount); err != nil {
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ We couldn't restart your deliveries right now. Please try again later.")
+		return
+	}
+
+	if subCount == 0 {
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ We don't have an order on file for you any more. Reply *2* to set up your delivery again.")
+		return
+	}
+
+	_, err := wr.DB.Exec(ctx,
+		"UPDATE customers SET status = 'pending', is_active = false WHERE phone_number = $1", phone)
+	if err != nil {
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ We couldn't restart your deliveries right now. Please try again later.")
+		return
+	}
+
+	fmt.Printf("🔄 Reactivation requested by %s — now pending admin approval\n", phone)
+	wr.WhatsApp.SendDeliveryUpdate(rawSender, "🔄 Welcome back! Your request to resume deliveries has been sent to our team.\n\nWe'll confirm as soon as your route is assigned. 🥛")
 }
 
 func (wr *WhatsAppResource) handleDeleteAccount(rawSender, customerID, phone string) {
@@ -258,8 +229,20 @@ func (wr *WhatsAppResource) handleDeleteAccount(rawSender, customerID, phone str
 	}
 
 	if unbilledDeliveries > 0 {
-		wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf("❌ We cannot delete your account because you have %d unbilled deliveries this month.\n\nPlease disable your account (Reply 'Pause account') to stop future deliveries. Once your final bill is settled, you can delete your account.", unbilledDeliveries))
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf("❌ We cannot delete your account because you have %d unbilled deliveries this month.\n\nPlease pause your account (reply *PAUSE*) to stop future deliveries. Once your final bill is settled, you can delete your account.", unbilledDeliveries))
 		fmt.Printf("🚨 ADMIN ALERT: Customer %s tried to delete account but has pending payments.\n", phone)
+		return
+	}
+
+	// Also block on unpaid invoices from previous months — the same guard the
+	// admin Delete endpoint applies. Without this a customer could settle
+	// nothing and vanish between the 1st and the invoice run.
+	var unpaidInvoices int
+	if err := wr.DB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM invoices WHERE customer_id = $1 AND status = 'PENDING'`,
+		customerID,
+	).Scan(&unpaidInvoices); err == nil && unpaidInvoices > 0 {
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf("❌ We cannot delete your account — you have %d unpaid bill(s) outstanding.\n\nPlease settle them first, then try again.", unpaidInvoices))
 		return
 	}
 
@@ -271,6 +254,8 @@ func (wr *WhatsAppResource) handleDeleteAccount(rawSender, customerID, phone str
 
 	wr.WhatsApp.SendDeliveryUpdate(rawSender, "✅ Your account and all associated data have been permanently deleted. Goodbye!")
 }
+
+// --- TOKEN-GATED WEB LINK HANDLERS ---
 
 // handleOverrideRequest generates a secure token and sends the override web link
 func (wr *WhatsAppResource) handleOverrideRequest(rawSender, cleanPhone string) {
@@ -309,3 +294,6 @@ func (wr *WhatsAppResource) handleUpdateRequest(rawSender, cleanPhone string) {
 		fmt.Printf("❌ Failed to send update link: %v\n", err)
 	}
 }
+
+// NOTE: handleIssueRequest lives in internal/webhook/issue.go — it isn't
+// duplicated here.
