@@ -33,6 +33,12 @@ func (dr DriverResource) Routes() chi.Router {
 	// Admin routes
 	r.With(middleware.Paginate).Get("/", dr.List)
 	r.Post("/", dr.Create)
+
+	// Admin: sync-failure review. Outside the Supabase group — the admin
+	// app authenticates locally and holds no Supabase JWT.
+	r.Get("/sync-failures", dr.ListSyncFailures)
+	r.Post("/sync-failures/{id}/resolve", dr.ResolveSyncFailure)
+
 	r.Route("/{id}", func(r chi.Router) {
 		r.Get("/", dr.Get)
 		r.Put("/", dr.Update)
@@ -51,10 +57,7 @@ func (dr DriverResource) Routes() chi.Router {
 		r.Post("/shift/start", dr.StartShift)
 		r.Post("/shift/end", dr.EndShift)
 
-		r.Get("/sync-failures", dr.ListSyncFailures)
-		r.Post("/sync-failures/{id}/resolve", dr.ResolveSyncFailure)
-
-		// Offline-queue sync failure reporting
+		// Offline-queue sync failure reporting (driver-side)
 		r.Post("/sync-failures", dr.ReportSyncFailure)
 	})
 
