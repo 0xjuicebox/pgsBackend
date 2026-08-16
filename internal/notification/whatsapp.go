@@ -102,7 +102,7 @@ func (s *WhatsAppService) SendOverrideLink(toPhone, token string) error {
 
 func (s *WhatsAppService) SendIssueLink(toPhone, token string) error {
 	variables := fmt.Sprintf(`{"1":"%s"}`, token)
-	return s.SendContentTemplate(toPhone, "REPLACE_WITH_ISSUE_TEMPLATE_SID", variables)
+	return s.SendContentTemplate(toPhone, "HX08111bb54337d6ef74dadf404e9f2402", variables)
 }
 
 // -------------------------------------------------------------------------
