@@ -25,6 +25,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )
@@ -43,6 +44,36 @@ func main() {
 	if err != nil {
 		log.Fatalf("Unable to parse connection string: %v", err)
 	}
+	// -----------------------------------------------------------------
+	// Session timezone. This is load-bearing, not cosmetic.
+	//
+	// Supabase sessions default to UTC. Every CURRENT_DATE in this
+	// codebase was therefore returning the UTC date, while the Go code
+	// that writes those dates computes them in Asia/Kolkata. The two
+	// disagree for the first five and a half hours of every Indian day.
+	//
+	// Concretely: update.ApprovePendingChange sets effective_from to
+	// tomorrow-in-IST, and applyDueChanges promotes it when
+	// `effective_from <= CURRENT_DATE`. Approve on Monday and the change
+	// is due Tuesday — but until 05:30 IST Tuesday, CURRENT_DATE still
+	// reads Monday, so the sweeper skips it. The morning manifest is
+	// built at the 03:00 cutoff from the customer's OLD order and the van
+	// leaves before the change lands. "Effective from tomorrow" silently
+	// means "effective from tomorrow mid-morning" for the morning slot.
+	//
+	// route.StartPricePromotionSweeper has the identical mismatch
+	// (pricing.go computes the 1st in IST, the sweeper compares against
+	// CURRENT_DATE), as does the `target_date >= CURRENT_DATE` filter in
+	// override.go. Setting it once here fixes all of them, because the
+	// parameter applies to every connection the pool hands out.
+	//
+	// Verify with: SHOW timezone;  -> Asia/Kolkata
+	// -----------------------------------------------------------------
+	pgConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SET timezone = 'Asia/Kolkata'")
+		return err
+	}
+
 	pgConfig.MaxConns = 20
 	pgConfig.MinConns = 2
 	pgConfig.MaxConnIdleTime = 30 * time.Second
@@ -59,6 +90,24 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatalf("Database ping failed: %v", err)
 	}
+
+	// Confirm the timezone actually took. A silently-ignored RuntimeParam
+	// would reintroduce the bug above with no visible symptom until a
+	// customer's order changed a day late — which is exactly the class of
+	// failure this codebase has been worst at surfacing. One round trip at
+	// boot is cheap insurance.
+	var dbTZ string
+	if err := pool.QueryRow(ctx, "SHOW timezone").Scan(&dbTZ); err != nil {
+		log.Printf("⚠️  Could not read database timezone: %v", err)
+	} else if dbTZ != "Asia/Kolkata" {
+		log.Printf("⚠️  Database timezone is %q, expected Asia/Kolkata — date-based sweepers will drift.", dbTZ)
+	} else {
+		var dbDate time.Time
+		if err := pool.QueryRow(ctx, "SELECT CURRENT_DATE").Scan(&dbDate); err == nil {
+			log.Printf("Database timezone: %s (CURRENT_DATE = %s)", dbTZ, dbDate.Format("2006-01-02"))
+		}
+	}
+
 	log.Println("Successfully connected and pinged Supabase PostgreSQL engine.")
 
 	// Background sweepers
