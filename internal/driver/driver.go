@@ -242,7 +242,13 @@ func (dr *DriverResource) GetMobileManifest(w http.ResponseWriter, r *http.Reque
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			http.Error(w, `{"error": "No route assigned to this driver for the `+slot+` slot"}`, http.StatusNotFound)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":   "no_route_for_slot",
+				"slot":    slot,
+				"message": "No route assigned to this driver for the " + slot + " slot",
+			})
 			return
 		}
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
@@ -258,6 +264,27 @@ func (dr *DriverResource) GetMobileManifest(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(manifest)
 }
+
+// effectiveOrderTotal builds the SQL expression for "how much is actually
+// owed on this stop" — the override quantity if one exists, otherwise the
+// subscription default, summed across all products.
+//
+// NOTE: this predicate is now the third place expressing "is a delivery due
+// here" (the others being route.GenerateManifest and stats.dueTodayCTE).
+// Worth consolidating when one of them next needs to change.
+const effectiveOrderTotal = `(
+	  COALESCE(o.new_milk_qty,    s.default_milk_qty,    0)
+	+ COALESCE(o.new_curd_qty,    s.default_curd_qty,    0)
+	+ COALESCE(o.new_butter_qty,  s.default_butter_qty,  0)
+	+ COALESCE(o.new_ghee_qty,    s.default_ghee_qty,    0)
+	+ COALESCE(o.new_lassi_qty,   s.default_lassi_qty,   0)
+	+ COALESCE(o.new_paneer_qty,  s.default_paneer_qty,  0)
+	+ COALESCE(o.new_jaggery_qty, s.default_jaggery_qty, 0)
+	+ COALESCE(o.new_khand_qty,   s.default_khand_qty,   0)
+	+ COALESCE(o.new_oil_qty,     s.default_oil_qty,     0)
+	+ COALESCE(o.new_atta_qty,    s.default_atta_qty,    0)
+	+ COALESCE(o.new_burfi_qty,   s.default_burfi_qty,   0)
+)`
 
 // CloseRoute marks undelivered stops as UNATTEMPTED for the driver's current
 // slot. Reads route assignment from route_slot_drivers and schedule info from
@@ -284,6 +311,13 @@ func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 
 	// Insert UNATTEMPTED logs for every scheduled customer on this route+slot
 	// who doesn't already have a delivery log for today.
+	//
+	// The final condition excludes stops with nothing owed — a customer who
+	// paused today via a zero-quantity override. GenerateManifest already
+	// filters those out, so the driver never saw them; without this they'd
+	// be recorded as a missed delivery the driver was never asked to make.
+	// That polluted the admin's log view with false failures and dragged the
+	// dashboard's completion rate below 100% on any day someone skipped.
 	query := `
 		INSERT INTO delivery_logs (customer_id, route_id, driver_id, delivery_date, status, slot)
 		SELECT
@@ -301,6 +335,7 @@ func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 			  OR (s.schedule_type = 'alternate' AND ($2::date - s.anchor_date) % 2 = 0)
 			  OR o.id IS NOT NULL
 		  )
+		  AND ` + effectiveOrderTotal + ` > 0
 	`
 
 	_, err = dr.DB.Exec(r.Context(), query, routeID, targetDate, slot, driverID)

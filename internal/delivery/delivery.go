@@ -31,6 +31,36 @@ var Products = []string{
 	"jaggery", "khand", "oil", "atta", "burfi",
 }
 
+// ProductLabels / litreProducts drive customer-facing formatting. Kept next to
+// Products so adding a twelfth item is one edit in three obvious places.
+var ProductLabels = map[string]string{
+	"milk": "Milk", "curd": "Curd", "butter": "Butter", "ghee": "Ghee",
+	"lassi": "Buttermilk", "paneer": "Paneer", "jaggery": "Jaggery",
+	"khand": "Desi Khand", "oil": "Mustard Oil", "atta": "Atta", "burfi": "Burfi",
+}
+
+var litreProducts = map[string]bool{"milk": true, "curd": true, "lassi": true, "oil": true}
+
+// formatQty turns a stored base-unit quantity into something a customer can
+// read: 500 -> "500 ml", 2000 -> "2 L". Matches the formatter used by the
+// customer-facing HTML pages and the driver app.
+func formatQty(v int, product string) string {
+	litre := litreProducts[product]
+	if v < 1000 {
+		if litre {
+			return fmt.Sprintf("%d ml", v)
+		}
+		return fmt.Sprintf("%d g", v)
+	}
+	val := float64(v) / 1000
+	unit := "kg"
+	if litre {
+		unit = "L"
+	}
+	// Trim a trailing .0 so 2000 reads "2 L" rather than "2.0 L".
+	return strings.TrimSuffix(fmt.Sprintf("%.2f", val), ".00") + " " + unit
+}
+
 // -------------------------------------------------------------------------
 // Types
 // -------------------------------------------------------------------------
@@ -59,6 +89,12 @@ type FlaggedDelivery struct {
 	Status           string    `json:"status"`
 	CustomerFeedback string    `json:"customerFeedback"`
 	UpdatedAt        time.Time `json:"updatedAt"`
+	// Quantities as recorded. The admin needs these in the flagged list so
+	// they can correct the bill in the same step as clearing the flag —
+	// without them, resolving a complaint and fixing the charge were two
+	// separate journeys and the second one rarely happened.
+	Quantities map[string]int `json:"quantities"`
+	DayTotal   float64        `json:"dayTotal"`
 }
 
 // AdminDeliveryLog is the enriched row the admin UI renders.
@@ -318,17 +354,19 @@ func (dr DeliveryResource) notifyDelivered(customerID uuid.UUID, slot string, or
 	}
 
 	items := []struct {
-		label string
-		qty   int
+		key string
+		qty int
 	}{
-		{"Milk", order.Milk}, {"Curd", order.Curd}, {"Butter", order.Butter}, {"Ghee", order.Ghee},
-		{"Buttermilk", order.Lassi}, {"Paneer", order.Paneer}, {"Jaggery", order.Jaggery},
-		{"Desi Khand", order.Khand}, {"Mustard Oil", order.Oil}, {"Atta", order.Atta}, {"Burfi", order.Burfi},
+		{"milk", order.Milk}, {"curd", order.Curd}, {"butter", order.Butter}, {"ghee", order.Ghee},
+		{"lassi", order.Lassi}, {"paneer", order.Paneer}, {"jaggery", order.Jaggery},
+		{"khand", order.Khand}, {"oil", order.Oil}, {"atta", order.Atta}, {"burfi", order.Burfi},
 	}
 	var lines []string
 	for _, it := range items {
 		if it.qty > 0 {
-			lines = append(lines, fmt.Sprintf("%s: %d", it.label, it.qty))
+			// Quantities are stored in base units (ml / g). Printing the raw
+			// number gave customers "Milk: 2000" several times a week.
+			lines = append(lines, fmt.Sprintf("• %s: %s", ProductLabels[it.key], formatQty(it.qty, it.key)))
 		}
 	}
 
@@ -754,6 +792,9 @@ func (dr DeliveryResource) AdminUpsert(w http.ResponseWriter, r *http.Request) {
 // Admin: Flagged + Resolve
 // -------------------------------------------------------------------------
 
+// ListFlagged now returns the recorded quantities and what the day was
+// charged at, so the admin can correct the bill in the same action as
+// clearing the flag.
 func (dr DeliveryResource) ListFlagged(w http.ResponseWriter, r *http.Request) {
 	page, ok := r.Context().Value(middleware.PageKey).(int)
 	if !ok {
@@ -765,15 +806,26 @@ func (dr DeliveryResource) ListFlagged(w http.ResponseWriter, r *http.Request) {
 	}
 	offset := (page - 1) * limit
 
-	query := `
+	qtyCols := make([]string, 0, len(Products))
+	valueTerms := make([]string, 0, len(Products))
+	for _, p := range Products {
+		qtyCols = append(qtyCols, "COALESCE(dl.delivered_"+p+"_qty, 0)")
+		valueTerms = append(valueTerms,
+			fmt.Sprintf("COALESCE(dl.delivered_%s_qty, 0) * COALESCE(dl.unit_price_%s, 0)", p, p))
+	}
+
+	query := fmt.Sprintf(`
 		SELECT dl.id, dl.customer_id, c.name, c.phone_number, COALESCE(c.house_address, ''),
-		       dl.slot, dl.delivery_date, dl.status, COALESCE(dl.customer_feedback, ''), dl.updated_at
+		       dl.slot, dl.delivery_date, dl.status, COALESCE(dl.customer_feedback, ''), dl.updated_at,
+		       (%s) AS day_total,
+		       %s
 		FROM delivery_logs dl
 		JOIN customers c ON c.id = dl.customer_id
 		WHERE dl.is_flagged = true
 		ORDER BY dl.updated_at DESC
 		LIMIT $1 OFFSET $2
-	`
+	`, strings.Join(valueTerms, " + "), strings.Join(qtyCols, ", "))
+
 	rows, err := dr.DB.Query(r.Context(), query, limit, offset)
 	if err != nil {
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
@@ -784,12 +836,22 @@ func (dr DeliveryResource) ListFlagged(w http.ResponseWriter, r *http.Request) {
 	flagged := []FlaggedDelivery{}
 	for rows.Next() {
 		var f FlaggedDelivery
-		if err := rows.Scan(
+		qty := make([]int, len(Products))
+		dest := []any{
 			&f.Id, &f.CustomerId, &f.CustomerName, &f.PhoneNumber, &f.HouseAddress,
 			&f.Slot, &f.DeliveryDate, &f.Status, &f.CustomerFeedback, &f.UpdatedAt,
-		); err != nil {
+			&f.DayTotal,
+		}
+		for i := range qty {
+			dest = append(dest, &qty[i])
+		}
+		if err := rows.Scan(dest...); err != nil {
 			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+		f.Quantities = map[string]int{}
+		for i, p := range Products {
+			f.Quantities[p] = qty[i]
 		}
 		flagged = append(flagged, f)
 	}
@@ -797,15 +859,62 @@ func (dr DeliveryResource) ListFlagged(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, flagged)
 }
 
+// ResolveRequest is what the admin sends when closing out a complaint.
+//
+// Quantities is optional: omit it to simply clear the flag (the customer was
+// mistaken, or the issue was handled another way). Supply it to correct what
+// was recorded — which is what actually adjusts the bill, since billing sums
+// delivered_qty × unit_price.
+type ResolveRequest struct {
+	Quantities *map[string]int `json:"quantities"`
+	Note       *string         `json:"note"`
+	// Defaults to true when quantities change. Set false to correct the
+	// record silently — e.g. fixing a driver's typo the customer never saw.
+	NotifyCustomer *bool `json:"notifyCustomer"`
+}
+
+// Resolve closes a flagged delivery, optionally correcting the quantities.
+//
+// This used to only flip is_flagged to false. That left the most common
+// complaint — "an item was missing" — with the flag cleared and the customer
+// still billed for the item they never received. The two halves of the fix
+// were separate journeys and the second one rarely happened, so they're one
+// action now.
 func (dr DeliveryResource) Resolve(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	var resolvedID uuid.UUID
-	err := dr.DB.QueryRow(r.Context(), `
-		UPDATE delivery_logs SET is_flagged = false, updated_at = NOW()
-		WHERE id = $1 AND is_flagged = true RETURNING id
-	`, id).Scan(&resolvedID)
-	if err != nil {
+	var req ResolveRequest
+	// An empty body is valid: "resolve, change nothing".
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	// Load the current state first — we need the old quantities and the
+	// frozen unit prices to work out what the correction is worth.
+	qtyCols := make([]string, 0, len(Products))
+	priceCols := make([]string, 0, len(Products))
+	for _, p := range Products {
+		qtyCols = append(qtyCols, "COALESCE(delivered_"+p+"_qty, 0)")
+		priceCols = append(priceCols, "COALESCE(unit_price_"+p+", 0)")
+	}
+
+	var customerID uuid.UUID
+	var slot, deliveryDate string
+	oldQty := make([]int, len(Products))
+	unitPrice := make([]float64, len(Products))
+
+	loadDest := []any{&customerID, &slot, &deliveryDate}
+	for i := range oldQty {
+		loadDest = append(loadDest, &oldQty[i])
+	}
+	for i := range unitPrice {
+		loadDest = append(loadDest, &unitPrice[i])
+	}
+
+	loadQuery := fmt.Sprintf(`
+		SELECT customer_id, slot, TO_CHAR(delivery_date, 'YYYY-MM-DD'), %s, %s
+		FROM delivery_logs WHERE id = $1 AND is_flagged = true
+	`, strings.Join(qtyCols, ", "), strings.Join(priceCols, ", "))
+
+	if err := dr.DB.QueryRow(r.Context(), loadQuery, id).Scan(loadDest...); err != nil {
 		if err == pgx.ErrNoRows {
 			http.Error(w, "Flagged delivery not found or already resolved", http.StatusNotFound)
 			return
@@ -814,7 +923,136 @@ func (dr DeliveryResource) Resolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"message": "Marked as resolved"})
+	sets := []string{"is_flagged = false", "updated_at = NOW()"}
+	args := []any{}
+
+	// Work out the value change and a human-readable list of what moved.
+	var amountAdjusted float64
+	var changeLines []string
+
+	if req.Quantities != nil {
+		for i, p := range Products {
+			newQ := (*req.Quantities)[p]
+			if newQ < 0 {
+				http.Error(w, "Quantity for "+p+" cannot be negative", http.StatusBadRequest)
+				return
+			}
+			args = append(args, newQ)
+			sets = append(sets, fmt.Sprintf("delivered_%s_qty = $%d", p, len(args)))
+
+			if newQ != oldQty[i] {
+				amountAdjusted += float64(oldQty[i]-newQ) * unitPrice[i]
+				changeLines = append(changeLines, fmt.Sprintf(
+					"• %s: %s → %s",
+					ProductLabels[p], formatQty(oldQty[i], p), formatQty(newQ, p),
+				))
+			}
+		}
+	}
+
+	// The note is appended rather than replacing the customer's own words —
+	// their description of the problem is the audit trail.
+	if req.Note != nil && *req.Note != "" {
+		args = append(args, "\n[Admin] "+*req.Note)
+		sets = append(sets, fmt.Sprintf("customer_feedback = COALESCE(customer_feedback, '') || $%d", len(args)))
+	}
+
+	args = append(args, id)
+	updateQuery := fmt.Sprintf(`UPDATE delivery_logs SET %s WHERE id = $%d`,
+		strings.Join(sets, ", "), len(args))
+
+	if _, err := dr.DB.Exec(r.Context(), updateQuery, args...); err != nil {
+		http.Error(w, "Failed to resolve: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// If this month is already invoiced, the frozen invoice is now stale.
+	// We don't regenerate automatically — that's the admin's call, and a
+	// paid invoice must not be silently rewritten — but we tell the UI so it
+	// can offer the button rather than leaving a wrong bill in place.
+	var invoiceID *uuid.UUID
+	var invoiceStatus *string
+	if len(changeLines) > 0 {
+		month := deliveryDate[:7]
+		dr.DB.QueryRow(r.Context(),
+			`SELECT id, status FROM invoices WHERE customer_id = $1 AND billing_month = $2`,
+			customerID, month,
+		).Scan(&invoiceID, &invoiceStatus)
+	}
+
+	notify := len(changeLines) > 0
+	if req.NotifyCustomer != nil {
+		notify = *req.NotifyCustomer && len(changeLines) > 0
+	}
+	if notify && dr.WhatsApp != nil {
+		go dr.notifyCorrection(customerID, slot, deliveryDate, changeLines, amountAdjusted)
+	}
+
+	resp := map[string]any{
+		"message":        "Delivery resolved",
+		"amountAdjusted": amountAdjusted,
+		"changed":        len(changeLines) > 0,
+	}
+	if invoiceID != nil {
+		resp["invoiceNeedsRegeneration"] = true
+		resp["invoiceId"] = invoiceID.String()
+		if invoiceStatus != nil {
+			resp["invoiceStatus"] = *invoiceStatus
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// notifyCorrection tells the customer their record — and therefore their
+// bill — has been put right. Leads with the acknowledgement rather than the
+// numbers: someone who just complained wants to know they were heard.
+func (dr DeliveryResource) notifyCorrection(
+	customerID uuid.UUID, slot, deliveryDate string, changes []string, amountAdjusted float64,
+) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var phone, name string
+	if err := dr.DB.QueryRow(ctx,
+		`SELECT phone_number, name FROM customers WHERE id = $1`, customerID,
+	).Scan(&phone, &name); err != nil {
+		fmt.Printf("⚠️ notifyCorrection: no phone for %s: %v\n", customerID, err)
+		return
+	}
+
+	prettyDate := deliveryDate
+	if t, err := time.Parse("2006-01-02", deliveryDate); err == nil {
+		prettyDate = t.Format("2 January")
+	}
+
+	slotLabel := "morning"
+	if slot == "evening" {
+		slotLabel = "evening"
+	}
+
+	var billLine string
+	switch {
+	case amountAdjusted > 0:
+		billLine = fmt.Sprintf("\n*Your bill has been reduced by ₹%.0f.*", amountAdjusted)
+	case amountAdjusted < 0:
+		billLine = fmt.Sprintf("\n*Your bill has been increased by ₹%.0f.*", -amountAdjusted)
+	default:
+		// Quantities moved but netted to zero — swapped items, say. No point
+		// claiming a refund that isn't there.
+		billLine = "\n*Your bill total is unchanged.*"
+	}
+
+	msg := fmt.Sprintf(
+		"✅ Thanks for letting us know, %s.\n\n"+
+			"We've checked your %s delivery from %s and corrected our records:\n\n%s\n%s\n\n"+
+			"Sorry for the trouble.",
+		name, slotLabel, prettyDate, strings.Join(changes, "\n"), billLine,
+	)
+
+	if err := dr.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {
+		fmt.Printf("⚠️ notifyCorrection: send failed for %s: %v\n", phone, err)
+	}
 }
 
 // -------------------------------------------------------------------------

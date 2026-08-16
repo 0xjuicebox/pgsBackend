@@ -73,18 +73,57 @@ type SlotState struct {
 
 // CustomerState carries both slots. A customer subscribed to morning only
 // gets Evening.Subscribed = false, and the page hides that tab entirely.
+//
+// Both cutoffs are sent because they genuinely differ. The morning van loads
+// around 3 AM; the evening van doesn't leave until the evening. Applying the
+// morning deadline to an evening order meant an evening-only customer was
+// refused at 8 AM for a delivery eleven hours away — the cutoff existed for a
+// constraint that hadn't happened yet.
 type CustomerState struct {
 	Morning SlotState `json:"morning"`
 	Evening SlotState `json:"evening"`
 
-	// Cutoff hour (HH:MM) after which today can no longer be changed. Sent
-	// so the page can grey out today's chip rather than letting the customer
-	// fill in a form that the server will reject.
-	MorningCutoff string `json:"morningCutoff"`
+	MorningCutoff string `json:"morningCutoff"` // HH:MM
+	EveningCutoff string `json:"eveningCutoff"` // HH:MM
 }
 
 func newSlotState() SlotState {
 	return SlotState{Overrides: make(map[string]customer.Order)}
+}
+
+// cutoffColumn maps a slot to the system_config column that gates it.
+func cutoffColumn(slot string) string {
+	if slot == "evening" {
+		return "evening_cutoff_time"
+	}
+	return "morning_cutoff_time"
+}
+
+// defaultCutoff is the fallback when system_config is missing or unreadable.
+// Morning is early because the van is loaded before dawn; evening is late
+// afternoon, giving the depot time to pack the second run.
+func defaultCutoff(slot string) (hour, minute int) {
+	if slot == "evening" {
+		return 15, 0
+	}
+	return 3, 0
+}
+
+// readCutoff pulls a slot's cutoff from system_config, falling back to the
+// slot's sensible default rather than failing the request. A missing config
+// row shouldn't stop a customer changing tomorrow's order.
+func (or OverrideResource) readCutoff(ctx context.Context, slot string) (hour, minute int, display string) {
+	hour, minute = defaultCutoff(slot)
+
+	var raw string
+	q := fmt.Sprintf(`SELECT TO_CHAR(%s, 'HH24:MI') FROM system_config LIMIT 1`, cutoffColumn(slot))
+	if err := or.DB.QueryRow(ctx, q).Scan(&raw); err == nil && raw != "" {
+		var h, m int
+		if _, err := fmt.Sscanf(raw, "%d:%d", &h, &m); err == nil {
+			hour, minute = h, m
+		}
+	}
+	return hour, minute, fmt.Sprintf("%02d:%02d", hour, minute)
 }
 
 func (or OverrideResource) GetState(w http.ResponseWriter, r *http.Request) {
@@ -106,19 +145,12 @@ func (or OverrideResource) GetState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	state := CustomerState{
-		Morning:       newSlotState(),
-		Evening:       newSlotState(),
-		MorningCutoff: "03:00",
+		Morning: newSlotState(),
+		Evening: newSlotState(),
 	}
 
-	// Best-effort: if system_config is missing we keep the 03:00 default
-	// rather than failing the whole page.
-	var cutoff string
-	if err := or.DB.QueryRow(ctx,
-		`SELECT TO_CHAR(morning_cutoff_time, 'HH24:MI') FROM system_config LIMIT 1`,
-	).Scan(&cutoff); err == nil && cutoff != "" {
-		state.MorningCutoff = cutoff
-	}
+	_, _, state.MorningCutoff = or.readCutoff(ctx, "morning")
+	_, _, state.EveningCutoff = or.readCutoff(ctx, "evening")
 
 	// --- Subscriptions, one row per slot ---
 	subRows, err := or.DB.Query(ctx, `
@@ -238,28 +270,22 @@ func (or OverrideResource) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cutoff now comes from system_config rather than a hardcoded 03:00, so
-	// the admin settings screen actually controls it. Falls back to 3 AM if
-	// the row is missing.
+	// Cutoff is per slot. The morning van loads before dawn; the evening van
+	// leaves much later, so an evening customer legitimately has most of the
+	// day to change today's order.
 	loc, _ := time.LoadLocation("Asia/Kolkata")
 	now := time.Now().In(loc)
 	todayStr := now.Format("2006-01-02")
 
-	cutoffHour, cutoffMin := 3, 0
-	var cutoffStr string
-	if err := or.DB.QueryRow(ctx,
-		`SELECT TO_CHAR(morning_cutoff_time, 'HH24:MI') FROM system_config LIMIT 1`,
-	).Scan(&cutoffStr); err == nil && cutoffStr != "" {
-		var h, m int
-		if _, err := fmt.Sscanf(cutoffStr, "%d:%d", &h, &m); err == nil {
-			cutoffHour, cutoffMin = h, m
-		}
-	}
+	cutoffHour, cutoffMin, _ := or.readCutoff(ctx, payload.Slot)
 	cutoffTime := time.Date(now.Year(), now.Month(), now.Day(), cutoffHour, cutoffMin, 0, 0, loc)
 
 	for _, targetDate := range payload.Dates {
 		if targetDate == todayStr && now.After(cutoffTime) {
-			http.Error(w, fmt.Sprintf("Cannot alter today's order after the %s cutoff.", cutoffTime.Format("3:04 PM")), http.StatusForbidden)
+			http.Error(w, fmt.Sprintf(
+				"Today's %s order is already being prepared — changes closed at %s. You can still change any day from tomorrow.",
+				payload.Slot, cutoffTime.Format("3:04 PM"),
+			), http.StatusForbidden)
 			return
 		}
 		// Two-week horizon, enforced server-side. The page only renders 14
@@ -341,7 +367,10 @@ func (or OverrideResource) Submit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		dateStr := strings.Join(formattedDates, ", ")
-		slotLabel := strings.Title(payload.Slot)
+		slotLabel := "Morning"
+		if payload.Slot == "evening" {
+			slotLabel = "Evening"
+		}
 
 		var msg string
 		if payload.Action == "delete" {

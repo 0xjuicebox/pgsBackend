@@ -25,13 +25,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// -------------------------------------------------------------------------
-// Routes — wire these in BillingResource.Routes()
-//
-//     r.Post("/final/{customerId}", br.FinalInvoice)
-//     r.Post("/invoices/{id}/regenerate", br.RegenerateInvoice)
-// -------------------------------------------------------------------------
-
 // aggregateOne is aggregate() scoped to a single customer. Kept separate
 // rather than adding an optional filter to aggregate(), because that function
 // is on the month-end hot path and shouldn't grow branches.
@@ -145,6 +138,8 @@ func (br BillingResource) FinalInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// notifyBill builds its own payment link, so the final invoice arrives
+	// with the same tap-to-pay flow as a regular month-end bill.
 	if br.WhatsApp != nil {
 		go br.notifyBill(*tally, month)
 	}
@@ -209,7 +204,7 @@ func (br BillingResource) RegenerateInvoice(w http.ResponseWriter, r *http.Reque
 	// regenerate that changes nothing shouldn't generate a WhatsApp.
 	changed := tally.TotalAmount != oldAmount
 	if changed && br.WhatsApp != nil {
-		go br.notifyRevisedBill(*tally, month, oldAmount)
+		go br.notifyRevisedBill(*tally, month, oldAmount, id)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -223,8 +218,13 @@ func (br BillingResource) RegenerateInvoice(w http.ResponseWriter, r *http.Reque
 // notifyRevisedBill tells the customer their bill moved and by how much.
 // Leads with the direction of change, since that's the only thing they
 // actually care about on opening the message.
-func (br BillingResource) notifyRevisedBill(t CustomerTally, month string, oldAmount float64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//
+// Takes the invoice id so it can reissue the payment link. The old link is
+// locked to the old amount — CreateLinkForInvoice notices the mismatch,
+// cancels it, and issues a fresh one. Without that, a customer could still
+// tap the original and pay the wrong figure.
+func (br BillingResource) notifyRevisedBill(t CustomerTally, month string, oldAmount float64, invoiceID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	var phone string
@@ -242,14 +242,23 @@ func (br BillingResource) notifyRevisedBill(t CustomerTally, month string, oldAm
 		diff = -diff
 	}
 
+	payLine := "To pay, please transfer to our UPI ID and reply PAID once done."
+	if br.Payment != nil && br.Payment.Enabled() {
+		if url, err := br.Payment.CreateLinkForInvoice(ctx, invoiceID); err == nil {
+			payLine = "Tap here to pay the updated amount:\n" + url
+		} else {
+			fmt.Printf("⚠️ notifyRevisedBill: link reissue failed for invoice %s: %v\n", invoiceID, err)
+		}
+	}
+
 	msg := fmt.Sprintf(
 		"🧾 *Your %s bill has been updated*\n\n"+
 			"Hello %s,\n\n"+
 			"We've corrected your bill after reviewing your deliveries. "+
 			"Your total has %s by ₹%.0f.\n\n"+
-			"Previous: ₹%.0f\n*Updated total: ₹%.0f*\n\n"+
+			"Previous: ₹%.0f\n*Updated total: ₹%.0f*\n\n%s\n\n"+
 			"Sorry for the confusion, and thank you for letting us know.",
-		labelForMonth(month), t.CustomerName, direction, diff, oldAmount, t.TotalAmount,
+		labelForMonth(month), t.CustomerName, direction, diff, oldAmount, t.TotalAmount, payLine,
 	)
 
 	if err := br.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {

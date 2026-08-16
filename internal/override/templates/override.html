@@ -295,6 +295,26 @@ function istNow() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
 }
 
+// Each slot has its own deadline. The morning van is loaded before dawn; the
+// evening van goes out much later, so an evening customer legitimately has
+// most of the day to change today's order. Applying one cutoff to both meant
+// evening customers were refused at 8 AM for a delivery eleven hours away.
+function cutoffFor(slot) {
+  if (!serverState) return '03:00';
+  return (slot === 'evening'
+    ? serverState.eveningCutoff
+    : serverState.morningCutoff) || (slot === 'evening' ? '15:00' : '03:00');
+}
+
+// "15:00" -> "3:00 PM" for display. The customer shouldn't have to parse
+// 24-hour time to understand a deadline.
+function prettyTime(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const hour = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return hour + ':' + String(m).padStart(2, '0') + ' ' + ampm;
+}
+
 // Does the customer's schedule actually include this date? A chip for a day
 // with no delivery is still tappable — that's how you ADD a one-off — but
 // it's dimmed so the usual pattern is visible at a glance.
@@ -314,7 +334,7 @@ function isScheduledOn(slotState, dateStr) {
 }
 
 function cutoffPassedForToday() {
-  const cutoff = (serverState && serverState.morningCutoff) || '03:00';
+  const cutoff = cutoffFor(activeSlot);
   const [h, m] = cutoff.split(':').map(Number);
   const now = istNow();
   const limit = new Date(now); limit.setHours(h, m, 0, 0);
@@ -341,6 +361,8 @@ function buildTabs() {
       activeSlot = key;
       selected.clear();
       mode = 'change';
+      // Rebuilt rather than just restyled: the two slots have different
+      // schedules, different existing overrides, and different cutoffs.
       buildTabs(); buildDates(); refreshEditor();
     });
     tabs.appendChild(b);
@@ -393,9 +415,11 @@ function buildDates() {
 
   const notice = document.getElementById('cutoffNotice');
   if (lockedToday) {
-    const cutoff = (serverState.morningCutoff || '03:00');
+    const label = SLOT_META[activeSlot].label.toLowerCase();
     document.getElementById('cutoffText').textContent =
-      "Today's deliveries are already loaded on the van, so they can't be changed after " + cutoff + ". You can still change any day from tomorrow onwards.";
+      "Today's " + label + " deliveries are already being prepared, so they can't be changed after " +
+      prettyTime(cutoffFor(activeSlot)) +
+      ". You can still change any day from tomorrow onwards.";
     notice.style.display = 'flex';
   } else {
     notice.style.display = 'none';

@@ -49,9 +49,9 @@ var validSlots = map[string]bool{"morning": true, "evening": true}
 // RouteId and StopOrder are pointers and deliberately left out of most calls
 // to this endpoint: this is where schedules and quantities get edited, not
 // where routing decisions get made. Omitting them means "leave routing as it
-// is" (via COALESCE against the existing row), so editing someone's Tuesday
-// order can never accidentally un-route them. Routing is customer.Approve's
-// job, or an explicit call here that does include them.
+// is", so editing someone's Tuesday order can never accidentally un-route
+// them. Routing is customer.Approve's job, or an explicit call here that does
+// include them.
 func (sr SubscriptionResource) CreateOrUpdate(w http.ResponseWriter, r *http.Request) {
 	var sub Subscription
 	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
@@ -87,6 +87,20 @@ func (sr SubscriptionResource) CreateOrUpdate(w http.ResponseWriter, r *http.Req
 	}
 	sub.Id = id
 
+	// Two things to notice in this statement, both about stop_order.
+	//
+	// In VALUES it's COALESCE($19, 0). The column is INT NOT NULL DEFAULT 0,
+	// and Postgres does NOT substitute a column default when you explicitly
+	// pass NULL — it rejects the row. Since every schedule/quantity edit
+	// omits routing, $19 is nil on the common path, and without the COALESCE
+	// this endpoint failed with a not-null violation on every call.
+	//
+	// In DO UPDATE the routing columns reference $18/$19 directly rather than
+	// EXCLUDED. That matters: EXCLUDED.stop_order is the post-COALESCE value
+	// (0), so COALESCE(EXCLUDED.stop_order, ...) would resolve to 0 and wipe
+	// an existing customer's stop position every time someone edited their
+	// milk quantity. Reading the raw parameter preserves the distinction
+	// between "not supplied" and "supplied as zero".
 	query := `
 		INSERT INTO subscriptions (
 			id, customer_id, slot, schedule_type, active_days, anchor_date,
@@ -99,7 +113,7 @@ func (sr SubscriptionResource) CreateOrUpdate(w http.ResponseWriter, r *http.Req
 			$7, $8, $9, $10,
 			$11, $12, $13, $14,
 			$15, $16, $17,
-			$18, $19
+			$18, COALESCE($19, 0)
 		)
 		ON CONFLICT (customer_id, slot)
 		DO UPDATE SET
@@ -117,8 +131,8 @@ func (sr SubscriptionResource) CreateOrUpdate(w http.ResponseWriter, r *http.Req
 			default_oil_qty = EXCLUDED.default_oil_qty,
 			default_atta_qty = EXCLUDED.default_atta_qty,
 			default_burfi_qty = EXCLUDED.default_burfi_qty,
-			route_id = COALESCE(EXCLUDED.route_id, subscriptions.route_id),
-			stop_order = COALESCE(EXCLUDED.stop_order, subscriptions.stop_order),
+			route_id = COALESCE($18, subscriptions.route_id),
+			stop_order = COALESCE($19, subscriptions.stop_order),
 			updated_at = NOW();
 	`
 	_, err = sr.DB.Exec(
@@ -149,24 +163,26 @@ const selectColumns = `
 `
 
 func scanSubscription(row pgx.Row) (Subscription, error) {
-	var sub Subscription
+	var s Subscription
 	err := row.Scan(
-		&sub.Id, &sub.CustomerId, &sub.Slot, &sub.ScheduleType, &sub.ActiveDays, &sub.AnchorDate,
-		&sub.DefaultOrder.Milk, &sub.DefaultOrder.Curd, &sub.DefaultOrder.Butter, &sub.DefaultOrder.Ghee,
-		&sub.DefaultOrder.Lassi, &sub.DefaultOrder.Paneer, &sub.DefaultOrder.Jaggery, &sub.DefaultOrder.Khand,
-		&sub.DefaultOrder.Oil, &sub.DefaultOrder.Atta, &sub.DefaultOrder.Burfi,
-		&sub.RouteId, &sub.StopOrder,
+		&s.Id, &s.CustomerId, &s.Slot, &s.ScheduleType, &s.ActiveDays, &s.AnchorDate,
+		&s.DefaultOrder.Milk, &s.DefaultOrder.Curd, &s.DefaultOrder.Butter, &s.DefaultOrder.Ghee,
+		&s.DefaultOrder.Lassi, &s.DefaultOrder.Paneer, &s.DefaultOrder.Jaggery, &s.DefaultOrder.Khand,
+		&s.DefaultOrder.Oil, &s.DefaultOrder.Atta, &s.DefaultOrder.Burfi,
+		&s.RouteId, &s.StopOrder,
 	)
-	return sub, err
+	return s, err
 }
 
-// ListByCustomer returns every slot a customer has — zero, one, or two rows.
-// This is what the admin customer screen calls to render "Morning: Route A,
-// stop 4" and "Evening: unrouted" as separate cards.
+// ListByCustomer returns every slot this customer is subscribed to — zero,
+// one, or two rows. The admin customer screen renders one panel per slot from
+// this.
 func (sr SubscriptionResource) ListByCustomer(w http.ResponseWriter, r *http.Request) {
 	customerId := chi.URLParam(r, "customerId")
 
-	rows, err := sr.DB.Query(r.Context(), "SELECT "+selectColumns+" FROM subscriptions WHERE customer_id = $1 ORDER BY slot ASC", customerId)
+	rows, err := sr.DB.Query(r.Context(),
+		`SELECT `+selectColumns+` FROM subscriptions WHERE customer_id = $1 ORDER BY slot ASC`,
+		customerId)
 	if err != nil {
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -175,34 +191,40 @@ func (sr SubscriptionResource) ListByCustomer(w http.ResponseWriter, r *http.Req
 
 	subs := []Subscription{}
 	for rows.Next() {
-		sub, err := scanSubscription(rows)
+		s, err := scanSubscription(rows)
 		if err != nil {
 			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		subs = append(subs, sub)
+		subs = append(subs, s)
 	}
 
 	writeJSON(w, http.StatusOK, subs)
 }
 
-// GetOne returns a single slot's subscription — used wherever code needs to
-// check exactly one plan (e.g. before allowing an override for that slot).
+// GetOne fetches a single slot's plan.
 func (sr SubscriptionResource) GetOne(w http.ResponseWriter, r *http.Request) {
 	customerId := chi.URLParam(r, "customerId")
 	slot := chi.URLParam(r, "slot")
 
-	sub, err := scanSubscription(sr.DB.QueryRow(r.Context(), "SELECT "+selectColumns+" FROM subscriptions WHERE customer_id = $1 AND slot = $2", customerId, slot))
+	if !validSlots[slot] {
+		http.Error(w, "slot must be 'morning' or 'evening'", http.StatusBadRequest)
+		return
+	}
+
+	s, err := scanSubscription(sr.DB.QueryRow(r.Context(),
+		`SELECT `+selectColumns+` FROM subscriptions WHERE customer_id = $1 AND slot = $2`,
+		customerId, slot))
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			http.Error(w, "No subscription found for this customer and slot", http.StatusNotFound)
+			http.Error(w, "No "+slot+" subscription for this customer", http.StatusNotFound)
 			return
 		}
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, sub)
+	writeJSON(w, http.StatusOK, s)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

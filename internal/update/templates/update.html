@@ -124,6 +124,24 @@
 
   .notice { display: flex; gap: 10px; padding: 13px 14px; border-radius: var(--r-sm); font-size: 13px; line-height: 1.5; background: var(--amber-light); border: 1px solid #fde68a; color: #7c4a03; margin-top: 14px; }
 
+  /* Under-review state. A customer who already has a change waiting can't
+     submit another — the server enforces one open request per customer — so
+     the page says so up front rather than letting them refill a long form
+     and refusing it on submit. */
+  .review-banner {
+    background: var(--amber-light);
+    border: 1px solid #fde68a;
+    border-radius: var(--r);
+    padding: 16px;
+    margin-bottom: 18px;
+    display: flex;
+    gap: 12px;
+  }
+  .review-banner .ico { font-size: 20px; line-height: 1.2; }
+  .review-banner strong { display: block; color: #7c4a03; font-size: 15px; margin-bottom: 3px; }
+  .review-banner p { margin: 0; color: #8a5a12; font-size: 13px; line-height: 1.55; }
+  .locked-form { opacity: .5; pointer-events: none; }
+
   .bottom { position: fixed; left: 0; right: 0; bottom: 0; z-index: 700; background: var(--card); border-top: 1px solid var(--line); padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); }
   .bottom-inner { max-width: 560px; margin: 0 auto; }
   .submit-btn { width: 100%; padding: 17px; border: none; border-radius: 14px; background: var(--accent); color: #fff; font-family: inherit; font-size: 16px; font-weight: 700; cursor: pointer; transition: background .15s; }
@@ -156,6 +174,14 @@
 <div id="loader"><div class="spinner-lg"></div>Loading your details…</div>
 
 <main id="formRoot" style="display:none">
+
+  <div class="review-banner" id="reviewBanner" style="display:none">
+    <span class="ico">⏳</span>
+    <div>
+      <strong>You have a change under review</strong>
+      <p id="reviewBannerText"></p>
+    </div>
+  </div>
 
   <section class="card">
     <h2>Your Details</h2>
@@ -203,7 +229,7 @@
     <div id="slotsContainer"></div>
     <div class="notice">
       <span>⏳</span>
-      <div>Saving changes puts your account back into review so our team can reassign your route. Deliveries pause briefly until that's done — usually the same day.</div>
+      <div>Changes go to our team for approval. <strong>Your deliveries continue as normal in the meantime</strong> — once approved, your new order starts from the following day.</div>
     </div>
   </section>
 
@@ -211,13 +237,13 @@
 
 <div id="successScreen">
   <div class="success-mark">✓</div>
-  <h2>Changes saved</h2>
-  <p>Your account is under review while we reassign your delivery route. We'll message you on WhatsApp as soon as deliveries resume.</p>
+  <h2>Request sent</h2>
+  <p>Our team will review your changes and confirm on WhatsApp. Your deliveries continue as normal until then — once approved, the new order starts from the following day.</p>
 </div>
 
 <div class="bottom" id="bottomBar" style="display:none">
   <div class="bottom-inner">
-    <button class="submit-btn" id="submitBtn">Save Changes</button>
+    <button class="submit-btn" id="submitBtn">Submit Changes</button>
     <div class="bottom-note" id="bottomNote"></div>
   </div>
 </div>
@@ -267,6 +293,7 @@ function plainToOrder(plain) {
 
 const state = {
   lat: null, lng: null,
+  locked: false,
   slots: {
     morning: { on: false, scheduleType: 'daily', activeDays: new Set([0,1,2,3,4,5,6]), startDate: todayISO(), items: {} },
     evening: { on: false, scheduleType: 'daily', activeDays: new Set([0,1,2,3,4,5,6]), startDate: todayISO(), items: {} },
@@ -553,11 +580,34 @@ function problems() {
 }
 
 function validate() {
+  if (state.locked) return;
   const issues = problems();
   const btn = document.getElementById('submitBtn');
   const note = document.getElementById('bottomNote');
   btn.disabled = issues.length > 0;
-  note.textContent = issues.length ? issues[0] : 'Your account will go back into review after saving';
+  note.textContent = issues.length
+    ? issues[0]
+    : 'Your deliveries continue as normal until this is approved';
+}
+
+// Puts the page into read-only mode when a request is already open. The
+// server rejects a second submission anyway (one open change per customer),
+// so the honest thing is to say why before the customer refills the form.
+function applyLockedState(pending) {
+  state.locked = true;
+
+  const when = new Date(pending.submittedAt);
+  document.getElementById('reviewBannerText').textContent =
+    'You submitted changes on ' +
+    when.toLocaleDateString('en-IN', { day: 'numeric', month: 'long' }) +
+    ' and our team is still reviewing them. Your deliveries are continuing as normal in the meantime. ' +
+    "You'll be able to make further changes once this one is confirmed.";
+  document.getElementById('reviewBanner').style.display = 'flex';
+
+  document.querySelectorAll('#formRoot section.card').forEach(function (el) {
+    el.classList.add('locked-form');
+  });
+  document.getElementById('bottomBar').style.display = 'none';
 }
 
 // --- Load ---
@@ -591,12 +641,16 @@ async function load() {
     initMap(data.latitude, data.longitude);
     initSearch();
     buildSlots();
-    validate();
 
-    ['name','addrHouse','addrStreet','addrLandmark'].forEach(id =>
-      document.getElementById(id).addEventListener('input', validate));
-    document.getElementById('locateBtn').addEventListener('click', locateMe);
-    document.getElementById('submitBtn').addEventListener('click', submit);
+    if (data.pending) {
+      applyLockedState(data.pending);
+    } else {
+      validate();
+      ['name','addrHouse','addrStreet','addrLandmark'].forEach(id =>
+        document.getElementById(id).addEventListener('input', validate));
+      document.getElementById('locateBtn').addEventListener('click', locateMe);
+      document.getElementById('submitBtn').addEventListener('click', submit);
+    }
   } catch (err) {
     document.getElementById('loader').innerHTML =
       '<p style="color:var(--danger);font-weight:600">Couldn\'t load your details.</p>' +
@@ -610,7 +664,7 @@ async function submit() {
   if (issues.length) { toast(issues[0], true); return; }
 
   const btn = document.getElementById('submitBtn');
-  btn.disabled = true; btn.textContent = 'Saving…';
+  btn.disabled = true; btn.textContent = 'Sending…';
 
   const landmark = document.getElementById('addrLandmark').value.trim();
   const address = [
@@ -620,8 +674,8 @@ async function submit() {
   ].filter(Boolean).join(', ');
 
   // Only slots that are ON get sent. The backend treats the array as
-  // authoritative and deletes any slot missing from it — that's how turning
-  // a switch off actually cancels that delivery.
+  // authoritative and drops any slot missing from it when the change is
+  // applied — that's how turning a switch off cancels that delivery.
   const subscriptions = SLOTS.filter(sl => state.slots[sl.key].on).map(sl => {
     const s = state.slots[sl.key];
     return {
@@ -646,7 +700,7 @@ async function submit() {
         subscriptions,
       }),
     });
-    if (!res.ok) throw new Error((await res.text()) || 'Save failed');
+    if (!res.ok) throw new Error((await res.text()) || 'Submission failed');
 
     document.getElementById('formRoot').style.display = 'none';
     document.getElementById('bottomBar').style.display = 'none';
@@ -654,7 +708,7 @@ async function submit() {
     document.getElementById('successScreen').classList.add('show');
     window.scrollTo(0,0);
   } catch (err) {
-    btn.disabled = false; btn.textContent = 'Save Changes';
+    btn.disabled = false; btn.textContent = 'Submit Changes';
     toast(err.message || 'Something went wrong. Please try again.', true);
   }
 }

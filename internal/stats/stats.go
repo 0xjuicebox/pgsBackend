@@ -12,6 +12,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// UnroutedSlot is an active customer with a subscription that has no route
+// (or no stop position), so no manifest will ever include it.
+//
+// This is possible by design: Approve requires at least one slot to be
+// assigned, not all of them, so you can onboard someone's morning delivery
+// while evening capacity is still being sorted out. The risk is that it's
+// completely silent — the customer shows as active, nothing errors, and the
+// missing delivery only surfaces when they phone up asking where it is.
+type UnroutedSlot struct {
+	CustomerId   string `json:"customerId"`
+	CustomerName string `json:"customerName"`
+	Slot         string `json:"slot"`
+}
+
 // AdminStats is the single payload behind the admin dashboard.
 //
 // Everything here is derived, never stored. The dashboard is a read-only view
@@ -40,6 +54,12 @@ type AdminStats struct {
 	PendingApprovals int `json:"pendingApprovals"`
 	FlaggedCount     int `json:"flaggedCount"`
 
+	// Slots that will never be delivered until someone assigns a route.
+	// Returned as a list rather than a bare count so the dashboard can name
+	// the customers — a number alone tells you there's a problem without
+	// telling you whose.
+	UnroutedSlots []UnroutedSlot `json:"unroutedSlots"`
+
 	// Commercials
 	ActiveCustomers int     `json:"activeCustomers"`
 	MonthRevenue    float64 `json:"monthRevenue"`
@@ -62,6 +82,13 @@ func (sr StatsResource) Routes() chi.Router {
 // dashboard must keep reporting even if manifest logic is mid-refactor, and a
 // silent divergence is easier to spot than a silent coupling. If you change
 // the schedule rules, change them in all three places.
+//
+// The trailing quantity check matters as much as the schedule rules. A
+// customer who paused today has an override row, which satisfies
+// `o.id IS NOT NULL`, so without it they'd count as a stop that was expected
+// and never delivered — permanently capping the completion rate below 100%
+// on any day someone skips. GenerateManifest drops those stops too, so the
+// driver was never asked to make them.
 const dueTodayCTE = `
 	WITH due AS (
 		SELECT s.route_id, s.slot, s.customer_id
@@ -81,6 +108,19 @@ const dueTodayCTE = `
 				 AND ($1::date - s.anchor_date) % 2 = 0)
 			 OR o.id IS NOT NULL
 		  )
+		  AND (
+			  COALESCE(o.new_milk_qty,    s.default_milk_qty,    0)
+			+ COALESCE(o.new_curd_qty,    s.default_curd_qty,    0)
+			+ COALESCE(o.new_butter_qty,  s.default_butter_qty,  0)
+			+ COALESCE(o.new_ghee_qty,    s.default_ghee_qty,    0)
+			+ COALESCE(o.new_lassi_qty,   s.default_lassi_qty,   0)
+			+ COALESCE(o.new_paneer_qty,  s.default_paneer_qty,  0)
+			+ COALESCE(o.new_jaggery_qty, s.default_jaggery_qty, 0)
+			+ COALESCE(o.new_khand_qty,   s.default_khand_qty,   0)
+			+ COALESCE(o.new_oil_qty,     s.default_oil_qty,     0)
+			+ COALESCE(o.new_atta_qty,    s.default_atta_qty,    0)
+			+ COALESCE(o.new_burfi_qty,   s.default_burfi_qty,   0)
+		  ) > 0
 	)
 `
 
@@ -93,7 +133,7 @@ func (sr StatsResource) GetStats(w http.ResponseWriter, r *http.Request) {
 	}
 	month := target[:7]
 
-	out := AdminStats{Date: target, MonthLabel: month}
+	out := AdminStats{Date: target, MonthLabel: month, UnroutedSlots: []UnroutedSlot{}}
 
 	// --- 1. Today's runs and stops -----------------------------------------
 	//
@@ -167,7 +207,38 @@ func (sr StatsResource) GetStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- 3. Month-to-date revenue ------------------------------------------
+	// --- 3. Unrouted slots -------------------------------------------------
+	//
+	// stop_order = 0 counts as unrouted too: it's the default, and the
+	// manifest requires stop_order > 0. It's also what FinalInvoice sets to
+	// pull a departing customer off the run — but those are marked inactive
+	// shortly after, and status = 'active' filters them out here.
+	//
+	// Capped at 50. If it ever gets that long the list isn't the problem.
+	unroutedRows, err := sr.DB.Query(ctx, `
+		SELECT s.customer_id::text, c.name, s.slot
+		FROM subscriptions s
+		JOIN customers c ON c.id = s.customer_id
+		WHERE c.status = 'active'
+		  AND (s.route_id IS NULL OR s.stop_order = 0)
+		ORDER BY c.name ASC, s.slot ASC
+		LIMIT 50
+	`)
+	if err != nil {
+		http.Error(w, "Failed checking unrouted slots: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer unroutedRows.Close()
+
+	for unroutedRows.Next() {
+		var u UnroutedSlot
+		if err := unroutedRows.Scan(&u.CustomerId, &u.CustomerName, &u.Slot); err != nil {
+			continue
+		}
+		out.UnroutedSlots = append(out.UnroutedSlots, u)
+	}
+
+	// --- 4. Month-to-date revenue ------------------------------------------
 	//
 	// Reads unit_price_* off the log, never routes.price_*. That is the whole
 	// point of the price snapshot: a mid-month price change must not

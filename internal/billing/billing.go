@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
+	"github.com/0xjuicebox/pgsBackend/internal/payment"
 	"github.com/0xjuicebox/pgsBackend/middleware"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
@@ -56,12 +57,16 @@ type MarkPaidRequest struct {
 	Status string `json:"status"`
 }
 
-// BillingResource now carries a WhatsApp handle so Generate can notify each
-// customer whose invoice was just created. main.go needs to construct it
-// with both fields — see the note at the bottom of this file.
+// BillingResource carries a WhatsApp handle so Generate can notify each
+// customer whose invoice was just created, and a Payment handle so those
+// messages can carry a Razorpay link.
+//
+// Payment is optional. When it's nil or unconfigured, bills still go out with
+// manual payment instructions — a missing gateway shouldn't stop billing.
 type BillingResource struct {
 	DB       *pgxpool.Pool
 	WhatsApp *notification.WhatsAppService
+	Payment  *payment.Service
 }
 
 func (br BillingResource) Routes() chi.Router {
@@ -261,9 +266,9 @@ func (br BillingResource) GetCustomerBill(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"customerId": customerID, "month": month, "days": days})
 }
 
-// Generate creates invoices for a completed month and — new in this version —
-// fires off a WhatsApp bill to each customer whose invoice was just created.
-// Pre-existing invoices are not re-messaged (see notifyFreshInvoices below).
+// Generate creates invoices for a completed month and fires off a WhatsApp
+// bill to each customer whose invoice was just created. Pre-existing invoices
+// are not re-messaged (see notifyFreshInvoices below).
 func (br BillingResource) Generate(w http.ResponseWriter, r *http.Request) {
 	var req GenerateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -313,10 +318,10 @@ func (br BillingResource) Generate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fire-and-forget notifications for the invoices we just inserted. Serial
-	// Twilio calls at ~500ms each × N customers can take a long time, so we
-	// don't want to hold the admin's HTTP request open while it runs. Any
-	// failures get logged; admin can re-notify a specific customer manually
-	// via the billing drill-down.
+	// Twilio calls at ~500ms each × N customers can take a long time, and
+	// each one now also creates a Razorpay link, so we don't hold the admin's
+	// HTTP request open while it runs. Failures get logged; admin can
+	// re-notify a specific customer via the billing drill-down.
 	if br.WhatsApp != nil && generated > 0 {
 		go br.notifyFreshInvoices(req.Month, tallies)
 	}
@@ -329,7 +334,9 @@ func (br BillingResource) Generate(w http.ResponseWriter, r *http.Request) {
 // finished. Filtering by created_at avoids re-messaging customers whose
 // invoices already existed from a previous Generate run.
 func (br BillingResource) notifyFreshInvoices(month string, tallies []CustomerTally) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Generous timeout: this loop now makes an outbound Razorpay call per
+	// customer as well as a Twilio one, so a large month takes a while.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	rows, err := br.DB.Query(ctx, `
@@ -358,17 +365,49 @@ func (br BillingResource) notifyFreshInvoices(month string, tallies []CustomerTa
 	}
 }
 
+// paymentLine builds the "how to pay" part of a bill message.
+//
+// Returns a Razorpay link when the gateway is configured and the call
+// succeeds, and falls back to manual instructions otherwise. The fallback is
+// deliberate: a gateway outage at month-end must not stop bills going out —
+// worst case the customer pays the old way and an admin marks it manually,
+// which is exactly where this system was before payments existed.
+func (br BillingResource) paymentLine(ctx context.Context, customerID uuid.UUID, month string) string {
+	const manual = "To pay, please transfer to our UPI ID and reply PAID once done. " +
+		"Our team will confirm and mark your bill as settled."
+
+	if br.Payment == nil || !br.Payment.Enabled() {
+		return manual
+	}
+
+	// The invoice id isn't carried on CustomerTally, and
+	// (customer_id, billing_month) is unique, so looking it up here avoids
+	// threading it through every caller of notifyBill.
+	var invoiceID string
+	if err := br.DB.QueryRow(ctx, `
+		SELECT id::text FROM invoices WHERE customer_id = $1 AND billing_month = $2
+	`, customerID, month).Scan(&invoiceID); err != nil {
+		fmt.Printf("⚠️ paymentLine: no invoice for customer %s month %s: %v\n", customerID, month, err)
+		return manual
+	}
+
+	url, err := br.Payment.CreateLinkForInvoice(ctx, invoiceID)
+	if err != nil {
+		fmt.Printf("⚠️ paymentLine: payment link failed for invoice %s: %v\n", invoiceID, err)
+		return manual
+	}
+
+	return "Tap here to pay securely:\n" + url
+}
+
 // notifyBill sends the month-end bill total to a single customer over
 // WhatsApp. Uses a free-form text message via SendDeliveryUpdate rather than
 // a Twilio Content Template — templates would need Meta approval for every
 // tweak to the wording, and this message body changes with the product mix
 // each month. Once the format is stable we can switch to a template.
-//
-// UPI reconciliation is deliberately out of scope for v1. The message ends
-// with a manual "Reply PAID once transferred" nudge; auto-reconciliation
-// via a payment gateway comes in v1.1.
 func (br BillingResource) notifyBill(t CustomerTally, month string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Long enough to cover a Razorpay round trip plus the Twilio send.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	var phone string
@@ -412,10 +451,9 @@ func (br BillingResource) notifyBill(t CustomerTally, month string) {
 		"🧾 *Your PGS Direct bill — %s*\n\n"+
 			"Hello %s,\n\n"+
 			"%s\n\n"+
-			"*Total: ₹%.0f*\n\n"+
-			"To pay, please transfer to our UPI ID and reply PAID once done. "+
-			"Our team will confirm and mark your bill as settled.",
+			"*Total: ₹%.0f*\n\n%s",
 		labelForMonth(month), t.CustomerName, strings.Join(lines, "\n"), t.TotalAmount,
+		br.paymentLine(ctx, t.CustomerId, month),
 	)
 
 	if err := br.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {
@@ -488,6 +526,12 @@ func (br BillingResource) ListInvoices(w http.ResponseWriter, r *http.Request) {
 
 var allowedInvoiceStatus = map[string]bool{"PENDING": true, "PAID_ONLINE": true, "PAID_CASH": true}
 
+// MarkPaid is the manual path — cash, or an admin correcting a status.
+//
+// Marking anything PAID also cancels an outstanding Razorpay link. Without
+// that, a customer who paid cash could still tap the link they were sent and
+// pay a second time. The webhook would catch it as ALREADY_PAID, but issuing
+// a refund is worse than a link that quietly stops working.
 func (br BillingResource) MarkPaid(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	var req MarkPaidRequest
@@ -499,8 +543,13 @@ func (br BillingResource) MarkPaid(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "status must be PENDING, PAID_ONLINE or PAID_CASH", http.StatusBadRequest)
 		return
 	}
+
 	var updated uuid.UUID
-	err := br.DB.QueryRow(r.Context(), `UPDATE invoices SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING id`, req.Status, id).Scan(&updated)
+	var linkID *string
+	err := br.DB.QueryRow(r.Context(),
+		`UPDATE invoices SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING id, payment_link_id`,
+		req.Status, id,
+	).Scan(&updated, &linkID)
 	if err == pgx.ErrNoRows {
 		http.Error(w, "Invoice not found", http.StatusNotFound)
 		return
@@ -509,6 +558,17 @@ func (br BillingResource) MarkPaid(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	if strings.HasPrefix(req.Status, "PAID") && linkID != nil && br.Payment != nil && br.Payment.Enabled() {
+		go func(lid string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := br.Payment.CancelLink(ctx, lid); err != nil {
+				fmt.Printf("⚠️ MarkPaid: couldn't cancel link %s: %v\n", lid, err)
+			}
+		}(*linkID)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Invoice status updated", "status": req.Status})
 }
 
@@ -518,16 +578,3 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(body)
 }
-
-// -------------------------------------------------------------------------
-// main.go change required:
-//
-// Where you currently have:
-//     br := billing.BillingResource{DB: pool}
-//
-// Change to:
-//     br := billing.BillingResource{DB: pool, WhatsApp: whatsappService}
-//
-// Use whatever variable name your Twilio/WhatsApp service is bound to in
-// main.go — it's the same one you already pass to DeliveryResource.
-// -------------------------------------------------------------------------

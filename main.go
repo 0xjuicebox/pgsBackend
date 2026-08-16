@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/0xjuicebox/pgsBackend/internal/driver"
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
 	"github.com/0xjuicebox/pgsBackend/internal/override"
+	"github.com/0xjuicebox/pgsBackend/internal/payment"
 	"github.com/0xjuicebox/pgsBackend/internal/registration"
 	"github.com/0xjuicebox/pgsBackend/internal/route"
 	"github.com/0xjuicebox/pgsBackend/internal/stats"
@@ -59,13 +61,53 @@ func main() {
 	}
 	log.Println("Successfully connected and pinged Supabase PostgreSQL engine.")
 
+	// Background sweepers
 	go driver.StartAutoEndSweeper(pool)
 	go route.StartPricePromotionSweeper(pool)
 	go update.StartChangeSweeper(pool)
 
-	// WhatsApp
 	// WhatsApp — NewWhatsAppService reads Twilio creds from env itself
 	whatsApp := notification.NewWhatsAppService()
+
+	// -----------------------------------------------------------------
+	// Payments
+	//
+	// Constructed before the resources that depend on it. Enabled() is
+	// false when the env vars are absent, and billing checks that before
+	// creating links — so a deployment without Razorpay credentials still
+	// sends bills, just with the manual "transfer and reply PAID" line.
+	// -----------------------------------------------------------------
+	pay := payment.New(
+		pool,
+		os.Getenv("RAZORPAY_KEY_ID"),
+		os.Getenv("RAZORPAY_KEY_SECRET"),
+		os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
+	)
+	if pay.Enabled() {
+		log.Println("Razorpay payments enabled.")
+	} else {
+		log.Println("Notice: Razorpay credentials absent — bills will use manual payment instructions.")
+	}
+
+	// Receipt on payment. A callback so internal/payment never has to know
+	// the notification package exists.
+	pay.OnPaid = func(invoiceID string, amount float64) {
+		cbCtx, cbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cbCancel()
+
+		var phone, name string
+		err := pool.QueryRow(cbCtx, `
+			SELECT c.phone_number, c.name
+			FROM invoices i JOIN customers c ON c.id = i.customer_id
+			WHERE i.id = $1::uuid`, invoiceID).Scan(&phone, &name)
+		if err != nil {
+			fmt.Printf("⚠️ payment receipt: couldn't load customer for invoice %s: %v\n", invoiceID, err)
+			return
+		}
+		whatsApp.SendDeliveryUpdate(phone, fmt.Sprintf(
+			"✅ Payment received — thank you, %s!\n\nWe've received ₹%.0f. Your bill is now settled.",
+			name, amount))
+	}
 
 	// Resources
 	cr := customer.CustomerResource{DB: pool, WhatsApp: whatsApp}
@@ -78,9 +120,7 @@ func main() {
 	regr := registration.Resource{DB: pool, WhatsApp: whatsApp}
 	ur := update.UpdateResource{DB: pool, WhatsApp: whatsApp}
 	statsResource := stats.StatsResource{DB: pool}
-
-	// NEW: billing and config — these were never mounted before
-	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp}
+	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp, Payment: pay}
 	cfgR := config.ConfigResource{DB: pool}
 
 	// Router
@@ -113,10 +153,11 @@ func main() {
 	r.Mount("/register", regr.Routes())
 	r.Mount("/update", ur.Routes())
 	r.Mount("/stats", statsResource.Routes())
-
-	// NEW mounts
 	r.Mount("/billing", br.Routes())
 	r.Mount("/config", cfgR.Routes())
+
+	// POST /payment/razorpay — the gateway's webhook lands here.
+	r.Mount("/payment", pay.Routes())
 
 	port := os.Getenv("PORT")
 	if port == "" {
