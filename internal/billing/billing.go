@@ -67,6 +67,10 @@ type BillingResource struct {
 	DB       *pgxpool.Pool
 	WhatsApp *notification.WhatsAppService
 	Payment  *payment.Service
+	// Templates carries the approved Twilio content template SIDs. An empty
+	// Bill SID makes notifyBill fall back to the free-form message, which
+	// still works inside WhatsApp's 24-hour window.
+	Templates notification.TemplateSIDs
 }
 
 func (br BillingResource) Routes() chi.Router {
@@ -405,6 +409,24 @@ func (br BillingResource) paymentLine(ctx context.Context, customerID uuid.UUID,
 // a Twilio Content Template — templates would need Meta approval for every
 // tweak to the wording, and this message body changes with the product mix
 // each month. Once the format is stable we can switch to a template.
+// notifyBill sends a customer their month-end bill.
+//
+// Uses the approved Twilio Content Template rather than free-form text.
+// WhatsApp only allows free-form within 24 hours of the customer's last
+// inbound message, and a month-end bill goes out to everyone regardless of
+// whether they've messaged — so the free-form version silently failed with
+// error 63016 for anyone who hadn't been in touch that day. In development
+// that never showed up, because a developer testing the bot is always inside
+// the window.
+//
+// The itemised breakdown moved to the hosted /pay page. Meta rejects template
+// parameters containing newlines, so a multi-line product list can never be a
+// variable — the template carries name, month and total, and the button links
+// to the full bill.
+//
+// Falls back to the old free-form message when no template SID is configured,
+// so a deployment without templates still bills people (it just won't reach
+// quiet customers).
 func (br BillingResource) notifyBill(t CustomerTally, month string) {
 	// Long enough to cover a Razorpay round trip plus the Twilio send.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -416,6 +438,39 @@ func (br BillingResource) notifyBill(t CustomerTally, month string) {
 		return
 	}
 
+	// The invoice id is what the template's button URL appends to /pay/.
+	// Without it there's nothing to link to, so fall back rather than send a
+	// bill the customer can't act on.
+	var invoiceID string
+	err := br.DB.QueryRow(ctx,
+		`SELECT id::text FROM invoices WHERE customer_id = $1 AND billing_month = $2`,
+		t.CustomerId, month).Scan(&invoiceID)
+	if err != nil {
+		fmt.Printf("⚠️ notifyBill: no invoice row for %s / %s: %v\n", t.CustomerId, month, err)
+	}
+
+	if br.Templates.Bill != "" && invoiceID != "" {
+		if err := br.WhatsApp.SendBill(
+			phone, br.Templates.Bill,
+			t.CustomerName, labelForMonth(month),
+			formatAmount(t.TotalAmount), invoiceID,
+		); err != nil {
+			// Log and fall through to free-form: a failed template send is
+			// better followed by an attempt that might land than by silence.
+			fmt.Printf("⚠️ notifyBill: template send failed for %s, falling back: %v\n", phone, err)
+		} else {
+			return
+		}
+	}
+
+	br.notifyBillFreeForm(ctx, phone, t, month)
+}
+
+// notifyBillFreeForm is the pre-template message, kept as a fallback for
+// deployments without approved templates and for the 24-hour window where it
+// still works. Retains the full itemised breakdown, which the template can't
+// carry.
+func (br BillingResource) notifyBillFreeForm(ctx context.Context, phone string, t CustomerTally, month string) {
 	// Pretty product breakdown, only for lines that actually contributed.
 	// Same LABEL and unit conventions used by the customer-facing HTML pages.
 	labels := map[string]string{
@@ -459,6 +514,28 @@ func (br BillingResource) notifyBill(t CustomerTally, month string) {
 	if err := br.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {
 		fmt.Printf("⚠️ notifyBill: WhatsApp send failed for %s: %v\n", phone, err)
 	}
+}
+
+// formatAmount renders a rupee amount with Indian digit grouping and no
+// symbol — the ₹ is baked into the approved template body, so including it
+// here would render "₹₹5,120".
+func formatAmount(v float64) string {
+	whole := int64(v + 0.5)
+	s := fmt.Sprintf("%d", whole)
+	if len(s) <= 3 {
+		return s
+	}
+	last3 := s[len(s)-3:]
+	rest := s[:len(s)-3]
+	var parts []string
+	for len(rest) > 2 {
+		parts = append([]string{rest[len(rest)-2:]}, parts...)
+		rest = rest[:len(rest)-2]
+	}
+	if rest != "" {
+		parts = append([]string{rest}, parts...)
+	}
+	return strings.Join(parts, ",") + "," + last3
 }
 
 // labelForMonth turns "2026-07" into "July 2026" for human-friendly headers.

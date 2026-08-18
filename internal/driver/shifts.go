@@ -51,11 +51,16 @@ type ShiftRow struct {
 	Status    string     `json:"status"`
 }
 
-// Cutoffs surfaced so the client can display "auto-ends at 21:00" hints
-// without a separate config fetch.
+// ShiftCutoffs surfaces the auto-end times so the client can display
+// "auto-ends at 22:00" hints without a separate config fetch.
+//
+// These are the SHIFT END times, not the customer order cutoffs. The two
+// were the same column until the shift-end split; naming them
+// morningCutoff/eveningCutoff while they carried order deadlines is what
+// made the sweeper bug hard to see. Named for what they are now.
 type ShiftCutoffs struct {
-	MorningCutoff string `json:"morningCutoff"` // HH:MM:SS
-	EveningCutoff string `json:"eveningCutoff"` // HH:MM:SS
+	MorningShiftEnd string `json:"morningShiftEnd"` // HH:MM:SS
+	EveningShiftEnd string `json:"eveningShiftEnd"` // HH:MM:SS
 }
 
 type shiftMutationRequest struct {
@@ -109,10 +114,10 @@ func (dr DriverResource) GetTodayShifts(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Cutoffs are best-effort; a missing row shouldn't break the response.
+	// Best-effort; a missing row shouldn't break the response.
 	dr.DB.QueryRow(r.Context(),
-		`SELECT morning_cutoff_time::text, evening_cutoff_time::text FROM system_config LIMIT 1`,
-	).Scan(&state.Cutoffs.MorningCutoff, &state.Cutoffs.EveningCutoff)
+		`SELECT morning_shift_end_time::text, evening_shift_end_time::text FROM system_config LIMIT 1`,
+	).Scan(&state.Cutoffs.MorningShiftEnd, &state.Cutoffs.EveningShiftEnd)
 
 	writeJSON(w, http.StatusOK, state)
 }
@@ -277,10 +282,18 @@ func (dr DriverResource) ReportSyncFailure(w http.ResponseWriter, r *http.Reques
 
 // StartAutoEndSweeper runs a ticker that closes stale ACTIVE shifts.
 //
-// The rule: at the evening cutoff (from system_config), any ACTIVE shift for
-// today gets flipped to AUTO_ENDED. This runs every 5 minutes, so the worst-
-// case delay is 5 min past cutoff. That precision is fine — this is a
-// dashboard housekeeping tick, not a payment settlement.
+// The rule: each slot has its own shift end time in system_config, and an
+// ACTIVE shift for that slot is flipped to AUTO_ENDED once today's clock
+// passes it. Runs every 5 minutes, so worst-case delay is 5 min past the
+// time. That precision is fine — this is a dashboard housekeeping tick, not
+// a payment settlement.
+//
+// This used to read evening_cutoff_time and apply it to BOTH slots. That
+// column is the customer's deadline to change an evening order (14:00), not
+// a shift boundary, so an evening driver starting their run at 16:00 was
+// auto-ended on the next sweep. The dashboard reported zero runs in progress
+// while vans were still out — during the evening run, which is precisely
+// when someone is watching that number.
 //
 // Start this from main.go once, after the DB pool is ready:
 //
@@ -305,35 +318,43 @@ func sweepAutoEnd(db *pgxpool.Pool) {
 	now := time.Now().In(loc)
 	today := now.Format("2006-01-02")
 
-	var morningCutoffStr, eveningCutoffStr string
+	var morningEndStr, eveningEndStr string
 	err := db.QueryRow(ctx,
-		`SELECT morning_cutoff_time::text, evening_cutoff_time::text FROM system_config LIMIT 1`,
-	).Scan(&morningCutoffStr, &eveningCutoffStr)
+		`SELECT morning_shift_end_time::text, evening_shift_end_time::text FROM system_config LIMIT 1`,
+	).Scan(&morningEndStr, &eveningEndStr)
 	if err != nil {
 		fmt.Printf("⚠️ sweepAutoEnd: no system_config row: %v\n", err)
 		return
 	}
 
-	// Morning slot rule: closes when the *evening* cutoff passes, since the
-	// morning cutoff is about override deadlines, not shift end. Both slots
-	// therefore auto-end at the same wall-clock moment (typically 21:00 IST).
-	// Kept a single check for both to make the sweeper's behaviour obvious
-	// to anyone reading it later.
-	if !cutoffPassed(now, eveningCutoffStr, loc) {
-		return
-	}
+	// Each slot closes on its own clock. Morning vans are back by noon;
+	// evening vans run until ten. Sweeping them together would either end
+	// evening shifts mid-round or leave morning shifts open all afternoon.
+	for _, s := range []struct {
+		slot   string
+		endStr string
+	}{
+		{"morning", morningEndStr},
+		{"evening", eveningEndStr},
+	} {
+		if !cutoffPassed(now, s.endStr, loc) {
+			continue
+		}
 
-	tag, err := db.Exec(ctx, `
-		UPDATE shifts
-		SET status = 'AUTO_ENDED', ended_at = NOW(), updated_at = NOW()
-		WHERE shift_date = $1::date AND status = 'ACTIVE'
-	`, today)
-	if err != nil {
-		fmt.Printf("⚠️ sweepAutoEnd: update failed: %v\n", err)
-		return
-	}
-	if tag.RowsAffected() > 0 {
-		fmt.Printf("🕘 auto-ended %d stale shift(s) for %s\n", tag.RowsAffected(), today)
+		tag, err := db.Exec(ctx, `
+			UPDATE shifts
+			SET status = 'AUTO_ENDED', ended_at = NOW(), updated_at = NOW()
+			WHERE shift_date = $1::date AND slot = $2 AND status = 'ACTIVE'
+		`, today, s.slot)
+		if err != nil {
+			// Log and carry on to the other slot — one failing UPDATE must
+			// not leave the second slot unswept for the rest of the day.
+			fmt.Printf("⚠️ sweepAutoEnd: %s update failed: %v\n", s.slot, err)
+			continue
+		}
+		if tag.RowsAffected() > 0 {
+			fmt.Printf("🕘 auto-ended %d stale %s shift(s) for %s\n", tag.RowsAffected(), s.slot, today)
+		}
 	}
 }
 

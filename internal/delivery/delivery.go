@@ -154,6 +154,9 @@ type HistoryRecord struct {
 type DeliveryResource struct {
 	DB       *pgxpool.Pool
 	WhatsApp *notification.WhatsAppService
+	// Templates carries the approved Twilio content template SIDs. An empty
+	// DeliveryDone SID falls back to the free-form confirmation.
+	Templates notification.TemplateSIDs
 }
 
 func (dr DeliveryResource) Routes() chi.Router {
@@ -362,11 +365,16 @@ func (dr DeliveryResource) notifyDelivered(customerID uuid.UUID, slot string, or
 		{"khand", order.Khand}, {"oil", order.Oil}, {"atta", order.Atta}, {"burfi", order.Burfi},
 	}
 	var lines []string
+	var flat []string
 	for _, it := range items {
 		if it.qty > 0 {
 			// Quantities are stored in base units (ml / g). Printing the raw
 			// number gave customers "Milk: 2000" several times a week.
-			lines = append(lines, fmt.Sprintf("• %s: %s", ProductLabels[it.key], formatQty(it.qty, it.key)))
+			pretty := formatQty(it.qty, it.key)
+			lines = append(lines, fmt.Sprintf("• %s: %s", ProductLabels[it.key], pretty))
+			// Template variables cannot contain newlines, so the same list is
+			// also built as one comma-separated line: "Milk 2 L, Curd 500 g".
+			flat = append(flat, fmt.Sprintf("%s %s", ProductLabels[it.key], pretty))
 		}
 	}
 
@@ -374,6 +382,20 @@ func (dr DeliveryResource) notifyDelivered(customerID uuid.UUID, slot string, or
 	if slot == "evening" {
 		slotLabel = "Evening"
 	}
+
+	// Template first. This confirmation goes out after every delivery, to
+	// customers who mostly haven't messaged us that day — the largest volume
+	// of sends that the free-form 24-hour rule would reject with error 63016.
+	if dr.Templates.DeliveryDone != "" {
+		if err := dr.WhatsApp.SendDeliveryComplete(
+			phone, dr.Templates.DeliveryDone, slotLabel, notification.JoinItems(flat),
+		); err == nil {
+			return
+		} else {
+			fmt.Printf("⚠️ notifyDelivered: template send failed for %s, falling back: %v\n", phone, err)
+		}
+	}
+
 	msg := fmt.Sprintf("✅ Your %s delivery is complete!\n\n%s", slotLabel, strings.Join(lines, "\n"))
 	dr.WhatsApp.SendDeliveryUpdate(phone, msg)
 }

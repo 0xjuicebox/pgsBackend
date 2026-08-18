@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/billing"
@@ -25,7 +26,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )
@@ -69,10 +69,7 @@ func main() {
 	//
 	// Verify with: SHOW timezone;  -> Asia/Kolkata
 	// -----------------------------------------------------------------
-	pgConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, "SET timezone = 'Asia/Kolkata'")
-		return err
-	}
+	pgConfig.ConnConfig.RuntimeParams["timezone"] = "Asia/Kolkata"
 
 	pgConfig.MaxConns = 20
 	pgConfig.MinConns = 2
@@ -118,6 +115,23 @@ func main() {
 	// WhatsApp — NewWhatsAppService reads Twilio creds from env itself
 	whatsApp := notification.NewWhatsAppService()
 
+	// Approved Twilio content templates.
+	//
+	// WhatsApp only permits free-form text within 24 hours of the customer's
+	// last inbound message. Bills, reminders, suspension notices, delivery
+	// confirmations and receipts all go to customers who haven't just
+	// messaged, so each needs an approved template or it silently fails with
+	// error 63016. Reported at boot because an unset SID means a whole
+	// category of message stops reaching quiet customers — a failure that
+	// otherwise surfaces weeks later as "nobody paid this month".
+	templates := notification.LoadTemplateSIDs()
+	if missing := templates.TemplateHealth(); len(missing) > 0 {
+		log.Printf("⚠️  WhatsApp templates not configured: %s — these messages fall back to free-form and will only reach customers who messaged in the last 24h.",
+			strings.Join(missing, ", "))
+	} else {
+		log.Println("WhatsApp templates: all configured.")
+	}
+
 	// -----------------------------------------------------------------
 	// Payments
 	//
@@ -140,19 +154,41 @@ func main() {
 
 	// Receipt on payment. A callback so internal/payment never has to know
 	// the notification package exists.
+	//
+	// Uses the approved template: a customer who pays by tapping the link in
+	// a bill hasn't necessarily messaged us, so a free-form receipt would be
+	// rejected outside the 24-hour window. Falls back to free-form when the
+	// template isn't configured.
 	pay.OnPaid = func(invoiceID string, amount float64) {
-		cbCtx, cbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cbCtx, cbCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cbCancel()
 
-		var phone, name string
+		var phone, name, month string
 		err := pool.QueryRow(cbCtx, `
-			SELECT c.phone_number, c.name
+			SELECT c.phone_number, c.name, i.billing_month
 			FROM invoices i JOIN customers c ON c.id = i.customer_id
-			WHERE i.id = $1::uuid`, invoiceID).Scan(&phone, &name)
+			WHERE i.id = $1::uuid`, invoiceID).Scan(&phone, &name, &month)
 		if err != nil {
 			fmt.Printf("⚠️ payment receipt: couldn't load customer for invoice %s: %v\n", invoiceID, err)
 			return
 		}
+
+		prettyMonth := month
+		if t, perr := time.Parse("2006-01", month); perr == nil {
+			prettyMonth = t.Format("January 2006")
+		}
+
+		if templates.PaymentReceipt != "" {
+			if err := whatsApp.SendPaymentReceipt(
+				phone, templates.PaymentReceipt, name,
+				fmt.Sprintf("%.0f", amount), prettyMonth,
+			); err == nil {
+				return
+			} else {
+				fmt.Printf("⚠️ payment receipt: template send failed, falling back: %v\n", err)
+			}
+		}
+
 		whatsApp.SendDeliveryUpdate(phone, fmt.Sprintf(
 			"✅ Payment received — thank you, %s!\n\nWe've received ₹%.0f. Your bill is now settled.",
 			name, amount))
@@ -162,14 +198,14 @@ func main() {
 	cr := customer.CustomerResource{DB: pool, WhatsApp: whatsApp}
 	rr := route.RouteResource{DB: pool}
 	dr := driver.DriverResource{DB: pool}
-	dlr := delivery.DeliveryResource{DB: pool, WhatsApp: whatsApp}
+	dlr := delivery.DeliveryResource{DB: pool, WhatsApp: whatsApp, Templates: templates}
 	sr := subscription.SubscriptionResource{DB: pool}
 	or := override.OverrideResource{DB: pool, WhatsApp: whatsApp}
 	wr := webhook.WhatsAppResource{WhatsApp: whatsApp, DB: pool}
 	regr := registration.Resource{DB: pool, WhatsApp: whatsApp}
 	ur := update.UpdateResource{DB: pool, WhatsApp: whatsApp}
 	statsResource := stats.StatsResource{DB: pool}
-	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp, Payment: pay}
+	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp, Payment: pay, Templates: templates}
 	cfgR := config.ConfigResource{DB: pool}
 
 	// Router
@@ -207,6 +243,14 @@ func main() {
 
 	// POST /payment/razorpay — the gateway's webhook lands here.
 	r.Mount("/payment", pay.Routes())
+
+	// GET /pay/{invoiceID} — the customer-facing hosted bill.
+	//
+	// Mounted at a short root path, not under /payment, because this URL goes
+	// inside an approved WhatsApp template button. Template base URLs are
+	// fixed at Meta approval time, so this path must stay stable forever —
+	// changing it means re-approval.
+	r.Mount("/pay", pay.PayPageRoutes())
 
 	port := os.Getenv("PORT")
 	if port == "" {
