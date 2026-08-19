@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -77,6 +78,7 @@ func (br BillingResource) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Get("/live", br.GetLiveTallies)
 	r.Get("/customer/{id}", br.GetCustomerBill)
+	r.Get("/customer/{id}/invoices", br.GetCustomerInvoices)
 	r.Post("/generate", br.Generate)
 	r.With(middleware.Paginate).Get("/invoices", br.ListInvoices)
 	r.Put("/invoices/{id}/status", br.MarkPaid)
@@ -268,6 +270,114 @@ func (br BillingResource) GetCustomerBill(w http.ResponseWriter, r *http.Request
 		days = append(days, d)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"customerId": customerID, "month": month, "days": days})
+}
+
+// CustomerInvoice is one row of a customer's billing history.
+type CustomerInvoice struct {
+	InvoiceId     string   `json:"invoiceId"`
+	BillingMonth  string   `json:"billingMonth"`
+	TotalAmount   float64  `json:"totalAmount"`
+	Status        string   `json:"status"`
+	PaidAt        *string  `json:"paidAt"`
+	PaymentRef    *string  `json:"paymentReference"`
+	ReminderCount int      `json:"reminderCount"`
+	SuspendedAt   *string  `json:"suspendedAt"`
+	PayURL        string   `json:"payUrl"`
+	LineItems     []string `json:"lineItems"`
+}
+
+// GetCustomerInvoices returns every invoice ever raised for a customer,
+// newest first.
+//
+// Exists because the customer detail screen previously showed only identity
+// and slots — an admin fielding "what did I pay in July?" had to leave the
+// customer, open Billing, pick the month, and find them again. The data was
+// always there; nothing surfaced it in the one place an admin looks when
+// they're thinking about a specific person.
+func (br BillingResource) GetCustomerInvoices(w http.ResponseWriter, r *http.Request) {
+	customerID := chi.URLParam(r, "id")
+
+	rows, err := br.DB.Query(r.Context(), `
+		SELECT id::text, billing_month, total_amount, status,
+		       TO_CHAR(paid_at, 'YYYY-MM-DD'), payment_reference,
+		       COALESCE(reminder_count, 0),
+		       TO_CHAR(suspended_at, 'YYYY-MM-DD'),
+		       breakdown
+		FROM invoices
+		WHERE customer_id = $1
+		ORDER BY billing_month DESC
+	`, customerID)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	labels := map[string]string{
+		"milk": "Milk", "curd": "Curd", "butter": "Butter", "ghee": "Ghee",
+		"lassi": "Buttermilk", "paneer": "Paneer", "jaggery": "Jaggery",
+		"khand": "Desi Khand", "oil": "Mustard Oil", "atta": "Atta", "burfi": "Burfi",
+	}
+	litre := map[string]bool{"milk": true, "curd": true, "lassi": true, "oil": true}
+
+	out := []CustomerInvoice{}
+	for rows.Next() {
+		var (
+			inv          CustomerInvoice
+			breakdownRaw []byte
+		)
+		if err := rows.Scan(&inv.InvoiceId, &inv.BillingMonth, &inv.TotalAmount, &inv.Status,
+			&inv.PaidAt, &inv.PaymentRef, &inv.ReminderCount, &inv.SuspendedAt, &breakdownRaw); err != nil {
+			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// A compact one-line-per-product summary so the screen can show what
+		// the bill was made of without a second request per invoice.
+		var bd InvoiceBreakdown
+		if len(breakdownRaw) > 0 {
+			_ = json.Unmarshal(breakdownRaw, &bd)
+		}
+		for _, p := range Products {
+			qty := bd.Quantities[p]
+			total := bd.LineTotals[p]
+			if qty <= 0 {
+				continue
+			}
+			unit := "g"
+			display := float64(qty)
+			if qty >= 1000 {
+				display = float64(qty) / 1000
+				if litre[p] {
+					unit = "L"
+				} else {
+					unit = "kg"
+				}
+			} else if litre[p] {
+				unit = "ml"
+			}
+			inv.LineItems = append(inv.LineItems, fmt.Sprintf("%s %g%s — ₹%.0f", labels[p], display, unit, total))
+		}
+
+		// Only unpaid invoices get a pay link; a settled one would be a dead
+		// end for the admin and a confusing thing to forward to a customer.
+		if !strings.HasPrefix(inv.Status, "PAID") {
+			inv.PayURL = publicBaseURL() + "/pay/" + inv.InvoiceId
+		}
+
+		out = append(out, inv)
+	}
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+// publicBaseURL is where customer-facing pages live. Read from the
+// environment so a staging deploy doesn't hand out production links.
+func publicBaseURL() string {
+	if v := os.Getenv("PUBLIC_BASE_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "https://pgsbackend-e4hiw.ondigitalocean.app"
 }
 
 // Generate creates invoices for a completed month and fires off a WhatsApp

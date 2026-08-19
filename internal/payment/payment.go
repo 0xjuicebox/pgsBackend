@@ -86,7 +86,7 @@ type createLinkRequest struct {
 	// Partial payment is off deliberately. A half-paid invoice has no state
 	// in our schema, and inventing one to support a feature nobody asked for
 	// would be the wrong trade.
-	PartialPayment bool   `json:"partial_payment"`
+	PartialPayment bool   `json:"accept_partial"`
 	ExpireBy       int64  `json:"expire_by,omitempty"`
 	ReferenceID    string `json:"reference_id,omitempty"`
 }

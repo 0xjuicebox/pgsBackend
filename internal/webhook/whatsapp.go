@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -70,6 +71,22 @@ func (wr WhatsAppResource) HandleIncomingMessage(w http.ResponseWriter, r *http.
 		}
 		if status == "rejected" {
 			wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ Your subscription request was previously reviewed and could not be fulfilled. Please contact support if you believe this is an error.")
+			return
+		}
+
+		// --- SUSPENDED USERS: unpaid bill, only payment lifts this ---
+		//
+		// Deliberately handled BEFORE the disabled branch, and deliberately
+		// not sharing its RESUME path. A suspension exists because money is
+		// owed; letting the customer type RESUME to lift it would make the
+		// whole dunning cycle decorative — paused on the 6th, back on the
+		// 7th, still unpaid.
+		//
+		// Payment is what resumes them, automatically, via
+		// billing.ResumeIfSuspended on the OnPaid callback. So the only
+		// useful thing to send here is the bill and a way to pay it.
+		if status == "suspended" {
+			wr.handleSuspendedMessage(rawSender, customerID)
 			return
 		}
 
@@ -297,3 +314,62 @@ func (wr *WhatsAppResource) handleUpdateRequest(rawSender, cleanPhone string) {
 
 // NOTE: handleIssueRequest lives in internal/webhook/issue.go — it isn't
 // duplicated here.
+
+// handleSuspendedMessage replies to any message from a customer suspended for
+// non-payment.
+//
+// Every inbound message gets the same answer regardless of content: here is
+// what you owe, here is where to pay. There is no menu branch worth offering —
+// overrides, order changes and issue reports are all meaningless while
+// deliveries are stopped, and offering them would imply the account is
+// functioning.
+//
+// The suspension lifts automatically when the invoice is paid (see
+// billing.ResumeIfSuspended), so no admin step is mentioned and none is
+// needed.
+func (wr WhatsAppResource) handleSuspendedMessage(rawSender, customerID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	var (
+		invoiceID string
+		month     string
+		total     float64
+	)
+	err := wr.DB.QueryRow(ctx, `
+		SELECT i.id::text, i.billing_month, i.total_amount
+		FROM customers c
+		JOIN invoices i ON i.id = c.suspended_for_invoice_id
+		WHERE c.id = $1::uuid
+	`, customerID).Scan(&invoiceID, &month, &total)
+
+	if err != nil {
+		// Suspended but the invoice link is missing or broken. Rather than
+		// leave the customer with no path forward, hand them to a human —
+		// this is a state only an admin can untangle.
+		fmt.Printf("⚠️ suspended customer %s has no resolvable invoice: %v\n", customerID, err)
+		wr.WhatsApp.SendDeliveryUpdate(rawSender,
+			"⏸️ Your deliveries are currently on hold because of an unpaid bill.\n\nPlease reply here and our team will help you sort it out.")
+		return
+	}
+
+	base := os.Getenv("PUBLIC_BASE_URL")
+	if base == "" {
+		base = "https://pgsbackend-e4hiw.ondigitalocean.app"
+	}
+
+	wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf(
+		"⏸️ Your deliveries are on hold.\n\nYour %s bill of *₹%.0f* is still unpaid.\n\n"+
+			"Pay here and your deliveries resume automatically — nothing else needed:\n%s/pay/%s\n\n"+
+			"If you'd like to discuss this, just reply and our team will help.",
+		prettyMonthLabel(month), total, strings.TrimRight(base, "/"), invoiceID,
+	))
+}
+
+// prettyMonthLabel turns "2026-07" into "July 2026".
+func prettyMonthLabel(m string) string {
+	if t, err := time.Parse("2006-01", m); err == nil {
+		return t.Format("January 2006")
+	}
+	return m
+}

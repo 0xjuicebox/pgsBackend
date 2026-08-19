@@ -152,6 +152,23 @@ func main() {
 		log.Println("Notice: Razorpay credentials absent — bills will use manual payment instructions.")
 	}
 
+	// Resources
+	cr := customer.CustomerResource{DB: pool, WhatsApp: whatsApp}
+	rr := route.RouteResource{DB: pool}
+	dr := driver.DriverResource{DB: pool}
+	dlr := delivery.DeliveryResource{DB: pool, WhatsApp: whatsApp, Templates: templates}
+	sr := subscription.SubscriptionResource{DB: pool}
+	or := override.OverrideResource{DB: pool, WhatsApp: whatsApp}
+	wr := webhook.WhatsAppResource{WhatsApp: whatsApp, DB: pool}
+	regr := registration.Resource{DB: pool, WhatsApp: whatsApp}
+	ur := update.UpdateResource{DB: pool, WhatsApp: whatsApp}
+	statsResource := stats.StatsResource{DB: pool}
+	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp, Payment: pay, Templates: templates}
+
+	// OnPaid is assigned here, after br exists, because the callback needs
+	// BillingResource to lift a non-payment suspension. Payment is what
+	// resumes a suspended customer, so the two are inseparable.
+	//
 	// Receipt on payment. A callback so internal/payment never has to know
 	// the notification package exists.
 	//
@@ -178,6 +195,34 @@ func main() {
 			prettyMonth = t.Format("January 2006")
 		}
 
+		// Lift a non-payment suspension before sending anything, so the
+		// message can reflect the customer's actual state. Fires for both the
+		// Razorpay webhook and an admin marking a bill PAID_CASH, since both
+		// route through OnPaid.
+		//
+		// resumed is false when the customer was restored to 'disabled'
+		// rather than 'active' — they had paused for a holiday before being
+		// suspended, so paying clears the debt without restarting
+		// deliveries. They get an ordinary receipt, not a welcome-back.
+		resumed, rerr := br.ResumeIfSuspended(cbCtx, invoiceID)
+		if rerr != nil {
+			fmt.Printf("⚠️ payment receipt: resume check failed for invoice %s: %v\n", invoiceID, rerr)
+		}
+		if resumed {
+			log.Printf("▶️  resumed suspended customer after payment on invoice %s", invoiceID)
+			// TODO: this is free-form and will silently fail outside the
+			// 24-hour window. A customer who paid by tapping the link in a
+			// suspension template has NOT messaged us, so there is usually no
+			// open window — this is exactly the send most likely to be
+			// dropped, at the moment the customer most needs confirmation.
+			// Replace with the approved "payment received & resumed" template
+			// once its SID is configured.
+			whatsApp.SendDeliveryUpdate(phone, fmt.Sprintf(
+				"✅ Payment received — thank you, %s!\n\nWe've received ₹%.0f for your %s bill, and your deliveries have been resumed. You're back on the round from the next delivery. 🥛",
+				name, amount, prettyMonth))
+			return
+		}
+
 		if templates.PaymentReceipt != "" {
 			if err := whatsApp.SendPaymentReceipt(
 				phone, templates.PaymentReceipt, name,
@@ -193,20 +238,16 @@ func main() {
 			"✅ Payment received — thank you, %s!\n\nWe've received ₹%.0f. Your bill is now settled.",
 			name, amount))
 	}
-
-	// Resources
-	cr := customer.CustomerResource{DB: pool, WhatsApp: whatsApp}
-	rr := route.RouteResource{DB: pool}
-	dr := driver.DriverResource{DB: pool}
-	dlr := delivery.DeliveryResource{DB: pool, WhatsApp: whatsApp, Templates: templates}
-	sr := subscription.SubscriptionResource{DB: pool}
-	or := override.OverrideResource{DB: pool, WhatsApp: whatsApp}
-	wr := webhook.WhatsAppResource{WhatsApp: whatsApp, DB: pool}
-	regr := registration.Resource{DB: pool, WhatsApp: whatsApp}
-	ur := update.UpdateResource{DB: pool, WhatsApp: whatsApp}
-	statsResource := stats.StatsResource{DB: pool}
-	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp, Payment: pay, Templates: templates}
 	cfgR := config.ConfigResource{DB: pool}
+
+	// Dunning: auto-generate on the 1st, remind daily to the 5th, suspend on
+	// the 6th. Started after br so the callback wiring above is in place.
+	//
+	// Hourly rather than daily on purpose: a once-a-day timer only fires if
+	// the process happens to be alive at that moment, so a deploy at 00:59 on
+	// the 1st would skip the entire month's billing with nothing to show for
+	// it. Every phase is idempotent, so running often is harmless.
+	go br.StartDunningSweeper()
 
 	// Router
 	r := chi.NewRouter()
