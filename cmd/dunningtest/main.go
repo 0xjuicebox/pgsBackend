@@ -1,9 +1,10 @@
 // Command dunningtest drives the full dunning cycle against throwaway
 // fixtures and asserts the resulting database state.
 //
-//	go run ./cmd/dunningtest
-//	go run ./cmd/dunningtest -keep        # leave fixtures for inspection
-//	go run ./cmd/dunningtest -no-whatsapp # skip Twilio sends
+//	go run ./cmd/dunningtest -no-whatsapp
+//	go run ./cmd/dunningtest -phone +919876543210
+//	go run ./cmd/dunningtest -phone +919876543210 -force
+//	go run ./cmd/dunningtest -keep
 //
 // # WHY A HARNESS RATHER THAN WAITING FOR THE CALENDAR
 //
@@ -11,38 +12,36 @@
 // suspend on the 6th. Testing it by waiting means one attempt per month, and
 // the resume-on-payment path can't be reached at all without a real payment.
 //
-// The alternative — editing rows and restarting the server until each phase
-// fires — proves less than it looks like it does, because it exercises the
-// date arithmetic rather than the billing logic, and it leaves the database
-// in a half-modified state that's easy to mistake for a passing test.
-//
 // This calls BillingResource.RunPhase directly with an explicit month. The
-// phases themselves are unmodified: the same idempotency guards, the same
-// SQL, the same notifications. Only the calendar is bypassed.
+// phases themselves are unmodified — same idempotency guards, same SQL, same
+// notifications. Only the calendar is bypassed.
 //
-// WHAT IT COVERS
+// # WHY SCENARIOS RUN SEQUENTIALLY
 //
-//  1. GENERATE creates an invoice with the correct total from delivery logs
-//  2. GENERATE is idempotent — a second run creates nothing
-//  3. REMIND marks last_reminder_on and increments reminder_count
-//  4. REMIND is idempotent within a day
-//  5. SUSPEND sets status='suspended', is_active=false
-//  6. SUSPEND preserves route_id and stop_order
-//  7. SUSPEND records status_before_suspension
-//  8. Payment resumes an active customer back to active
-//  9. Payment does NOT resume a customer who was paused before suspension
-//  10. A paid invoice is never reminded or suspended
+// Three customers with three different histories, run one after another and
+// torn down between, rather than three fixtures existing at once. That means
+// a single phone number can play all three parts — so the messages arrive on
+// one real handset, in the order a real customer would receive them.
 //
-// Case 9 is the one worth having a harness for. A customer who paused for a
-// holiday, owed last month's bill, was suspended, then paid, must go back to
-// 'disabled' — not 'active'. Settling a debt is not a request to restart
-// deliveries, and getting this wrong delivers milk to an empty house.
+// dunning_runs is cleared between scenarios. Its UNIQUE (run_date, phase)
+// constraint is what stops GENERATE running twice in a day, which is correct
+// in production and would silently skip scenarios two and three here.
+//
+// THE SCENARIOS
+//
+//  1. ACTIVE   bill -> reminder -> suspension -> pays -> resumes to active
+//  2. PAUSED   paused for a holiday, owes money, suspended, pays, stays paused
+//  3. PAID     pays immediately, must never be reminded or suspended
+//
+// Scenario 2 is the one worth having a harness for. Paying a debt is not a
+// request to restart deliveries; restoring that customer to 'active' would
+// deliver milk to an empty house.
 //
 // # SAFETY
 //
-// Fixtures use phone numbers +910000000001 / +910000000002 and a billing
-// month two years in the future, so they cannot collide with real data or be
-// picked up by real reporting. Cleanup runs on exit unless -keep is passed.
+// Billing month is two years out, so nothing here can be picked up by real
+// reporting. If the target phone already belongs to a customer, the run
+// aborts and reports what would be destroyed — pass -force to proceed.
 package main
 
 import (
@@ -62,27 +61,31 @@ import (
 )
 
 const (
-	// Two years out: past any real billing month, and clearly synthetic to
-	// anyone who stumbles across it in the database.
-	testMonth = "2098-11"
-	// Dates inside testMonth for the delivery logs.
+	// Two years out: past any real billing month, and obviously synthetic to
+	// anyone who finds it in the database.
+	testMonth      = "2098-11"
 	testDatePrefix = "2098-11-"
+	fixtureTag     = "DUNNINGTEST FIXTURE — safe to delete"
 
-	activePhone = "+910000000001" // suspended from 'active', should resume
-	pausedPhone = "+910000000002" // suspended from 'disabled', should NOT resume
-	paidPhone   = "+910000000003" // pays immediately, should never be chased
-
-	fixtureTag = "DUNNINGTEST FIXTURE — safe to delete"
+	// Fallback when no real number is supplied. Ten zeros is not an
+	// assignable Indian number, so Twilio rejects it at validation and
+	// nothing leaves their platform.
+	defaultPhone = "+910000000000"
 )
 
 var (
-	flagKeep       = flag.Bool("keep", false, "skip cleanup so fixture rows can be inspected")
+	flagPhone      = flag.String("phone", "", "phone number for fixtures, E.164 (default: unroutable placeholder)")
+	flagKeep       = flag.Bool("keep", false, "skip final cleanup so fixture rows can be inspected")
 	flagNoWhatsApp = flag.Bool("no-whatsapp", false, "run without Twilio so no real messages are sent")
+	flagForce      = flag.Bool("force", false, "delete an existing customer on the target number before running")
+	flagPace       = flag.Duration("pace", 3*time.Second, "pause between phases so messages arrive in readable order")
 )
 
 type harness struct {
 	db      *pgxpool.Pool
 	br      billing.BillingResource
+	phone   string
+	pace    time.Duration
 	results []result
 }
 
@@ -95,16 +98,25 @@ type result struct {
 func (h *harness) expect(name string, cond bool, got, want string) {
 	if cond {
 		h.results = append(h.results, result{name, true, got})
-		fmt.Printf("  \033[32mPASS\033[0m  %-34s %s\n", name, got)
+		fmt.Printf("  \033[32mPASS\033[0m  %-36s %s\n", name, got)
 		return
 	}
 	h.results = append(h.results, result{name, false, fmt.Sprintf("got %s, want %s", got, want)})
-	fmt.Printf("  \033[31mFAIL\033[0m  %-34s got %s, want %s\n", name, got, want)
+	fmt.Printf("  \033[31mFAIL\033[0m  %-36s got %s, want %s\n", name, got, want)
 }
 
 func (h *harness) fail(name, detail string) {
 	h.results = append(h.results, result{name, false, detail})
-	fmt.Printf("  \033[31mFAIL\033[0m  %-34s %s\n", name, detail)
+	fmt.Printf("  \033[31mFAIL\033[0m  %-36s %s\n", name, detail)
+}
+
+// wait paces the run so a human watching a phone can tell which message
+// belongs to which phase. Skipped entirely when Twilio is off, since there is
+// then nothing to watch.
+func (h *harness) wait() {
+	if !*flagNoWhatsApp && h.pace > 0 {
+		time.Sleep(h.pace)
+	}
 }
 
 // -------------------------------------------------------------------------
@@ -113,30 +125,35 @@ func (h *harness) fail(name, detail string) {
 
 type fixture struct {
 	customerID uuid.UUID
-	phone      string
-	status     string
-	routeID    *uuid.UUID
+	routeID    uuid.UUID
+	invoiceID  string
 }
 
-// newCustomer creates a fixture customer with a route and stop order, so the
-// harness can prove suspension leaves routing intact.
-func (h *harness) newCustomer(ctx context.Context, phone, status string, routeID *uuid.UUID) (fixture, error) {
+func (h *harness) newRoute(ctx context.Context) (uuid.UUID, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return id, err
+	}
+	_, err = h.db.Exec(ctx, `INSERT INTO routes (id, name) VALUES ($1, $2)`, id, fixtureTag)
+	return id, err
+}
+
+// newCustomer creates a fixture with a route and a stop order, so the harness
+// can prove suspension leaves routing intact — unlike FinalInvoice, which
+// zeroes stop_order because a leaver is gone for good.
+func (h *harness) newCustomer(ctx context.Context, status string, routeID uuid.UUID) (fixture, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return fixture{}, err
 	}
 
-	isActive := status == "active"
 	if _, err := h.db.Exec(ctx, `
 		INSERT INTO customers (id, name, phone_number, house_address, geo_latitude, geo_longitude, is_active, status)
 		VALUES ($1, $2, $3, 'Fixture address, do not deliver', '0', '0', $4, $5)
-	`, id, fixtureTag, phone, isActive, status); err != nil {
+	`, id, fixtureTag, h.phone, status == "active", status); err != nil {
 		return fixture{}, err
 	}
 
-	// A subscription with a route and stop_order. Suspension must not touch
-	// either — unlike FinalInvoice, which zeroes stop_order because a leaver
-	// is gone for good.
 	if _, err := h.db.Exec(ctx, `
 		INSERT INTO subscriptions (customer_id, slot, route_id, stop_order, default_milk_qty,
 		                           schedule_type, active_days)
@@ -145,13 +162,13 @@ func (h *harness) newCustomer(ctx context.Context, phone, status string, routeID
 		return fixture{}, err
 	}
 
-	return fixture{customerID: id, phone: phone, status: status, routeID: routeID}, nil
+	return fixture{customerID: id, routeID: routeID}, nil
 }
 
-// addDeliveryLogs writes n delivered logs inside testMonth with real price
-// snapshots. Billing reads only from these — never from subscriptions — so
-// this is what determines the invoice total.
-func (h *harness) addDeliveryLogs(ctx context.Context, f fixture, n int, milkMl int, pricePerMl float64) (float64, error) {
+// addDeliveryLogs writes delivered logs with real price snapshots. Billing
+// reads only from these — never from subscriptions — so this is what
+// determines the invoice total.
+func (h *harness) addDeliveryLogs(ctx context.Context, f fixture, n, milkMl int, pricePerMl float64) (float64, error) {
 	var expected float64
 	for i := 1; i <= n; i++ {
 		date := fmt.Sprintf("%s%02d", testDatePrefix, i)
@@ -168,35 +185,61 @@ func (h *harness) addDeliveryLogs(ctx context.Context, f fixture, n int, milkMl 
 	return expected, nil
 }
 
-// newRoute creates a throwaway route so subscriptions have something real to
-// point at. Named distinctly so it's obvious in the admin UI if cleanup fails.
-func (h *harness) newRoute(ctx context.Context) (*uuid.UUID, error) {
-	id, err := uuid.NewV7()
-	if err != nil {
-		return nil, err
+// resetScenario removes everything a scenario created. Called before and
+// after each, so a scenario always starts from nothing and a failure part way
+// through can't poison the next one.
+//
+// dunning_runs must go too: its UNIQUE (run_date, phase) is what stops
+// GENERATE running twice in one day, which would otherwise make scenarios two
+// and three silently no-op.
+func (h *harness) resetScenario(ctx context.Context) error {
+	if _, err := h.db.Exec(ctx, `DELETE FROM dunning_runs WHERE run_date = CURRENT_DATE`); err != nil {
+		return err
 	}
-	if _, err := h.db.Exec(ctx,
-		`INSERT INTO routes (id, name) VALUES ($1, $2)`, id, fixtureTag); err != nil {
-		return nil, err
+
+	var id uuid.UUID
+	err := h.db.QueryRow(ctx,
+		`SELECT id FROM customers WHERE phone_number = $1 AND name = $2`, h.phone, fixtureTag).Scan(&id)
+	if err == nil {
+		if derr := deleteCustomerDeep(ctx, h.db, id); derr != nil {
+			return derr
+		}
 	}
-	return &id, nil
+
+	_, err = h.db.Exec(ctx, `DELETE FROM routes WHERE name = $1`, fixtureTag)
+	return err
 }
 
-func (h *harness) cleanup(ctx context.Context) error {
-	// dunning_runs rows are keyed by (run_date, phase) and would otherwise
-	// make a second run today think GENERATE had already happened.
-	if _, err := h.db.Exec(ctx,
-		`DELETE FROM dunning_runs WHERE billing_month = $1 OR run_date = CURRENT_DATE`, testMonth); err != nil {
-		return err
+// deleteCustomerDeep removes a customer and everything referencing them.
+//
+// Not every foreign key into customers cascades — order_overrides and
+// pending_subscription_changes both use the default NO ACTION, so a plain
+// DELETE FROM customers fails with a 23503 for anyone who has ever changed a
+// single day's order or submitted an order change. Dependents therefore have
+// to go first, in reference order.
+//
+// This mirrors customer.Delete in internal/customer/routes.go, which does the
+// same thing for the admin path — except that one omits
+// pending_subscription_changes and so fails on any customer with change
+// history.
+func deleteCustomerDeep(ctx context.Context, db *pgxpool.Pool, customerID uuid.UUID) error {
+	// payment_events references invoices, not customers, and is ON DELETE
+	// SET NULL — so it survives deliberately. A payment record outliving the
+	// customer is correct: the money still moved.
+	stmts := []string{
+		`DELETE FROM order_overrides WHERE customer_id = $1`,
+		`DELETE FROM pending_subscription_changes WHERE customer_id = $1`,
+		`DELETE FROM delivery_logs WHERE customer_id = $1`,
+		`DELETE FROM invoices WHERE customer_id = $1`,
+		`DELETE FROM subscriptions WHERE customer_id = $1`,
+		`DELETE FROM customers WHERE id = $1`,
 	}
-	// invoices, subscriptions and delivery_logs all cascade from customers.
-	if _, err := h.db.Exec(ctx,
-		`DELETE FROM customers WHERE phone_number IN ($1,$2,$3)`,
-		activePhone, pausedPhone, paidPhone); err != nil {
-		return err
+	for _, q := range stmts {
+		if _, err := db.Exec(ctx, q, customerID); err != nil {
+			return fmt.Errorf("%s: %w", strings.SplitN(q, " WHERE", 2)[0], err)
+		}
 	}
-	_, err := h.db.Exec(ctx, `DELETE FROM routes WHERE name = $1`, fixtureTag)
-	return err
+	return nil
 }
 
 // -------------------------------------------------------------------------
@@ -209,17 +252,15 @@ type invoiceState struct {
 	status        string
 	reminderCount int
 	lastReminder  *string
-	suspendedAt   *string
 }
 
 func (h *harness) invoiceFor(ctx context.Context, f fixture) (invoiceState, error) {
 	var st invoiceState
 	err := h.db.QueryRow(ctx, `
 		SELECT id::text, total_amount, status, COALESCE(reminder_count,0),
-		       TO_CHAR(last_reminder_on,'YYYY-MM-DD'), TO_CHAR(suspended_at,'YYYY-MM-DD')
+		       TO_CHAR(last_reminder_on,'YYYY-MM-DD')
 		FROM invoices WHERE customer_id = $1 AND billing_month = $2
-	`, f.customerID, testMonth).Scan(&st.id, &st.total, &st.status,
-		&st.reminderCount, &st.lastReminder, &st.suspendedAt)
+	`, f.customerID, testMonth).Scan(&st.id, &st.total, &st.status, &st.reminderCount, &st.lastReminder)
 	return st, err
 }
 
@@ -234,8 +275,7 @@ type customerState struct {
 func (h *harness) customerFor(ctx context.Context, f fixture) (customerState, error) {
 	var st customerState
 	err := h.db.QueryRow(ctx, `
-		SELECT c.status, c.is_active, c.status_before_suspension,
-		       s.stop_order, s.route_id::text
+		SELECT c.status, c.is_active, c.status_before_suspension, s.stop_order, s.route_id::text
 		FROM customers c
 		JOIN subscriptions s ON s.customer_id = c.id AND s.slot = 'morning'
 		WHERE c.id = $1
@@ -243,11 +283,286 @@ func (h *harness) customerFor(ctx context.Context, f fixture) (customerState, er
 	return st, err
 }
 
-func (h *harness) invoiceCount(ctx context.Context) int {
-	var n int
-	_ = h.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM invoices WHERE billing_month = $1`, testMonth).Scan(&n)
-	return n
+// -------------------------------------------------------------------------
+// Scenario 1 — active customer, full cycle through to resume
+// -------------------------------------------------------------------------
+
+func (h *harness) scenarioActive(ctx context.Context) {
+	const s = "active"
+	fmt.Println("\n\033[1mScenario 1 — active customer: bill, reminder, suspension, payment\033[0m")
+
+	if err := h.resetScenario(ctx); err != nil {
+		h.fail(s+"/reset", err.Error())
+		return
+	}
+	routeID, err := h.newRoute(ctx)
+	if err != nil {
+		h.fail(s+"/route", err.Error())
+		return
+	}
+	f, err := h.newCustomer(ctx, "active", routeID)
+	if err != nil {
+		h.fail(s+"/customer", err.Error())
+		return
+	}
+	// 20 deliveries of 2 L at ₹0.07/ml = ₹140/day = ₹2,800
+	expected, err := h.addDeliveryLogs(ctx, f, 20, 2000, 0.07)
+	if err != nil {
+		h.fail(s+"/logs", err.Error())
+		return
+	}
+
+	// --- Generate -------------------------------------------------------
+	fmt.Println("  → generating bill")
+	if err := h.br.RunPhase(ctx, "GENERATE", testMonth); err != nil {
+		h.fail(s+"/generate", err.Error())
+		return
+	}
+	inv, err := h.invoiceFor(ctx, f)
+	if err != nil {
+		h.fail(s+"/generate/invoice", "no invoice created: "+err.Error())
+		return
+	}
+	h.expect(s+"/generate/total",
+		fmt.Sprintf("%.2f", inv.total) == fmt.Sprintf("%.2f", expected),
+		fmt.Sprintf("₹%.2f", inv.total), fmt.Sprintf("₹%.2f", expected))
+	h.expect(s+"/generate/status", inv.status == "PENDING", inv.status, "PENDING")
+	h.wait()
+
+	// Re-run: dunning_runs already holds today's GENERATE. Without that
+	// guard, a restart on the 1st would re-message every customer.
+	if err := h.br.RunPhase(ctx, "GENERATE", testMonth); err != nil {
+		h.fail(s+"/generate/rerun", err.Error())
+	}
+	inv2, _ := h.invoiceFor(ctx, f)
+	h.expect(s+"/generate/idempotent", inv2.id == inv.id, "same invoice", "same invoice")
+
+	// --- Remind ---------------------------------------------------------
+	fmt.Println("  → sending reminder")
+	if err := h.br.RunPhase(ctx, "REMIND", testMonth); err != nil {
+		h.fail(s+"/remind", err.Error())
+	}
+	inv, _ = h.invoiceFor(ctx, f)
+	h.expect(s+"/remind/marked", inv.lastReminder != nil,
+		fmt.Sprintf("last_reminder_on=%s", derefOr(inv.lastReminder, "<nil>")), "today")
+	h.expect(s+"/remind/counted", inv.reminderCount == 1,
+		fmt.Sprintf("count=%d", inv.reminderCount), "1")
+	h.wait()
+
+	// Same day again: last_reminder_on excludes it. This is what stops the
+	// hourly ticker sending 24 reminders a day.
+	if err := h.br.RunPhase(ctx, "REMIND", testMonth); err != nil {
+		h.fail(s+"/remind/rerun", err.Error())
+	}
+	inv, _ = h.invoiceFor(ctx, f)
+	h.expect(s+"/remind/idempotent", inv.reminderCount == 1,
+		fmt.Sprintf("count=%d", inv.reminderCount), "1 (unchanged)")
+
+	// --- Suspend --------------------------------------------------------
+	fmt.Println("  → suspending")
+	if err := h.br.RunPhase(ctx, "SUSPEND", testMonth); err != nil {
+		h.fail(s+"/suspend", err.Error())
+	}
+	cs, err := h.customerFor(ctx, f)
+	if err != nil {
+		h.fail(s+"/suspend/read", err.Error())
+		return
+	}
+	h.expect(s+"/suspend/status", cs.status == "suspended", cs.status, "suspended")
+	h.expect(s+"/suspend/inactive", !cs.isActive, fmt.Sprintf("is_active=%v", cs.isActive), "false")
+	// Routing survives so resuming is one flag flip, not an admin re-routing
+	// them from scratch.
+	h.expect(s+"/suspend/keeps_stop_order", cs.stopOrder == 7,
+		fmt.Sprintf("stop_order=%d", cs.stopOrder), "7")
+	h.expect(s+"/suspend/keeps_route", cs.routeID != nil,
+		fmt.Sprintf("route_id=%s", derefOr(cs.routeID, "<nil>")), "unchanged")
+	h.expect(s+"/suspend/records_prior", derefOr(cs.beforeSusp, "") == "active",
+		fmt.Sprintf("before=%s", derefOr(cs.beforeSusp, "<nil>")), "active")
+	h.wait()
+
+	if err := h.br.RunPhase(ctx, "SUSPEND", testMonth); err != nil {
+		h.fail(s+"/suspend/rerun", err.Error())
+	}
+	cs, _ = h.customerFor(ctx, f)
+	h.expect(s+"/suspend/idempotent", cs.status == "suspended", cs.status, "suspended")
+
+	// --- Pay and resume -------------------------------------------------
+	fmt.Println("  → paying")
+	inv, _ = h.invoiceFor(ctx, f)
+	if _, err := h.db.Exec(ctx,
+		`UPDATE invoices SET status = 'PAID_ONLINE', paid_at = NOW() WHERE id = $1::uuid`, inv.id); err != nil {
+		h.fail(s+"/resume/mark_paid", err.Error())
+		return
+	}
+	resumed, err := h.br.ResumeIfSuspended(ctx, inv.id)
+	if err != nil {
+		h.fail(s+"/resume/call", err.Error())
+		return
+	}
+	h.expect(s+"/resume/reported", resumed, fmt.Sprintf("resumed=%v", resumed), "true")
+	cs, _ = h.customerFor(ctx, f)
+	h.expect(s+"/resume/status", cs.status == "active", cs.status, "active")
+	h.expect(s+"/resume/active", cs.isActive, fmt.Sprintf("is_active=%v", cs.isActive), "true")
+	h.expect(s+"/resume/clears_prior", cs.beforeSusp == nil,
+		fmt.Sprintf("before=%s", derefOr(cs.beforeSusp, "<nil>")), "<nil>")
+
+	_ = h.resetScenario(ctx)
+}
+
+// -------------------------------------------------------------------------
+// Scenario 2 — paused customer who owes money
+// -------------------------------------------------------------------------
+
+// The case this harness exists for. Someone pauses for a holiday, still owes
+// last month's bill, gets suspended on the 6th, then pays. They must go back
+// to 'disabled' — they are still on holiday. Restoring them to 'active' would
+// deliver milk to an empty house because they settled a debt.
+func (h *harness) scenarioPaused(ctx context.Context) {
+	const s = "paused"
+	fmt.Println("\n\033[1mScenario 2 — paused customer who owes money: must stay paused after paying\033[0m")
+
+	if err := h.resetScenario(ctx); err != nil {
+		h.fail(s+"/reset", err.Error())
+		return
+	}
+	routeID, err := h.newRoute(ctx)
+	if err != nil {
+		h.fail(s+"/route", err.Error())
+		return
+	}
+	f, err := h.newCustomer(ctx, "disabled", routeID)
+	if err != nil {
+		h.fail(s+"/customer", err.Error())
+		return
+	}
+	if _, err := h.addDeliveryLogs(ctx, f, 10, 1000, 0.07); err != nil {
+		h.fail(s+"/logs", err.Error())
+		return
+	}
+
+	fmt.Println("  → generating bill")
+	if err := h.br.RunPhase(ctx, "GENERATE", testMonth); err != nil {
+		h.fail(s+"/generate", err.Error())
+		return
+	}
+	inv, err := h.invoiceFor(ctx, f)
+	if err != nil {
+		h.fail(s+"/generate/invoice", "no invoice for a paused customer: "+err.Error())
+		return
+	}
+	// A paused customer is still billed for what was delivered before they
+	// paused — billing reads delivery_logs, not account state.
+	h.expect(s+"/generate/billed_anyway", inv.total > 0,
+		fmt.Sprintf("₹%.2f", inv.total), "> 0")
+	h.wait()
+
+	fmt.Println("  → suspending")
+	if err := h.br.RunPhase(ctx, "SUSPEND", testMonth); err != nil {
+		h.fail(s+"/suspend", err.Error())
+	}
+	cs, err := h.customerFor(ctx, f)
+	if err != nil {
+		h.fail(s+"/suspend/read", err.Error())
+		return
+	}
+	h.expect(s+"/suspend/status", cs.status == "suspended", cs.status, "suspended")
+	h.expect(s+"/suspend/records_prior", derefOr(cs.beforeSusp, "") == "disabled",
+		fmt.Sprintf("before=%s", derefOr(cs.beforeSusp, "<nil>")), "disabled")
+	h.wait()
+
+	fmt.Println("  → paying")
+	if _, err := h.db.Exec(ctx,
+		`UPDATE invoices SET status = 'PAID_ONLINE', paid_at = NOW() WHERE id = $1::uuid`, inv.id); err != nil {
+		h.fail(s+"/resume/mark_paid", err.Error())
+		return
+	}
+	resumed, err := h.br.ResumeIfSuspended(ctx, inv.id)
+	if err != nil {
+		h.fail(s+"/resume/call", err.Error())
+		return
+	}
+	// Suspension lifted, but they are NOT back in service — so the caller
+	// must not send a "deliveries resumed" message.
+	h.expect(s+"/resume/not_resumed", !resumed, fmt.Sprintf("resumed=%v", resumed), "false")
+	cs, _ = h.customerFor(ctx, f)
+	h.expect(s+"/resume/back_to_disabled", cs.status == "disabled", cs.status, "disabled")
+	h.expect(s+"/resume/stays_inactive", !cs.isActive,
+		fmt.Sprintf("is_active=%v", cs.isActive), "false")
+
+	_ = h.resetScenario(ctx)
+}
+
+// -------------------------------------------------------------------------
+// Scenario 3 — customer who pays immediately
+// -------------------------------------------------------------------------
+
+func (h *harness) scenarioPaid(ctx context.Context) {
+	const s = "paid"
+	fmt.Println("\n\033[1mScenario 3 — customer who pays on time: must never be chased\033[0m")
+
+	if err := h.resetScenario(ctx); err != nil {
+		h.fail(s+"/reset", err.Error())
+		return
+	}
+	routeID, err := h.newRoute(ctx)
+	if err != nil {
+		h.fail(s+"/route", err.Error())
+		return
+	}
+	f, err := h.newCustomer(ctx, "active", routeID)
+	if err != nil {
+		h.fail(s+"/customer", err.Error())
+		return
+	}
+	if _, err := h.addDeliveryLogs(ctx, f, 5, 1000, 0.07); err != nil {
+		h.fail(s+"/logs", err.Error())
+		return
+	}
+
+	fmt.Println("  → generating bill")
+	if err := h.br.RunPhase(ctx, "GENERATE", testMonth); err != nil {
+		h.fail(s+"/generate", err.Error())
+		return
+	}
+	inv, err := h.invoiceFor(ctx, f)
+	if err != nil {
+		h.fail(s+"/generate/invoice", err.Error())
+		return
+	}
+	h.wait()
+
+	fmt.Println("  → paying immediately")
+	if _, err := h.db.Exec(ctx,
+		`UPDATE invoices SET status = 'PAID_CASH', paid_at = NOW() WHERE id = $1::uuid`, inv.id); err != nil {
+		h.fail(s+"/mark_paid", err.Error())
+		return
+	}
+
+	// From here on the customer must hear nothing. If either of these sends
+	// a message, a paying customer gets chased — the fastest way to lose one.
+	fmt.Println("  → running remind and suspend (expect silence)")
+	if err := h.br.RunPhase(ctx, "REMIND", testMonth); err != nil {
+		h.fail(s+"/remind", err.Error())
+	}
+	inv, _ = h.invoiceFor(ctx, f)
+	h.expect(s+"/remind/skipped", inv.reminderCount == 0,
+		fmt.Sprintf("count=%d", inv.reminderCount), "0")
+
+	if err := h.br.RunPhase(ctx, "SUSPEND", testMonth); err != nil {
+		h.fail(s+"/suspend", err.Error())
+	}
+	cs, err := h.customerFor(ctx, f)
+	if err != nil {
+		h.fail(s+"/suspend/read", err.Error())
+		return
+	}
+	h.expect(s+"/suspend/skipped", cs.status == "active", cs.status, "active")
+	h.expect(s+"/suspend/still_active", cs.isActive,
+		fmt.Sprintf("is_active=%v", cs.isActive), "true")
+
+	if !*flagKeep {
+		_ = h.resetScenario(ctx)
+	}
 }
 
 // -------------------------------------------------------------------------
@@ -266,6 +581,17 @@ func main() {
 		exit("DATABASE_URL is not set.")
 	}
 
+	phone := strings.TrimSpace(*flagPhone)
+	if phone == "" {
+		phone = os.Getenv("WHATSAPP_TEST_PHONE")
+	}
+	if phone == "" {
+		phone = defaultPhone
+	}
+	if !strings.HasPrefix(phone, "+") {
+		exit("phone must be in E.164 form, e.g. +919876543210")
+	}
+
 	ctx := context.Background()
 	connCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -275,7 +601,7 @@ func main() {
 		exit("bad DATABASE_URL: " + err.Error())
 	}
 	// Same IST pinning the server uses. Without it CURRENT_DATE here is the
-	// UTC date and last_reminder_on comparisons drift for 5.5 hours a day.
+	// UTC date, and last_reminder_on comparisons drift for 5.5 hours a day.
 	cfg.ConnConfig.RuntimeParams["timezone"] = "Asia/Kolkata"
 
 	db, err := pgxpool.NewWithConfig(connCtx, cfg)
@@ -287,9 +613,37 @@ func main() {
 		exit("database ping failed: " + err.Error())
 	}
 
-	// WhatsApp is real unless suppressed. The phases notify, so a run with
-	// live Twilio credentials sends actual messages to the fixture numbers —
-	// which are unassignable, so Twilio rejects them at validation.
+	// Guard an existing customer on this number. Deleting one cascades to
+	// its subscriptions, delivery logs and invoices — a real record with
+	// history is not something to remove as a side effect of running a test.
+	var existingName, existingStatus string
+	var logs, invs int
+	err = db.QueryRow(ctx, `
+		SELECT c.name, c.status,
+		       (SELECT COUNT(*) FROM delivery_logs d WHERE d.customer_id = c.id),
+		       (SELECT COUNT(*) FROM invoices i WHERE i.customer_id = c.id)
+		FROM customers c WHERE c.phone_number = $1
+	`, phone).Scan(&existingName, &existingStatus, &logs, &invs)
+
+	if err == nil && existingName != fixtureTag {
+		if !*flagForce {
+			exit(fmt.Sprintf(
+				"A customer already exists on %s:\n\n  name:     %s\n  status:   %s\n  logs:     %d\n  invoices: %d\n\n"+
+					"Running would delete this record and everything attached to it.\n"+
+					"Pass -force to proceed, or use a different -phone.",
+				phone, existingName, existingStatus, logs, invs))
+		}
+		fmt.Printf("⚠️  -force: deleting existing customer %q (%d logs, %d invoices)\n\n", existingName, logs, invs)
+		var existingID uuid.UUID
+		if derr := db.QueryRow(ctx,
+			`SELECT id FROM customers WHERE phone_number = $1`, phone).Scan(&existingID); derr != nil {
+			exit("could not find existing customer to delete: " + derr.Error())
+		}
+		if derr := deleteCustomerDeep(ctx, db, existingID); derr != nil {
+			exit("could not delete existing customer: " + derr.Error())
+		}
+	}
+
 	var whatsApp *notification.WhatsAppService
 	if !*flagNoWhatsApp {
 		whatsApp = notification.NewWhatsAppService()
@@ -301,260 +655,39 @@ func main() {
 		os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
 	)
 
+	templates := notification.LoadTemplateSIDs()
+
 	h := &harness{
-		db: db,
+		db:    db,
+		phone: phone,
+		pace:  *flagPace,
 		br: billing.BillingResource{
 			DB:        db,
 			WhatsApp:  whatsApp,
 			Payment:   pay,
-			Templates: notification.LoadTemplateSIDs(),
+			Templates: templates,
 		},
 	}
 
 	fmt.Printf("\nDunning cycle test — billing month %s\n", testMonth)
-	if *flagNoWhatsApp {
-		fmt.Println("WhatsApp suppressed (-no-whatsapp)")
+	fmt.Printf("Fixtures use %s", phone)
+	if phone == defaultPhone {
+		fmt.Print(" (unroutable placeholder)")
 	}
 	fmt.Println()
-
-	// Always start clean: a previous -keep run would otherwise make GENERATE
-	// look idempotent when it simply had nothing to do.
-	if err := h.cleanup(ctx); err != nil {
-		exit("pre-clean failed: " + err.Error())
-	}
-
-	teardown := func() {
-		if *flagKeep {
-			fmt.Printf("\n-keep: fixtures left in place. Phones %s / %s / %s, month %s.\n",
-				activePhone, pausedPhone, paidPhone, testMonth)
-			return
+	if *flagNoWhatsApp {
+		fmt.Println("WhatsApp suppressed (-no-whatsapp)")
+	} else {
+		if missing := templates.TemplateHealth(); len(missing) > 0 {
+			fmt.Printf("⚠️  Templates not configured: %s — those sends fall back to free-form.\n",
+				strings.Join(missing, ", "))
 		}
-		if err := h.cleanup(ctx); err != nil {
-			fmt.Printf("\n⚠️  cleanup failed: %v\n", err)
-			fmt.Printf("    By hand: DELETE FROM customers WHERE phone_number IN ('%s','%s','%s');\n",
-				activePhone, pausedPhone, paidPhone)
-			fmt.Printf("             DELETE FROM routes WHERE name = '%s';\n", fixtureTag)
-			fmt.Printf("             DELETE FROM dunning_runs WHERE run_date = CURRENT_DATE;\n")
-		}
+		fmt.Printf("Pacing %s between phases so messages arrive in order.\n", h.pace)
 	}
 
-	// ---------------------------------------------------------------------
-	// Setup
-	// ---------------------------------------------------------------------
-
-	routeID, err := h.newRoute(ctx)
-	if err != nil {
-		exit("route fixture failed: " + err.Error())
-	}
-
-	activeCust, err := h.newCustomer(ctx, activePhone, "active", routeID)
-	if err != nil {
-		exit("active customer fixture failed: " + err.Error())
-	}
-	pausedCust, err := h.newCustomer(ctx, pausedPhone, "disabled", routeID)
-	if err != nil {
-		exit("paused customer fixture failed: " + err.Error())
-	}
-	paidCust, err := h.newCustomer(ctx, paidPhone, "active", routeID)
-	if err != nil {
-		exit("paid customer fixture failed: " + err.Error())
-	}
-
-	// 20 deliveries of 2 L at ₹0.07/ml = ₹140/day = ₹2,800
-	expectActive, err := h.addDeliveryLogs(ctx, activeCust, 20, 2000, 0.07)
-	if err != nil {
-		exit("delivery logs failed: " + err.Error())
-	}
-	if _, err := h.addDeliveryLogs(ctx, pausedCust, 10, 1000, 0.07); err != nil {
-		exit("delivery logs failed: " + err.Error())
-	}
-	if _, err := h.addDeliveryLogs(ctx, paidCust, 5, 1000, 0.07); err != nil {
-		exit("delivery logs failed: " + err.Error())
-	}
-
-	// ---------------------------------------------------------------------
-	// Phase 1 — GENERATE
-	// ---------------------------------------------------------------------
-
-	fmt.Println("Phase 1 — generate")
-
-	if err := h.br.RunPhase(ctx, "GENERATE", testMonth); err != nil {
-		h.fail("generate/run", err.Error())
-	}
-
-	inv, err := h.invoiceFor(ctx, activeCust)
-	if err != nil {
-		h.fail("generate/invoice", "no invoice created: "+err.Error())
-	} else {
-		h.expect("generate/invoice_total",
-			fmt.Sprintf("%.2f", inv.total) == fmt.Sprintf("%.2f", expectActive),
-			fmt.Sprintf("₹%.2f", inv.total), fmt.Sprintf("₹%.2f", expectActive))
-		h.expect("generate/invoice_status", inv.status == "PENDING", inv.status, "PENDING")
-	}
-
-	countAfterFirst := h.invoiceCount(ctx)
-	h.expect("generate/all_three", countAfterFirst == 3,
-		fmt.Sprintf("%d invoices", countAfterFirst), "3 invoices")
-
-	// Second run: dunning_runs already holds today's GENERATE row, so this
-	// must be a no-op. Without that guard a restart on the 1st would
-	// re-message every customer.
-	if err := h.br.RunPhase(ctx, "GENERATE", testMonth); err != nil {
-		h.fail("generate/rerun", err.Error())
-	}
-	h.expect("generate/idempotent", h.invoiceCount(ctx) == countAfterFirst,
-		fmt.Sprintf("%d invoices", h.invoiceCount(ctx)),
-		fmt.Sprintf("%d (unchanged)", countAfterFirst))
-
-	// One customer pays straight away — they must not be chased below.
-	paidInv, err := h.invoiceFor(ctx, paidCust)
-	if err != nil {
-		h.fail("setup/paid_invoice", err.Error())
-	} else if _, err := db.Exec(ctx,
-		`UPDATE invoices SET status = 'PAID_CASH', paid_at = NOW() WHERE id = $1::uuid`, paidInv.id); err != nil {
-		h.fail("setup/mark_paid", err.Error())
-	}
-
-	// ---------------------------------------------------------------------
-	// Phase 2 — REMIND
-	// ---------------------------------------------------------------------
-
-	fmt.Println("\nPhase 2 — remind")
-
-	if err := h.br.RunPhase(ctx, "REMIND", testMonth); err != nil {
-		h.fail("remind/run", err.Error())
-	}
-
-	inv, err = h.invoiceFor(ctx, activeCust)
-	if err != nil {
-		h.fail("remind/read", err.Error())
-	} else {
-		h.expect("remind/marked", inv.lastReminder != nil,
-			fmt.Sprintf("last_reminder_on=%s", derefOr(inv.lastReminder, "<nil>")), "today's date")
-		h.expect("remind/counted", inv.reminderCount == 1,
-			fmt.Sprintf("count=%d", inv.reminderCount), "1")
-	}
-
-	// Same day again: last_reminder_on excludes it. This is what stops the
-	// hourly ticker sending 24 reminders a day.
-	if err := h.br.RunPhase(ctx, "REMIND", testMonth); err != nil {
-		h.fail("remind/rerun", err.Error())
-	}
-	inv, _ = h.invoiceFor(ctx, activeCust)
-	h.expect("remind/idempotent", inv.reminderCount == 1,
-		fmt.Sprintf("count=%d", inv.reminderCount), "1 (unchanged)")
-
-	paidInv, _ = h.invoiceFor(ctx, paidCust)
-	h.expect("remind/skips_paid", paidInv.reminderCount == 0,
-		fmt.Sprintf("count=%d", paidInv.reminderCount), "0")
-
-	// ---------------------------------------------------------------------
-	// Phase 3 — SUSPEND
-	// ---------------------------------------------------------------------
-
-	fmt.Println("\nPhase 3 — suspend")
-
-	if err := h.br.RunPhase(ctx, "SUSPEND", testMonth); err != nil {
-		h.fail("suspend/run", err.Error())
-	}
-
-	cs, err := h.customerFor(ctx, activeCust)
-	if err != nil {
-		h.fail("suspend/read", err.Error())
-	} else {
-		h.expect("suspend/status", cs.status == "suspended", cs.status, "suspended")
-		h.expect("suspend/inactive", !cs.isActive,
-			fmt.Sprintf("is_active=%v", cs.isActive), "false")
-		// The point of not clearing routing: resuming should be one flag
-		// flip, not an admin re-routing them from scratch.
-		h.expect("suspend/keeps_stop_order", cs.stopOrder == 7,
-			fmt.Sprintf("stop_order=%d", cs.stopOrder), "7")
-		h.expect("suspend/keeps_route", cs.routeID != nil,
-			fmt.Sprintf("route_id=%s", derefOr(cs.routeID, "<nil>")), "unchanged")
-		h.expect("suspend/records_prior", derefOr(cs.beforeSusp, "") == "active",
-			fmt.Sprintf("before=%s", derefOr(cs.beforeSusp, "<nil>")), "active")
-	}
-
-	ps, err := h.customerFor(ctx, pausedCust)
-	if err != nil {
-		h.fail("suspend/paused_read", err.Error())
-	} else {
-		h.expect("suspend/paused_suspended", ps.status == "suspended", ps.status, "suspended")
-		h.expect("suspend/paused_records_prior", derefOr(ps.beforeSusp, "") == "disabled",
-			fmt.Sprintf("before=%s", derefOr(ps.beforeSusp, "<nil>")), "disabled")
-	}
-
-	pc, err := h.customerFor(ctx, paidCust)
-	if err != nil {
-		h.fail("suspend/paid_read", err.Error())
-	} else {
-		h.expect("suspend/skips_paid", pc.status == "active", pc.status, "active")
-	}
-
-	// Running again must not re-notify; status is already 'suspended'.
-	if err := h.br.RunPhase(ctx, "SUSPEND", testMonth); err != nil {
-		h.fail("suspend/rerun", err.Error())
-	}
-	cs, _ = h.customerFor(ctx, activeCust)
-	h.expect("suspend/idempotent", cs.status == "suspended", cs.status, "suspended")
-
-	// ---------------------------------------------------------------------
-	// Phase 4 — resume on payment
-	// ---------------------------------------------------------------------
-
-	fmt.Println("\nPhase 4 — resume on payment")
-
-	activeInv, err := h.invoiceFor(ctx, activeCust)
-	if err != nil {
-		h.fail("resume/read_invoice", err.Error())
-	} else {
-		if _, err := db.Exec(ctx,
-			`UPDATE invoices SET status = 'PAID_ONLINE', paid_at = NOW() WHERE id = $1::uuid`, activeInv.id); err != nil {
-			h.fail("resume/mark_paid", err.Error())
-		}
-		resumed, err := h.br.ResumeIfSuspended(ctx, activeInv.id)
-		if err != nil {
-			h.fail("resume/call", err.Error())
-		} else {
-			h.expect("resume/reported", resumed, fmt.Sprintf("resumed=%v", resumed), "true")
-		}
-		cs, _ = h.customerFor(ctx, activeCust)
-		h.expect("resume/status", cs.status == "active", cs.status, "active")
-		h.expect("resume/active", cs.isActive, fmt.Sprintf("is_active=%v", cs.isActive), "true")
-		h.expect("resume/clears_prior", cs.beforeSusp == nil,
-			fmt.Sprintf("before=%s", derefOr(cs.beforeSusp, "<nil>")), "<nil>")
-	}
-
-	// The case this harness exists for. A customer who paused for a holiday,
-	// was suspended over an unpaid bill, and then paid, must go back to
-	// 'disabled'. Returning them to 'active' would deliver milk to an empty
-	// house because they settled a debt.
-	pausedInv, err := h.invoiceFor(ctx, pausedCust)
-	if err != nil {
-		h.fail("resume/paused_read", err.Error())
-	} else {
-		if _, err := db.Exec(ctx,
-			`UPDATE invoices SET status = 'PAID_ONLINE', paid_at = NOW() WHERE id = $1::uuid`, pausedInv.id); err != nil {
-			h.fail("resume/paused_mark_paid", err.Error())
-		}
-		resumed, err := h.br.ResumeIfSuspended(ctx, pausedInv.id)
-		if err != nil {
-			h.fail("resume/paused_call", err.Error())
-		} else {
-			// Suspension lifted, but they are NOT back in service — so the
-			// caller must not send a "deliveries resumed" message.
-			h.expect("resume/paused_not_resumed", !resumed,
-				fmt.Sprintf("resumed=%v", resumed), "false")
-		}
-		ps, _ = h.customerFor(ctx, pausedCust)
-		h.expect("resume/paused_back_to_disabled", ps.status == "disabled", ps.status, "disabled")
-		h.expect("resume/paused_stays_inactive", !ps.isActive,
-			fmt.Sprintf("is_active=%v", ps.isActive), "false")
-	}
-
-	// ---------------------------------------------------------------------
-	// Summary
-	// ---------------------------------------------------------------------
+	h.scenarioActive(ctx)
+	h.scenarioPaused(ctx)
+	h.scenarioPaid(ctx)
 
 	var failed int
 	for _, r := range h.results {
@@ -563,19 +696,21 @@ func main() {
 		}
 	}
 
-	fmt.Printf("\n%s\n", strings.Repeat("─", 68))
+	fmt.Printf("\n%s\n", strings.Repeat("─", 72))
 	if failed == 0 {
 		fmt.Printf("\033[32m%d/%d assertions passed.\033[0m\n", len(h.results), len(h.results))
 	} else {
 		fmt.Printf("\033[31m%d of %d assertions FAILED:\033[0m\n", failed, len(h.results))
 		for _, r := range h.results {
 			if !r.passed {
-				fmt.Printf("  • %-34s %s\n", r.name, r.detail)
+				fmt.Printf("  • %-36s %s\n", r.name, r.detail)
 			}
 		}
 	}
 
-	teardown()
+	if *flagKeep {
+		fmt.Printf("\n-keep: scenario 3 fixtures left in place on %s, month %s.\n", phone, testMonth)
+	}
 	fmt.Println()
 
 	if failed > 0 {

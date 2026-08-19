@@ -318,13 +318,17 @@ func (br BillingResource) dunningSuspend(ctx context.Context, now time.Time, mon
 		// customer who was 'disabled' (their own holiday pause) and owed
 		// money must return to 'disabled' when they pay, not to 'active' —
 		// settling a bill is not a request to restart deliveries.
+		// NOTE: no updated_at here. The customers table doesn't have one —
+		// unlike subscriptions, invoices and delivery_logs, which all do.
+		// Setting it silently fails the whole UPDATE with SQLSTATE 42703 and
+		// the suspension never happens, while the sweeper logs a warning
+		// nobody reads.
 		if _, err := br.DB.Exec(ctx, `
 			UPDATE customers c
 			SET is_active = false,
 			    status_before_suspension = c.status,
 			    status = 'suspended',
-			    suspended_for_invoice_id = $1::uuid,
-			    updated_at = NOW()
+			    suspended_for_invoice_id = $1::uuid
 			FROM invoices i
 			WHERE i.id = $1::uuid AND c.id = i.customer_id
 		`, t.InvoiceID); err != nil {
@@ -423,8 +427,7 @@ func (br BillingResource) ResumeIfSuspended(ctx context.Context, invoiceID strin
 		SET status = COALESCE(status_before_suspension, 'active'),
 		    is_active = (COALESCE(status_before_suspension, 'active') = 'active'),
 		    status_before_suspension = NULL,
-		    suspended_for_invoice_id = NULL,
-		    updated_at = NOW()
+		    suspended_for_invoice_id = NULL
 		WHERE status = 'suspended'
 		  AND suspended_for_invoice_id = $1::uuid
 		RETURNING status
