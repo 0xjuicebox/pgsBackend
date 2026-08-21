@@ -357,7 +357,7 @@
 
     <div class="notice info" id="slotNotice" style="display:none">
       <span>💡</span>
-      <div>Pick at least one delivery slot to continue.</div>
+      <div>Choose one delivery slot to continue — morning or evening.</div>
     </div>
   </section>
 
@@ -663,7 +663,25 @@ function buildSlots() {
       '<div class="slot-title"><strong>' + slot.title + '</strong><small>' + slot.sub + '</small></div>' +
       '<div class="switch"></div>';
     head.addEventListener('click', () => {
-      s.on = !s.on;
+      // ONE SLOT PER CUSTOMER (v1).
+      //
+      // Turning a slot on turns the other one off. A customer subscribes to
+      // either the morning round or the evening round, not both — routes are
+      // planned per slot, and allowing both doubles the routing work for a
+      // pilot that runs on one or two routes.
+      //
+      // Enforced again server-side: this is a convenience, not a guarantee,
+      // since anyone can post to the endpoint directly.
+      const turningOn = !s.on;
+      if (turningOn) {
+        SLOTS.forEach(other => {
+          if (other.key === slot.key) return;
+          state.slots[other.key].on = false;
+          const otherCard = container.querySelector('[data-slot="' + other.key + '"]');
+          if (otherCard) otherCard.classList.remove('on');
+        });
+      }
+      s.on = turningOn;
       card.classList.toggle('on', s.on);
       refreshSummary();
     });

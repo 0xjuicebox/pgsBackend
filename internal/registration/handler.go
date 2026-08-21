@@ -125,6 +125,22 @@ func (rr Resource) Submit(w http.ResponseWriter, r *http.Request) {
 	}
 	payload.normalize()
 
+	// ONE SLOT PER CUSTOMER (v1).
+	//
+	// Routes are planned per slot, and a pilot running on one or two routes
+	// can't absorb the routing work of customers on both. The registration
+	// form enforces this with mutually exclusive toggles, but the form is
+	// only a convenience — the endpoint is reachable directly, and a stale
+	// cached page would still post two.
+	//
+	// Rejected rather than silently truncated: picking one for the customer
+	// would deliver milk at a time they didn't choose, and they'd have no way
+	// to tell that's what happened.
+	if len(payload.Subscriptions) > 1 {
+		http.Error(w, "Please choose just one delivery slot — morning or evening. You can change it later on WhatsApp.", http.StatusBadRequest)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 

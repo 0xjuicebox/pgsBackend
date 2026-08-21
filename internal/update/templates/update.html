@@ -454,6 +454,8 @@ function buildSlots() {
     const s = state.slots[slot.key];
     const card = document.createElement('div');
     card.className = 'slot-card' + (s.on ? ' on' : '');
+    // Needed so the mutual-exclusion handler below can find the sibling card.
+    card.dataset.slot = slot.key;
 
     const head = document.createElement('div');
     head.className = 'slot-head';
@@ -461,7 +463,21 @@ function buildSlots() {
       '<div class="slot-title"><strong>' + slot.title + '</strong><small>' + slot.sub + '</small></div>' +
       '<div class="switch"></div>';
     head.addEventListener('click', () => {
-      s.on = !s.on;
+      // ONE SLOT PER CUSTOMER (v1) — same rule as registration.
+      //
+      // This form is the other way a second slot could appear: a customer who
+      // registered for mornings could otherwise switch evenings on here and
+      // end up with both. Turning one on turns the other off.
+      const turningOn = !s.on;
+      if (turningOn) {
+        SLOTS.forEach(other => {
+          if (other.key === slot.key) return;
+          state.slots[other.key].on = false;
+          const otherCard = container.querySelector('[data-slot="' + other.key + '"]');
+          if (otherCard) otherCard.classList.remove('on');
+        });
+      }
+      s.on = turningOn;
       card.classList.toggle('on', s.on);
       validate();
     });

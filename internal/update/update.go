@@ -272,6 +272,16 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ONE SLOT PER CUSTOMER (v1) — same rule as registration.
+	//
+	// This endpoint is the other route to a second slot: a customer who
+	// registered for mornings could otherwise add evenings here. The form
+	// enforces it with mutually exclusive toggles; this is the guarantee.
+	if len(payload.Subscriptions) > 1 {
+		http.Error(w, "Please choose just one delivery slot — morning or evening.", http.StatusBadRequest)
+		return
+	}
+
 	var customerID string
 	var currentAddress, currentLat, currentLng string
 	err = ur.DB.QueryRow(ctx, `
