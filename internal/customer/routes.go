@@ -6,11 +6,15 @@ package customer
 // internal/subscription for that half.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/0xjuicebox/pgsBackend/middleware"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
@@ -51,6 +55,11 @@ type Customer struct {
 type CustomerResource struct {
 	DB       *pgxpool.Pool
 	WhatsApp *notification.WhatsAppService
+	// Templates carries the approved Twilio content template SIDs. Approval
+	// and rejection happen whenever an admin gets to the queue — possibly
+	// days after the customer registered — so both must be templates or they
+	// silently never arrive.
+	Templates notification.TemplateSIDs
 }
 
 func (cr CustomerResource) Routes() chi.Router {
@@ -337,6 +346,27 @@ func (cr CustomerResource) Approve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// priorStatus distinguishes a brand-new customer from one coming back
+	// after a pause. Both land here — RESUME sets status to 'pending' and an
+	// admin approves it through this same endpoint — but they need different
+	// messages. Telling a six-month customer their "registration has been
+	// approved" reads as though we'd lost their account.
+	// Read the status before changing it. Both a brand-new registration and a
+	// customer returning from a pause arrive here as 'pending' — RESUME sets
+	// that status and an admin approves it through this same endpoint — so
+	// the prior value is the only way to tell them apart, and they need
+	// different messages.
+	//
+	// Read separately rather than via a subquery in RETURNING: that would
+	// work, but only because of statement-snapshot semantics, which is not
+	// something the next reader should have to know.
+	var priorStatus string
+	if err := tx.QueryRow(r.Context(),
+		`SELECT status FROM customers WHERE id = $1`, id).Scan(&priorStatus); err != nil && err != pgx.ErrNoRows {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	var phoneNumber, name string
 	err = tx.QueryRow(r.Context(), `
 		UPDATE customers
@@ -360,9 +390,7 @@ func (cr CustomerResource) Approve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cr.WhatsApp != nil {
-		if notifyErr := cr.WhatsApp.SendApprovalNotification(phoneNumber, name); notifyErr != nil {
-			fmt.Printf("❌ Failed to send approval notification to %s: %v\n", phoneNumber, notifyErr)
-		}
+		cr.notifyApproved(r.Context(), id, phoneNumber, name, priorStatus)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -407,9 +435,7 @@ func (cr CustomerResource) Reject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cr.WhatsApp != nil {
-		if notifyErr := cr.WhatsApp.SendRejectionNotification(phoneNumber, name, req.Reason); notifyErr != nil {
-			fmt.Printf("❌ Failed to send rejection notification to %s: %v\n", phoneNumber, notifyErr)
-		}
+		cr.notifyDeclined(phoneNumber, name, req.Reason)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -423,4 +449,139 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(body)
+}
+
+// -------------------------------------------------------------------------
+// Approval and decline notifications
+// -------------------------------------------------------------------------
+
+// notifyApproved tells a customer their account is live, and when milk
+// actually starts.
+//
+// priorStatus decides which message: 'disabled' means they were paused and
+// are coming back, anything else means this is their first approval. Both
+// paths carry the first delivery date and the order, because "you're
+// approved" on its own left the customer guessing whether to buy milk that
+// evening.
+//
+// Falls back to the old free-form message when a template isn't configured —
+// which still works inside WhatsApp's 24-hour window, just not outside it.
+func (cr CustomerResource) notifyApproved(ctx context.Context, customerID, phone, name, priorStatus string) {
+	slots, err := schedule.LoadSlots(ctx, cr.DB, customerID)
+	if err != nil {
+		fmt.Printf("⚠️ notifyApproved: couldn't load schedule for %s: %v\n", customerID, err)
+	}
+
+	firstDelivery := schedule.FirstDeliveryLabel(slots, time.Now())
+	order := cr.orderSummary(ctx, customerID)
+
+	resuming := priorStatus == "disabled"
+
+	sid := cr.Templates.RegApproved
+	if resuming {
+		sid = cr.Templates.ResumeApproved
+	}
+
+	if sid != "" {
+		var err error
+		if resuming {
+			err = cr.WhatsApp.SendResumeApproved(phone, sid, name, firstDelivery, order)
+		} else {
+			err = cr.WhatsApp.SendRegistrationApproved(phone, sid, name, firstDelivery, order)
+		}
+		if err == nil {
+			return
+		}
+		fmt.Printf("⚠️ approval template failed for %s, falling back: %v\n", phone, err)
+	}
+
+	if err := cr.WhatsApp.SendApprovalNotification(phone, name); err != nil {
+		fmt.Printf("❌ Failed to send approval notification to %s: %v\n", phone, err)
+	}
+}
+
+func (cr CustomerResource) notifyDeclined(phone, name, reason string) {
+	if cr.Templates.RegDeclined != "" {
+		if err := cr.WhatsApp.SendRegistrationDeclined(
+			phone, cr.Templates.RegDeclined, name, reason); err == nil {
+			return
+		} else {
+			fmt.Printf("⚠️ decline template failed for %s, falling back: %v\n", phone, err)
+		}
+	}
+	if err := cr.WhatsApp.SendRejectionNotification(phone, name, reason); err != nil {
+		fmt.Printf("❌ Failed to send rejection notification to %s: %v\n", phone, err)
+	}
+}
+
+// orderSummary renders a customer's standing order as one comma-separated
+// line: "Milk 2 L, Curd 500 g".
+//
+// Single line, not bulleted: this goes into a WhatsApp template variable, and
+// Meta rejects any parameter containing a newline.
+func (cr CustomerResource) orderSummary(ctx context.Context, customerID string) string {
+	type item struct {
+		label string
+		col   string
+		litre bool
+	}
+	items := []item{
+		{"Milk", "default_milk_qty", true},
+		{"Curd", "default_curd_qty", true},
+		{"Buttermilk", "default_lassi_qty", true},
+		{"Mustard Oil", "default_oil_qty", true},
+		{"Butter", "default_butter_qty", false},
+		{"Ghee", "default_ghee_qty", false},
+		{"Paneer", "default_paneer_qty", false},
+		{"Jaggery", "default_jaggery_qty", false},
+		{"Desi Khand", "default_khand_qty", false},
+		{"Atta", "default_atta_qty", false},
+		{"Burfi", "default_burfi_qty", false},
+	}
+
+	cols := make([]string, len(items))
+	for i, it := range items {
+		cols[i] = "COALESCE(SUM(" + it.col + "),0)"
+	}
+
+	row := cr.DB.QueryRow(ctx,
+		"SELECT "+strings.Join(cols, ", ")+" FROM subscriptions WHERE customer_id = $1", customerID)
+
+	vals := make([]int, len(items))
+	ptrs := make([]any, len(items))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := row.Scan(ptrs...); err != nil {
+		fmt.Printf("⚠️ orderSummary: %v\n", err)
+		return "your usual order"
+	}
+
+	var parts []string
+	for i, it := range items {
+		if vals[i] <= 0 {
+			continue
+		}
+		parts = append(parts, it.label+" "+formatBaseQty(vals[i], it.litre))
+	}
+	if len(parts) == 0 {
+		return "your usual order"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// formatBaseQty converts a base-unit quantity to how a customer reads it:
+// 500 -> "500 ml", 2000 -> "2 L".
+func formatBaseQty(v int, litre bool) string {
+	if v < 1000 {
+		if litre {
+			return fmt.Sprintf("%d ml", v)
+		}
+		return fmt.Sprintf("%d g", v)
+	}
+	unit := "kg"
+	if litre {
+		unit = "L"
+	}
+	return strings.TrimSuffix(fmt.Sprintf("%.2f", float64(v)/1000), ".00") + " " + unit
 }

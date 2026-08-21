@@ -22,6 +22,7 @@ import (
 	"github.com/0xjuicebox/pgsBackend/internal/stats"
 	"github.com/0xjuicebox/pgsBackend/internal/subscription"
 	"github.com/0xjuicebox/pgsBackend/internal/update"
+	"github.com/0xjuicebox/pgsBackend/internal/web"
 	"github.com/0xjuicebox/pgsBackend/internal/webhook"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -153,7 +154,7 @@ func main() {
 	}
 
 	// Resources
-	cr := customer.CustomerResource{DB: pool, WhatsApp: whatsApp}
+	cr := customer.CustomerResource{DB: pool, WhatsApp: whatsApp, Templates: templates}
 	rr := route.RouteResource{DB: pool}
 	dr := driver.DriverResource{DB: pool}
 	dlr := delivery.DeliveryResource{DB: pool, WhatsApp: whatsApp, Templates: templates}
@@ -284,6 +285,22 @@ func main() {
 
 	// POST /payment/razorpay — the gateway's webhook lands here.
 	r.Mount("/payment", pay.Routes())
+
+	// Public site: landing page and the commerce policies.
+	//
+	// Mounted at the root and LAST, so every specific path above wins. chi
+	// resolves the more specific pattern first, but ordering this deliberately
+	// keeps the routing readable.
+	//
+	// Razorpay will not enable live API keys until a website has been
+	// submitted and approved, and a reviewer opens the URL. Before this, / was
+	// a 404 — which reads as a dead service.
+	businessInfo := web.LoadBusinessInfo()
+	if missing := businessInfo.Missing(); len(missing) > 0 {
+		log.Printf("⚠️  Public site fields not set: %s — these render as [NOT SET] and must be filled before submitting the site to Razorpay.",
+			strings.Join(missing, ", "))
+	}
+	web.Resource{Info: businessInfo}.RegisterOn(r)
 
 	// GET /pay/{invoiceID} — the customer-facing hosted bill.
 	//

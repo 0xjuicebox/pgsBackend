@@ -43,6 +43,19 @@ type TemplateSIDs struct {
 	Suspension      string // account paused:  {{1}} name {{2}} month {{3}} total {{4}} invoiceID
 	DeliveryDone    string // delivered:       {{1}} slot {{2}} items (single line)
 	PaymentReceipt  string // payment landed:  {{1}} name {{2}} amount {{3}} month
+
+	// Admin-triggered. Every one of these fires whenever an admin gets round
+	// to the review, which may be days after the customer acted — so all of
+	// them must be templates or they silently never arrive.
+	RegApproved    string // {{1}} name {{2}} first delivery {{3}} order
+	RegDeclined    string // {{1}} name {{2}} reason
+	ChangeApproved string // {{1}} name {{2}} slot {{3}} start date {{4}} order
+	ChangeDeclined string // {{1}} name {{2}} reason
+	IssueResolved  string // {{1}} name {{2}} what changed {{3}} outcome sentence
+	Resumed        string // {{1}} name {{2}} amount {{3}} month {{4}} next delivery
+	BillCorrected  string // {{1}} name {{2}} month {{3}} new total {{4}} invoiceID
+	ResumeApproved string // {{1}} name {{2}} first delivery {{3}} order
+	DeliveryFailed string // {{1}} slot {{2}} reason sentence
 }
 
 // LoadTemplateSIDs reads the SIDs from the environment.
@@ -59,6 +72,16 @@ func LoadTemplateSIDs() TemplateSIDs {
 		Suspension:      os.Getenv("WHATSAPP_TEMPLATE_SUSPENSION"),
 		DeliveryDone:    os.Getenv("WHATSAPP_TEMPLATE_DELIVERY"),
 		PaymentReceipt:  os.Getenv("WHATSAPP_TEMPLATE_RECEIPT"),
+
+		RegApproved:    os.Getenv("WHATSAPP_TEMPLATE_REG_APPROVED"),
+		RegDeclined:    os.Getenv("WHATSAPP_TEMPLATE_REG_DECLINED"),
+		ChangeApproved: os.Getenv("WHATSAPP_TEMPLATE_CHANGE_APPROVED"),
+		ChangeDeclined: os.Getenv("WHATSAPP_TEMPLATE_CHANGE_DECLINED"),
+		IssueResolved:  os.Getenv("WHATSAPP_TEMPLATE_ISSUE_RESOLVED"),
+		Resumed:        os.Getenv("WHATSAPP_TEMPLATE_RESUMED"),
+		BillCorrected:  os.Getenv("WHATSAPP_TEMPLATE_BILL_CORRECTED"),
+		ResumeApproved: os.Getenv("WHATSAPP_TEMPLATE_RESUME_APPROVED"),
+		DeliveryFailed: os.Getenv("WHATSAPP_TEMPLATE_DELIVERY_ISSUE"),
 	}
 }
 
@@ -74,6 +97,16 @@ func (t TemplateSIDs) TemplateHealth() []string {
 		"suspension": t.Suspension,
 		"delivery":   t.DeliveryDone,
 		"receipt":    t.PaymentReceipt,
+
+		"reg-approved":    t.RegApproved,
+		"reg-declined":    t.RegDeclined,
+		"change-approved": t.ChangeApproved,
+		"change-declined": t.ChangeDeclined,
+		"issue-resolved":  t.IssueResolved,
+		"resumed":         t.Resumed,
+		"bill-corrected":  t.BillCorrected,
+		"resume-approved": t.ResumeApproved,
+		"delivery-failed": t.DeliveryFailed,
 	} {
 		if sid == "" || strings.HasPrefix(sid, "REPLACE_WITH") {
 			missing = append(missing, name)
@@ -206,4 +239,100 @@ func sanitizeTemplateVar(v string) string {
 		v = strings.ReplaceAll(v, "  ", " ")
 	}
 	return strings.TrimSpace(v)
+}
+
+// -------------------------------------------------------------------------
+// Admin-triggered templates
+// -------------------------------------------------------------------------
+
+// sendVars is the shared path for every template below. Positional arguments
+// are numbered 1..n in order, matching how Twilio's Content Builder numbers
+// them, so the call site reads in the same order as the approved body.
+func (s *WhatsAppService) sendVars(toPhone, sid, kind string, values ...string) error {
+	if !templateConfigured(sid) {
+		return fmt.Errorf("%s template SID not configured", kind)
+	}
+	vars := make(map[string]string, len(values))
+	for i, v := range values {
+		vars[fmt.Sprintf("%d", i+1)] = sanitizeTemplateVar(v)
+	}
+	payload, err := json.Marshal(vars)
+	if err != nil {
+		return fmt.Errorf("marshalling %s template variables: %w", kind, err)
+	}
+	return s.SendContentTemplate(toPhone, sid, string(payload))
+}
+
+// SendRegistrationApproved — a new customer is on the round.
+//
+// firstDelivery and order are what make this useful. "You're approved" alone
+// left the customer guessing whether milk arrived that evening or in three
+// days, which is a support call either way.
+func (s *WhatsAppService) SendRegistrationApproved(toPhone, sid, name, firstDelivery, order string) error {
+	return s.sendVars(toPhone, sid, "reg-approved", firstName(name), firstDelivery, order)
+}
+
+// SendRegistrationDeclined — reason is admin-typed, so sanitising matters
+// most here: a pasted reason containing a line break would otherwise fail the
+// send outright and the customer would hear nothing at all.
+func (s *WhatsAppService) SendRegistrationDeclined(toPhone, sid, name, reason string) error {
+	return s.sendVars(toPhone, sid, "reg-declined", firstName(name), reason)
+}
+
+// SendChangeApproved — echoes the approved order back.
+//
+// That echo is the customer's only chance to notice an admin approving 1.5 L
+// when they asked for 1 L. Without it the error surfaces a month later on a
+// bill.
+func (s *WhatsAppService) SendChangeApproved(toPhone, sid, name, slot, startDate, order string) error {
+	return s.sendVars(toPhone, sid, "change-approved", firstName(name), slot, startDate, order)
+}
+
+func (s *WhatsAppService) SendChangeDeclined(toPhone, sid, name, reason string) error {
+	return s.sendVars(toPhone, sid, "change-declined", firstName(name), reason)
+}
+
+// SendIssueResolved — outcome is a complete sentence, not an amount.
+//
+// That lets one template cover a bill correction, a replacement, and "no
+// change was needed". Modelling it as a number would mean complaints resolved
+// by explanation close silently, which is the fastest way to make a customer
+// feel ignored after they took the trouble to report something.
+func (s *WhatsAppService) SendIssueResolved(toPhone, sid, name, whatChanged, outcome string) error {
+	return s.sendVars(toPhone, sid, "issue-resolved", firstName(name), whatChanged, outcome)
+}
+
+// SendResumedAfterPayment — a suspended customer paid and is back on the round.
+//
+// The most important template in the system to get right. The customer paid
+// by tapping a link in a suspension message, which means they have NOT
+// messaged us — so the free-form version this replaces had no open 24-hour
+// window and was silently dropped, at the exact moment someone had just given
+// us money and was waiting to hear service was restored.
+func (s *WhatsAppService) SendResumedAfterPayment(toPhone, sid, name, amount, month, nextDelivery string) error {
+	return s.sendVars(toPhone, sid, "resumed", firstName(name), amount, month, nextDelivery)
+}
+
+// SendBillCorrected — carries the pay button, so the customer doesn't have to
+// scroll back through WhatsApp hunting for the original bill.
+func (s *WhatsAppService) SendBillCorrected(toPhone, sid, name, month, newTotal, invoiceID string) error {
+	return s.sendVars(toPhone, sid, "bill-corrected", firstName(name), month, newTotal, invoiceID)
+}
+
+// SendResumeApproved — deliveries restarting after a customer-requested pause.
+//
+// Distinct from SendRegistrationApproved, which this used to borrow: telling
+// a six-month customer that their "registration has been approved" reads as
+// though we'd lost their account.
+func (s *WhatsAppService) SendResumeApproved(toPhone, sid, name, firstDelivery, order string) error {
+	return s.sendVars(toPhone, sid, "resume-approved", firstName(name), firstDelivery, order)
+}
+
+// SendDeliveryFailed — a stop that could not be completed.
+//
+// No name variable: this may go to several customers at once when a round is
+// disrupted, and it reads better without. Previously nothing was sent at all,
+// so the customer simply got no milk and no explanation.
+func (s *WhatsAppService) SendDeliveryFailed(toPhone, sid, slot, reason string) error {
+	return s.sendVars(toPhone, sid, "delivery-failed", slot, reason)
 }
