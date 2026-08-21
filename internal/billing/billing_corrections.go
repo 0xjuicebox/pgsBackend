@@ -261,6 +261,24 @@ func (br BillingResource) notifyRevisedBill(t CustomerTally, month string, oldAm
 		labelForMonth(month), t.CustomerName, direction, diff, oldAmount, t.TotalAmount, payLine,
 	)
 
+	// Template first: a bill correction follows an admin action that may
+	// happen days after the original complaint, so the customer has usually
+	// not messaged us and the free-form version below would be dropped.
+	//
+	// The template carries the pay button, which the free-form message can
+	// only approximate with a bare URL — and without it the customer has to
+	// scroll back through WhatsApp hunting for the original bill.
+	if br.Templates.BillCorrected != "" {
+		if err := br.WhatsApp.SendBillCorrected(
+			phone, br.Templates.BillCorrected,
+			t.CustomerName, labelForMonth(month), formatAmount(t.TotalAmount), invoiceID,
+		); err == nil {
+			return
+		} else {
+			fmt.Printf("⚠️ bill-corrected template failed for %s, falling back: %v\n", phone, err)
+		}
+	}
+
 	if err := br.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {
 		fmt.Printf("⚠️ notifyRevisedBill: send failed for %s: %v\n", phone, err)
 	}

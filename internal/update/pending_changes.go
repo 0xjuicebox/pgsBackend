@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -212,12 +213,11 @@ func (ur UpdateResource) ApprovePendingChange(w http.ResponseWriter, r *http.Req
 	}
 
 	if ur.WhatsApp != nil {
-		msg := fmt.Sprintf(
-			"✅ Hello %s, your requested changes have been approved.\n\n"+
-				"They take effect from *tomorrow*. Today's delivery goes ahead on your existing order.",
-			name,
-		)
-		go ur.WhatsApp.SendDeliveryUpdate(phone, msg)
+		// Fired in the background so a slow Twilio call doesn't hold up the
+		// admin's response. Reads the applied order from the staged payload
+		// rather than from subscriptions, because the change hasn't been
+		// applied yet — the sweeper does that tomorrow.
+		go ur.notifyChangeApproved(customerID.String(), phone, name, tomorrow)
 	}
 
 	writeJSONUpdate(w, http.StatusOK, map[string]string{
@@ -274,7 +274,7 @@ func (ur UpdateResource) RejectPendingChange(w http.ResponseWriter, r *http.Requ
 				"If you'd like to discuss this or stop your deliveries instead, please reply here and our team will help.",
 			name, req.Reason,
 		)
-		go ur.WhatsApp.SendDeliveryUpdate(phone, msg)
+		go ur.notifyChangeDeclined(phone, name, req.Reason, msg)
 	}
 
 	writeJSONUpdate(w, http.StatusOK, map[string]string{
@@ -479,4 +479,157 @@ func writeJSONUpdate(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(body)
+}
+
+// -------------------------------------------------------------------------
+// Change review notifications
+// -------------------------------------------------------------------------
+
+// notifyChangeApproved tells the customer their new order is confirmed, which
+// slot it applies to, when it starts, and what it actually is.
+//
+// The echo matters. If an admin approves 1.5 L when the customer asked for
+// 1 L, this message is the only place the customer could notice before the
+// difference turns up on a bill a month later.
+func (ur UpdateResource) notifyChangeApproved(customerID, phone, name, effectiveFrom string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	slotLabel, order := ur.stagedSummary(ctx, customerID)
+	startLabel := prettyDate(effectiveFrom)
+
+	if ur.Templates.ChangeApproved != "" {
+		if err := ur.WhatsApp.SendChangeApproved(
+			phone, ur.Templates.ChangeApproved, name, slotLabel, startLabel, order,
+		); err == nil {
+			return
+		} else {
+			fmt.Printf("⚠️ change-approved template failed for %s, falling back: %v\n", phone, err)
+		}
+	}
+
+	ur.WhatsApp.SendDeliveryUpdate(phone, fmt.Sprintf(
+		"✅ Hello %s, your requested changes have been approved.\n\n"+
+			"They take effect from *%s*. Today's delivery goes ahead on your existing order.",
+		name, startLabel,
+	))
+}
+
+func (ur UpdateResource) notifyChangeDeclined(phone, name, reason, fallbackMsg string) {
+	if ur.Templates.ChangeDeclined != "" {
+		if err := ur.WhatsApp.SendChangeDeclined(
+			phone, ur.Templates.ChangeDeclined, name, reason,
+		); err == nil {
+			return
+		} else {
+			fmt.Printf("⚠️ change-declined template failed for %s, falling back: %v\n", phone, err)
+		}
+	}
+	ur.WhatsApp.SendDeliveryUpdate(phone, fallbackMsg)
+}
+
+// stagedSummary reads the approved-but-not-yet-applied change and renders the
+// slot and the new order for the confirmation message.
+//
+// Reads pending_subscription_changes, not subscriptions: at this point the
+// change has been approved but the sweeper hasn't applied it, so the live
+// subscription still holds the OLD order. Reading that would confirm back to
+// the customer exactly what they asked to change away from.
+func (ur UpdateResource) stagedSummary(ctx context.Context, customerID string) (slotLabel, order string) {
+	var raw []byte
+	err := ur.DB.QueryRow(ctx, `
+		SELECT subscriptions FROM pending_subscription_changes
+		WHERE customer_id = $1 AND review_status = 'APPROVED'
+		ORDER BY reviewed_at DESC LIMIT 1
+	`, customerID).Scan(&raw)
+	if err != nil {
+		fmt.Printf("⚠️ stagedSummary: %v\n", err)
+		return "Your", "your new order"
+	}
+
+	var subs []struct {
+		Slot  string         `json:"slot"`
+		Items map[string]int `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &subs); err != nil || len(subs) == 0 {
+		return "Your", "your new order"
+	}
+
+	// Slot label: name it when there's exactly one, since the message reads
+	// "your Morning order change is approved".
+	slotLabel = "Your"
+	if len(subs) == 1 {
+		slotLabel = capitalise(subs[0].Slot)
+	}
+
+	// Items arrive keyed as milkQuantity/curdQuantity — the /update payload
+	// shape, which differs from /register's {milk: 2000}. Both are handled at
+	// the edges elsewhere; this is the third place that has to know.
+	labels := []struct {
+		key   string
+		label string
+		litre bool
+	}{
+		{"milkQuantity", "Milk", true},
+		{"curdQuantity", "Curd", true},
+		{"lassiQuantity", "Buttermilk", true},
+		{"oilQuantity", "Mustard Oil", true},
+		{"butterQuantity", "Butter", false},
+		{"gheeQuantity", "Ghee", false},
+		{"paneerQuantity", "Paneer", false},
+		{"jaggeryQuantity", "Jaggery", false},
+		{"khandQuantity", "Desi Khand", false},
+		{"attaQuantity", "Atta", false},
+		{"burfiQuantity", "Burfi", false},
+	}
+
+	totals := map[string]int{}
+	for _, sub := range subs {
+		for k, v := range sub.Items {
+			totals[k] += v
+		}
+	}
+
+	var parts []string
+	for _, l := range labels {
+		if totals[l.key] <= 0 {
+			continue
+		}
+		parts = append(parts, l.label+" "+formatBaseUnit(totals[l.key], l.litre))
+	}
+	if len(parts) == 0 {
+		return slotLabel, "no items — deliveries will stop"
+	}
+	return slotLabel, strings.Join(parts, ", ")
+}
+
+// capitalise upper-cases the first letter. strings.Title is deprecated and
+// does more than wanted here — slot values are always a single lowercase word.
+func capitalise(v string) string {
+	if v == "" {
+		return v
+	}
+	return strings.ToUpper(v[:1]) + v[1:]
+}
+
+func formatBaseUnit(v int, litre bool) string {
+	if v < 1000 {
+		if litre {
+			return fmt.Sprintf("%d ml", v)
+		}
+		return fmt.Sprintf("%d g", v)
+	}
+	unit := "kg"
+	if litre {
+		unit = "L"
+	}
+	return strings.TrimSuffix(fmt.Sprintf("%.2f", float64(v)/1000), ".00") + " " + unit
+}
+
+// prettyDate turns "2026-08-20" into "20 August" for customer copy.
+func prettyDate(ymd string) string {
+	if t, err := time.Parse("2006-01-02", ymd); err == nil {
+		return t.Format("2 January")
+	}
+	return ymd
 }

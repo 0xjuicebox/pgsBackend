@@ -19,6 +19,7 @@ import (
 	"github.com/0xjuicebox/pgsBackend/internal/payment"
 	"github.com/0xjuicebox/pgsBackend/internal/registration"
 	"github.com/0xjuicebox/pgsBackend/internal/route"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/0xjuicebox/pgsBackend/internal/stats"
 	"github.com/0xjuicebox/pgsBackend/internal/subscription"
 	"github.com/0xjuicebox/pgsBackend/internal/update"
@@ -162,7 +163,7 @@ func main() {
 	or := override.OverrideResource{DB: pool, WhatsApp: whatsApp}
 	wr := webhook.WhatsAppResource{WhatsApp: whatsApp, DB: pool}
 	regr := registration.Resource{DB: pool, WhatsApp: whatsApp}
-	ur := update.UpdateResource{DB: pool, WhatsApp: whatsApp}
+	ur := update.UpdateResource{DB: pool, WhatsApp: whatsApp, Templates: templates}
 	statsResource := stats.StatsResource{DB: pool}
 	br := billing.BillingResource{DB: pool, WhatsApp: whatsApp, Payment: pay, Templates: templates}
 
@@ -181,11 +182,11 @@ func main() {
 		cbCtx, cbCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cbCancel()
 
-		var phone, name, month string
+		var phone, name, month, customerID string
 		err := pool.QueryRow(cbCtx, `
-			SELECT c.phone_number, c.name, i.billing_month
+			SELECT c.phone_number, c.name, i.billing_month, c.id::text
 			FROM invoices i JOIN customers c ON c.id = i.customer_id
-			WHERE i.id = $1::uuid`, invoiceID).Scan(&phone, &name, &month)
+			WHERE i.id = $1::uuid`, invoiceID).Scan(&phone, &name, &month, &customerID)
 		if err != nil {
 			fmt.Printf("⚠️ payment receipt: couldn't load customer for invoice %s: %v\n", invoiceID, err)
 			return
@@ -211,16 +212,33 @@ func main() {
 		}
 		if resumed {
 			log.Printf("▶️  resumed suspended customer after payment on invoice %s", invoiceID)
-			// TODO: this is free-form and will silently fail outside the
-			// 24-hour window. A customer who paid by tapping the link in a
-			// suspension template has NOT messaged us, so there is usually no
-			// open window — this is exactly the send most likely to be
-			// dropped, at the moment the customer most needs confirmation.
-			// Replace with the approved "payment received & resumed" template
-			// once its SID is configured.
+
+			// The customer paid by tapping a link in a suspension template.
+			// They have NOT messaged us, so there is no open 24-hour window
+			// and the free-form version this replaces was silently dropped —
+			// at the exact moment someone had just handed over money and was
+			// waiting to hear their milk was coming back.
+			nextDelivery := "your next scheduled delivery"
+			if slots, serr := schedule.LoadSlots(cbCtx, pool, customerID); serr == nil {
+				nextDelivery = schedule.FirstDeliveryLabel(slots, time.Now())
+			} else {
+				fmt.Printf("⚠️ resume notice: couldn't load schedule for %s: %v\n", customerID, serr)
+			}
+
+			if templates.Resumed != "" {
+				if terr := whatsApp.SendResumedAfterPayment(
+					phone, templates.Resumed, name,
+					fmt.Sprintf("%.0f", amount), prettyMonth, nextDelivery,
+				); terr == nil {
+					return
+				} else {
+					fmt.Printf("⚠️ resumed template failed, falling back: %v\n", terr)
+				}
+			}
+
 			whatsApp.SendDeliveryUpdate(phone, fmt.Sprintf(
-				"✅ Payment received — thank you, %s!\n\nWe've received ₹%.0f for your %s bill, and your deliveries have been resumed. You're back on the round from the next delivery. 🥛",
-				name, amount, prettyMonth))
+				"✅ Payment received — thank you, %s!\n\nWe've received ₹%.0f for your %s bill, and your deliveries have been resumed. Your next delivery is %s. 🥛",
+				name, amount, prettyMonth, nextDelivery))
 			return
 		}
 

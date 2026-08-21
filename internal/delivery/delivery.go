@@ -1072,9 +1072,50 @@ func (dr DeliveryResource) notifyCorrection(
 		name, slotLabel, prettyDate, strings.Join(changes, "\n"), billLine,
 	)
 
+	// Template first: an admin resolves a complaint whenever they get to it,
+	// so the customer has usually not messaged us since reporting it and the
+	// free-form version would be dropped outside the 24-hour window.
+	//
+	// The outcome is passed as a complete sentence rather than an amount.
+	// That lets the one template cover a bill reduction, an increase, and a
+	// net-zero correction — without it, a complaint resolved by explanation
+	// closes silently and the customer never hears back at all.
+	if dr.Templates.IssueResolved != "" {
+		var outcome string
+		switch {
+		case amountAdjusted > 0:
+			outcome = fmt.Sprintf("Your bill has been reduced by ₹%.0f.", amountAdjusted)
+		case amountAdjusted < 0:
+			outcome = fmt.Sprintf("Your bill has been increased by ₹%.0f.", -amountAdjusted)
+		default:
+			outcome = "Your bill total is unchanged."
+		}
+
+		// Template variables cannot contain newlines, so the per-item changes
+		// collapse to one comma-separated line here.
+		whatChanged := fmt.Sprintf("%s delivery on %s — %s",
+			capitalise(slotLabel), prettyDate, strings.Join(changes, ", "))
+
+		if err := dr.WhatsApp.SendIssueResolved(
+			phone, dr.Templates.IssueResolved, name, whatChanged, outcome,
+		); err == nil {
+			return
+		} else {
+			fmt.Printf("⚠️ issue-resolved template failed for %s, falling back: %v\n", phone, err)
+		}
+	}
+
 	if err := dr.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {
 		fmt.Printf("⚠️ notifyCorrection: send failed for %s: %v\n", phone, err)
 	}
+}
+
+// capitalise upper-cases the first letter of a single lowercase word.
+func capitalise(v string) string {
+	if v == "" {
+		return v
+	}
+	return strings.ToUpper(v[:1]) + v[1:]
 }
 
 // -------------------------------------------------------------------------

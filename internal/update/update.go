@@ -25,6 +25,11 @@ var updateTmpl = template.Must(template.ParseFS(templatesFS, "templates/update.h
 type UpdateResource struct {
 	DB       *pgxpool.Pool
 	WhatsApp *notification.WhatsAppService
+	// Templates carries the approved Twilio content template SIDs. An admin
+	// reviews a change whenever they get to the queue, possibly a day or more
+	// after the customer submitted it — so both the approval and the decline
+	// must be templates or they silently never arrive.
+	Templates notification.TemplateSIDs
 }
 
 func (ur UpdateResource) Routes() chi.Router {
