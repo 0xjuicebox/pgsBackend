@@ -344,6 +344,26 @@ func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Convert leftover PENDING stops to UNATTEMPTED.
+	//
+	// Since manifest locking, rows exist from the slot's cutoff rather than
+	// being created here — the INSERT above now finds nothing to do on a
+	// locked round. A stop still marked PENDING when the round closes is
+	// exactly what UNATTEMPTED means: it was on the list and nobody reached
+	// it.
+	//
+	// Without this the stop would stay PENDING forever, showing on tomorrow's
+	// dashboard as a run still in progress and never counting as a miss.
+	if _, err := dr.DB.Exec(r.Context(), `
+		UPDATE delivery_logs
+		SET status = 'UNATTEMPTED', driver_id = COALESCE(driver_id, $4), updated_at = NOW()
+		WHERE route_id = $1 AND delivery_date = $2::date AND slot = $3
+		  AND status = 'PENDING'
+	`, routeID, targetDate, slot, driverID); err != nil {
+		http.Error(w, "Failed to close pending stops: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message": "Route closed successfully"}`))
 }

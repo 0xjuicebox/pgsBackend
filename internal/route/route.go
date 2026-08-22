@@ -66,6 +66,10 @@ func (rr RouteResource) Routes() chi.Router {
 		r.Put("/driver", rr.UpdateDriver)
 
 		r.Get("/manifest", rr.GetManifest)
+		// Admin correction to a locked manifest. A cutoff should stop
+		// customers changing their order, not stop the business fixing a
+		// mistake before the van leaves.
+		r.Put("/manifest/plan", rr.EditPlannedOrder)
 		r.Get("/roster", rr.GetRoster)
 	})
 
@@ -441,6 +445,15 @@ type ManifestStop struct {
 	DeliveryOrder customer.Order `json:"deliveryOrder"`
 	Status        *string        `json:"status"`
 	ActualOrder   customer.Order `json:"actualOrder"`
+
+	// Locked means this stop's plan was frozen at the slot's cutoff and is
+	// authoritative. False means the manifest is still being computed live —
+	// either the cutoff hasn't passed, or the date predates locking.
+	Locked bool `json:"locked"`
+	// PlanEdited means an admin changed the plan after it was locked. Shown
+	// to the driver so a list that changes mid-round reads as deliberate
+	// rather than as the app misbehaving.
+	PlanEdited bool `json:"planEdited"`
 }
 
 type ManifestResponse struct {
@@ -496,28 +509,42 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 		return manifest, err
 	}
 
-	// The big manifest query. Reads from subscriptions (route/stop/schedule/
-	// quantities), with override and delivery-log left joins, all filtered to
-	// the same slot.
+	// The big manifest query.
+	//
+	// The planned quantities now read locked plan FIRST, then override, then
+	// subscription default. That order is the whole point of manifest
+	// locking: once a round is frozen at its cutoff, delivery_logs.planned_order
+	// is the authoritative list, and later edits to a subscription must not
+	// retroactively change what the driver was asked to deliver.
+	//
+	// Without that precedence, paging back to a past date rebuilt the plan
+	// from TODAY's subscriptions — so a customer who changed their order last
+	// week saw this week's quantities against last week's date. The delivered
+	// column was right; the planned column was fiction.
+	//
+	// Unlocked rounds (before the cutoff, or dates predating this feature)
+	// fall through to the live computation exactly as before.
 	customerQuery := `
 		SELECT
 			c.id, c.name, c.phone_number, COALESCE(c.house_address, ''),
 			COALESCE(c.geo_latitude, ''), COALESCE(c.geo_longitude, ''),
 			c.is_active, s.stop_order,
 
-			COALESCE(o.new_milk_qty, s.default_milk_qty, 0),
-			COALESCE(o.new_curd_qty, s.default_curd_qty, 0),
-			COALESCE(o.new_butter_qty, s.default_butter_qty, 0),
-			COALESCE(o.new_ghee_qty, s.default_ghee_qty, 0),
-			COALESCE(o.new_lassi_qty, s.default_lassi_qty, 0),
-			COALESCE(o.new_paneer_qty, s.default_paneer_qty, 0),
-			COALESCE(o.new_jaggery_qty, s.default_jaggery_qty, 0),
-			COALESCE(o.new_khand_qty, s.default_khand_qty, 0),
-			COALESCE(o.new_oil_qty, s.default_oil_qty, 0),
-			COALESCE(o.new_atta_qty, s.default_atta_qty, 0),
-			COALESCE(o.new_burfi_qty, s.default_burfi_qty, 0),
+			COALESCE((dl.planned_order->>'milk')::int, o.new_milk_qty, s.default_milk_qty, 0),
+			COALESCE((dl.planned_order->>'curd')::int, o.new_curd_qty, s.default_curd_qty, 0),
+			COALESCE((dl.planned_order->>'butter')::int, o.new_butter_qty, s.default_butter_qty, 0),
+			COALESCE((dl.planned_order->>'ghee')::int, o.new_ghee_qty, s.default_ghee_qty, 0),
+			COALESCE((dl.planned_order->>'lassi')::int, o.new_lassi_qty, s.default_lassi_qty, 0),
+			COALESCE((dl.planned_order->>'paneer')::int, o.new_paneer_qty, s.default_paneer_qty, 0),
+			COALESCE((dl.planned_order->>'jaggery')::int, o.new_jaggery_qty, s.default_jaggery_qty, 0),
+			COALESCE((dl.planned_order->>'khand')::int, o.new_khand_qty, s.default_khand_qty, 0),
+			COALESCE((dl.planned_order->>'oil')::int, o.new_oil_qty, s.default_oil_qty, 0),
+			COALESCE((dl.planned_order->>'atta')::int, o.new_atta_qty, s.default_atta_qty, 0),
+			COALESCE((dl.planned_order->>'burfi')::int, o.new_burfi_qty, s.default_burfi_qty, 0),
 
 			dl.status,
+			dl.locked_at IS NOT NULL,
+			dl.plan_edited_at IS NOT NULL,
 
 			COALESCE(dl.delivered_milk_qty, 0), COALESCE(dl.delivered_curd_qty, 0),
 			COALESCE(dl.delivered_butter_qty, 0), COALESCE(dl.delivered_ghee_qty, 0),
@@ -559,6 +586,8 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 			&stop.DeliveryOrder.Oil, &stop.DeliveryOrder.Atta, &stop.DeliveryOrder.Burfi,
 
 			&stop.Status,
+			&stop.Locked,
+			&stop.PlanEdited,
 
 			&stop.ActualOrder.Milk, &stop.ActualOrder.Curd, &stop.ActualOrder.Butter, &stop.ActualOrder.Ghee,
 			&stop.ActualOrder.Lassi, &stop.ActualOrder.Paneer, &stop.ActualOrder.Jaggery, &stop.ActualOrder.Khand,
@@ -662,4 +691,102 @@ func join(ss []string, sep string) string {
 		out += s
 	}
 	return out
+}
+
+// -------------------------------------------------------------------------
+// Admin: edit a locked manifest
+// -------------------------------------------------------------------------
+
+// EditPlanRequest changes what a driver is asked to deliver at one stop.
+type EditPlanRequest struct {
+	CustomerID string         `json:"customerId"`
+	Date       string         `json:"date"`
+	Slot       string         `json:"slot"`
+	Items      map[string]int `json:"items"` // base units, keyed milk/curd/...
+}
+
+// EditPlannedOrder updates a locked stop's planned quantities.
+//
+// PUT /route/{id}/manifest/plan
+//
+// # WHY THIS HAS TO EXIST
+//
+// Locking a manifest at the cutoff is what stops the driver's list changing
+// under them mid-round. But it also means an admin who spots a mistake at
+// 03:00 — a customer who rang to cancel after the deadline, an order entered
+// wrong — has no way to correct it, and the van goes out with the wrong load.
+//
+// A cutoff should stop CUSTOMERS changing their order, not stop the business
+// fixing an error. So this exists, and it stamps plan_edited_at, which the
+// driver's app surfaces: a list that changes mid-round then reads as a
+// deliberate correction rather than a glitch.
+func (rr RouteResource) EditPlannedOrder(w http.ResponseWriter, r *http.Request) {
+	var req EditPlanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if req.CustomerID == "" || req.Date == "" || req.Slot == "" {
+		http.Error(w, "customerId, date and slot are required", http.StatusBadRequest)
+		return
+	}
+
+	// Only meaningful on a locked row. An unlocked manifest is still computed
+	// live from subscriptions and overrides, so editing the plan there would
+	// be silently overwritten on the next request — the admin should change
+	// the subscription or the override instead.
+	var locked bool
+	err := rr.DB.QueryRow(r.Context(), `
+		SELECT locked_at IS NOT NULL
+		FROM delivery_logs
+		WHERE customer_id = $1::uuid AND delivery_date = $2::date AND slot = $3
+	`, req.CustomerID, req.Date, req.Slot).Scan(&locked)
+	if err == pgx.ErrNoRows {
+		http.Error(w, "This stop isn't on the manifest for that date.", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !locked {
+		http.Error(w, "This manifest isn't locked yet — change the customer's order or add an override instead.", http.StatusConflict)
+		return
+	}
+
+	// Store EVERY product, zeros included — matching how the lock sweeper
+	// writes a plan, and for the same reason.
+	//
+	// Omitting a zero would make GenerateManifest fall through to the
+	// customer's subscription for that product, so setting milk to zero here
+	// would silently restore their usual milk on the next refresh. An admin
+	// cancelling one item is the main reason to edit a locked plan at all, so
+	// this is the case that must work.
+	clean := map[string]int{}
+	for _, p := range lockProducts {
+		v := req.Items[p]
+		if v < 0 {
+			v = 0
+		}
+		clean[p] = v
+	}
+	payload, err := json.Marshal(clean)
+	if err != nil {
+		http.Error(w, "Could not encode the order", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := rr.DB.Exec(r.Context(), `
+		UPDATE delivery_logs
+		SET planned_order = $4::jsonb, plan_edited_at = NOW(), updated_at = NOW()
+		WHERE customer_id = $1::uuid AND delivery_date = $2::date AND slot = $3
+	`, req.CustomerID, req.Date, req.Slot, string(payload)); err != nil {
+		http.Error(w, "Could not save the change: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Manifest updated. The driver will see the change on their next refresh.",
+	})
 }

@@ -112,6 +112,11 @@ func main() {
 	// Background sweepers
 	go driver.StartAutoEndSweeper(pool)
 	go route.StartPricePromotionSweeper(pool)
+	// Freezes each round's plan at its order cutoff, so the manifest becomes
+	// a stored fact rather than a live query. Without it there was no record
+	// a driver was ever given a list, and past manifests were reconstructed
+	// from present-day subscriptions and were therefore wrong.
+	go route.StartManifestLockSweeper(pool)
 	go update.StartChangeSweeper(pool)
 
 	// WhatsApp — NewWhatsAppService reads Twilio creds from env itself
