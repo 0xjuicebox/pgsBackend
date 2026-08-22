@@ -32,6 +32,8 @@ func (or OverrideResource) Routes() chi.Router {
 	r.Get("/", or.ShowForm)
 	r.Get("/state", or.GetState)
 	r.Post("/", or.Submit)
+	// Admin: read-only view of a customer's one-off date changes.
+	r.Get("/customer/{id}", or.ListForCustomer)
 	return r
 }
 
@@ -437,4 +439,104 @@ func buildOrderString(o customer.Order) string {
 		return "• (No items)"
 	}
 	return strings.Join(lines, "\n")
+}
+
+// -------------------------------------------------------------------------
+// Admin: list a customer's overrides
+// -------------------------------------------------------------------------
+
+// AdminOverride is one customer-created change to a specific date's order.
+type AdminOverride struct {
+	Id         string         `json:"id"`
+	TargetDate string         `json:"targetDate"`
+	Slot       string         `json:"slot"`
+	CreatedAt  string         `json:"createdAt"`
+	Items      map[string]int `json:"items"`
+	IsPause    bool           `json:"isPause"`
+	IsPast     bool           `json:"isPast"`
+}
+
+// ListForCustomer returns a customer's overrides, most recent date first.
+//
+// GET /override/customer/{id}?upcoming=true
+//
+// # WHY ADMIN NEEDS THIS
+//
+// Overrides were entirely invisible on the admin side. A customer could
+// cancel Tuesday's delivery, then phone up saying they got milk anyway — and
+// there was no way to check whether the override existed, whether it covered
+// the right slot, or whether it was created before the cutoff.
+//
+// Read-only on purpose. Creating an override on a customer's behalf means
+// deciding what happens when it conflicts with one they made themselves, and
+// which cutoff applies to an admin. Those are v2 questions; being able to
+// answer the phone call is the v1 need.
+func (or OverrideResource) ListForCustomer(w http.ResponseWriter, r *http.Request) {
+	customerID := chi.URLParam(r, "id")
+
+	// Default to upcoming only. The full history grows without bound and the
+	// operational question is almost always about a date that hasn't happened
+	// yet — a past override has already been resolved by the delivery itself.
+	where := "AND o.target_date >= CURRENT_DATE"
+	if r.URL.Query().Get("upcoming") == "false" {
+		where = ""
+	}
+
+	rows, err := or.DB.Query(r.Context(), `
+		SELECT o.id::text, TO_CHAR(o.target_date, 'YYYY-MM-DD'), o.slot,
+		       TO_CHAR(o.created_at, 'YYYY-MM-DD HH24:MI'),
+		       o.target_date < CURRENT_DATE,
+		       COALESCE(o.new_milk_qty,0), COALESCE(o.new_curd_qty,0),
+		       COALESCE(o.new_butter_qty,0), COALESCE(o.new_ghee_qty,0),
+		       COALESCE(o.new_lassi_qty,0), COALESCE(o.new_paneer_qty,0),
+		       COALESCE(o.new_jaggery_qty,0), COALESCE(o.new_khand_qty,0),
+		       COALESCE(o.new_oil_qty,0), COALESCE(o.new_atta_qty,0),
+		       COALESCE(o.new_burfi_qty,0)
+		FROM order_overrides o
+		WHERE o.customer_id = $1 `+where+`
+		ORDER BY o.target_date ASC, o.slot
+		LIMIT 200
+	`, customerID)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	keys := []string{"milk", "curd", "butter", "ghee", "lassi", "paneer",
+		"jaggery", "khand", "oil", "atta", "burfi"}
+
+	out := []AdminOverride{}
+	for rows.Next() {
+		var (
+			o    AdminOverride
+			qtys = make([]int, len(keys))
+			ptrs = make([]any, 0, len(keys)+5)
+		)
+		ptrs = append(ptrs, &o.Id, &o.TargetDate, &o.Slot, &o.CreatedAt, &o.IsPast)
+		for i := range qtys {
+			ptrs = append(ptrs, &qtys[i])
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			http.Error(w, "Scan error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		o.Items = map[string]int{}
+		total := 0
+		for i, k := range keys {
+			if qtys[i] > 0 {
+				o.Items[k] = qtys[i]
+			}
+			total += qtys[i]
+		}
+		// An all-zero override is how a customer pauses a single date. Worth
+		// naming explicitly — a row with no items reads as corrupt otherwise.
+		o.IsPause = total == 0
+
+		out = append(out, o)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }

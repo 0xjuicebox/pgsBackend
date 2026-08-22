@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -51,6 +52,10 @@ type Customer struct {
 	// (was active, customer paused), or "rejected".
 	Status string `json:"status"`
 }
+
+// nonDigits strips formatting from a phone search term so "98765 43210"
+// matches a stored "+919876543210".
+var nonDigits = regexp.MustCompile(`[^0-9]`)
 
 type CustomerResource struct {
 	DB       *pgxpool.Pool
@@ -125,14 +130,53 @@ func (cr CustomerResource) List(w http.ResponseWriter, r *http.Request) {
 	}
 	offset := (page - 1) * limit
 
-	query := `
+	// Server-side search and status filter.
+	//
+	// The admin list used to fetch one page and filter it in the browser,
+	// which is fine at 100 customers and quietly broken above that: searching
+	// for customer #400 returned nothing, indistinguishable from "no such
+	// customer". Filtering has to happen where all the rows are.
+	//
+	// Phone is matched on digits only, because an admin reads a number off a
+	// missed call or a bill and types it without the +91 or the spaces the
+	// database has.
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+
+	where := []string{"1=1"}
+	args := []any{}
+
+	if q != "" {
+		digits := nonDigits.ReplaceAllString(q, "")
+		args = append(args, "%"+strings.ToLower(q)+"%")
+		namePos := len(args)
+		clause := fmt.Sprintf("(LOWER(name) LIKE $%d OR LOWER(house_address) LIKE $%d", namePos, namePos)
+		// Only search phone when the query has enough digits to be meaningful.
+		// Two digits would match most of the table and make the result look
+		// broken rather than filtered.
+		if len(digits) >= 3 {
+			args = append(args, "%"+digits+"%")
+			clause += fmt.Sprintf(" OR REGEXP_REPLACE(phone_number, '[^0-9]', '', 'g') LIKE $%d", len(args))
+		}
+		clause += ")"
+		where = append(where, clause)
+	}
+
+	if status != "" && status != "all" {
+		args = append(args, status)
+		where = append(where, fmt.Sprintf("status = $%d", len(args)))
+	}
+
+	args = append(args, limit, offset)
+	query := fmt.Sprintf(`
 		SELECT id, name, phone_number, house_address, geo_latitude, geo_longitude, is_active, status
 		FROM customers
-		ORDER BY id DESC
-		LIMIT $1 OFFSET $2
-	`
+		WHERE %s
+		ORDER BY name ASC
+		LIMIT $%d OFFSET $%d
+	`, strings.Join(where, " AND "), len(args)-1, len(args))
 
-	rows, err := cr.DB.Query(r.Context(), query, limit, offset)
+	rows, err := cr.DB.Query(r.Context(), query, args...)
 	if err != nil {
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return

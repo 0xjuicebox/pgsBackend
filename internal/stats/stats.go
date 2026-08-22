@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -64,6 +65,87 @@ type AdminStats struct {
 	ActiveCustomers int     `json:"activeCustomers"`
 	MonthRevenue    float64 `json:"monthRevenue"`
 	MonthLabel      string  `json:"monthLabel"`
+
+	// Things that are quietly wrong. Always present, never null, so the
+	// client can render the section unconditionally.
+	Attention Attention `json:"attention"`
+}
+
+// PaymentAnomaly is a webhook outcome that needs a human.
+//
+// Every one of these means money moved in a way the system couldn't fully
+// reconcile, and none of them were visible anywhere before this: they lived
+// only in payment_events, readable by hand-written SQL.
+//
+//	ALREADY_PAID    the customer paid twice — cash then online, usually.
+//	                They are owed a refund, and nobody will chase us for it.
+//	AMOUNT_MISMATCH they paid a different amount than billed, typically
+//	                because the invoice was corrected after the link went out.
+//	UNMATCHED       money arrived that we can't tie to any invoice. This one
+//	                becomes a customer insisting they paid while the system
+//	                says otherwise.
+type PaymentAnomaly struct {
+	EventId      string   `json:"eventId"`
+	Outcome      string   `json:"outcome"`
+	Note         string   `json:"note"`
+	ReceivedAt   string   `json:"receivedAt"`
+	InvoiceId    *string  `json:"invoiceId"`
+	CustomerId   *string  `json:"customerId"`
+	CustomerName *string  `json:"customerName"`
+	Amount       *float64 `json:"amount"`
+}
+
+// StuckChange is an approved order change whose effective date has passed
+// without the sweeper applying it.
+//
+// Should always be empty. When it isn't, a customer was told their new order
+// starts tomorrow and it never did — and because ListPendingChanges filters
+// on review_status = 'PENDING', the row has also vanished from the admin
+// review queue. Invisible in both directions, which is the exact failure
+// shape this codebase keeps producing.
+type StuckChange struct {
+	ChangeId      string `json:"changeId"`
+	CustomerId    string `json:"customerId"`
+	CustomerName  string `json:"customerName"`
+	EffectiveFrom string `json:"effectiveFrom"`
+	DaysLate      int    `json:"daysLate"`
+}
+
+// SuspendedCustomer is an account cut off for non-payment.
+type SuspendedCustomer struct {
+	CustomerId   string  `json:"customerId"`
+	CustomerName string  `json:"customerName"`
+	Amount       float64 `json:"amount"`
+	BillingMonth string  `json:"billingMonth"`
+	SuspendedOn  *string `json:"suspendedOn"`
+}
+
+// DunningStatus reports whether the automated billing cycle actually ran.
+//
+// The cycle is the only thing that produces invoices. If the 1st passes
+// without a GENERATE row, no bills went out at all — and the first signal
+// would be nobody paying, weeks later. A dashboard that shows revenue but
+// not whether it was ever billed is telling half the story.
+type DunningStatus struct {
+	Phase        string `json:"phase"`
+	LastRunOn    string `json:"lastRunOn"`
+	Affected     int    `json:"affected"`
+	Note         string `json:"note"`
+	BillingMonth string `json:"billingMonth"`
+}
+
+// Attention groups everything a human needs to act on that isn't part of
+// today's delivery run. Kept separate from the operational counts above
+// because they answer different questions: "is today going out?" versus
+// "is anything quietly broken?".
+type Attention struct {
+	PaymentAnomalies []PaymentAnomaly    `json:"paymentAnomalies"`
+	StuckChanges     []StuckChange       `json:"stuckChanges"`
+	Suspended        []SuspendedCustomer `json:"suspended"`
+	OverdueCount     int                 `json:"overdueCount"`
+	OverdueAmount    float64             `json:"overdueAmount"`
+	LastDunningRuns  []DunningStatus     `json:"lastDunningRuns"`
+	BillingRunMissed bool                `json:"billingRunMissed"`
 }
 
 type StatsResource struct{ DB *pgxpool.Pool }
@@ -260,6 +342,176 @@ func (sr StatsResource) GetStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- Attention ---------------------------------------------------------
+	//
+	// Deliberately best-effort. Each loader logs and leaves its slice empty on
+	// failure rather than aborting the response: the operational half of this
+	// dashboard is what someone checks at 6am to see whether the vans went
+	// out, and it must not go blank because a payment query timed out.
+	out.Attention = sr.loadAttention(ctx)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+// loadAttention gathers everything that is quietly wrong.
+func (sr StatsResource) loadAttention(ctx context.Context) Attention {
+	a := Attention{
+		PaymentAnomalies: []PaymentAnomaly{},
+		StuckChanges:     []StuckChange{},
+		Suspended:        []SuspendedCustomer{},
+		LastDunningRuns:  []DunningStatus{},
+	}
+
+	// --- Payment anomalies -------------------------------------------------
+	//
+	// Capped at 50: this is a worklist, not a ledger, and an unbounded query
+	// on a table that grows with every webhook would eventually make the
+	// dashboard slow for no benefit.
+	//
+	// LEFT JOINs throughout because an UNMATCHED event by definition has no
+	// invoice, and therefore no customer.
+	rows, err := sr.DB.Query(ctx, `
+		SELECT pe.event_id, pe.outcome, COALESCE(pe.note, ''),
+		       TO_CHAR(pe.received_at, 'YYYY-MM-DD HH24:MI'),
+		       i.id::text, c.id::text, c.name, i.total_amount
+		FROM payment_events pe
+		LEFT JOIN invoices  i ON i.id = pe.invoice_id
+		LEFT JOIN customers c ON c.id = i.customer_id
+		WHERE pe.outcome IN ('ALREADY_PAID', 'AMOUNT_MISMATCH', 'UNMATCHED')
+		ORDER BY pe.received_at DESC
+		LIMIT 50
+	`)
+	if err != nil {
+		fmt.Printf("⚠️ stats: payment anomalies failed: %v\n", err)
+	} else {
+		for rows.Next() {
+			var p PaymentAnomaly
+			if err := rows.Scan(&p.EventId, &p.Outcome, &p.Note, &p.ReceivedAt,
+				&p.InvoiceId, &p.CustomerId, &p.CustomerName, &p.Amount); err != nil {
+				continue
+			}
+			a.PaymentAnomalies = append(a.PaymentAnomalies, p)
+		}
+		rows.Close()
+	}
+
+	// --- Stuck approved changes -------------------------------------------
+	//
+	// Should always return nothing. A row here means applyOneChange has been
+	// failing silently — it logs a warning and retries hourly forever, while
+	// the change is invisible in the admin queue because that filters on
+	// PENDING.
+	rows, err = sr.DB.Query(ctx, `
+		SELECT p.id::text, p.customer_id::text, c.name,
+		       TO_CHAR(p.effective_from, 'YYYY-MM-DD'),
+		       (CURRENT_DATE - p.effective_from)::int
+		FROM pending_subscription_changes p
+		JOIN customers c ON c.id = p.customer_id
+		WHERE p.review_status = 'APPROVED'
+		  AND p.effective_from < CURRENT_DATE
+		ORDER BY p.effective_from
+		LIMIT 50
+	`)
+	if err != nil {
+		fmt.Printf("⚠️ stats: stuck changes failed: %v\n", err)
+	} else {
+		for rows.Next() {
+			var sc StuckChange
+			if err := rows.Scan(&sc.ChangeId, &sc.CustomerId, &sc.CustomerName,
+				&sc.EffectiveFrom, &sc.DaysLate); err != nil {
+				continue
+			}
+			a.StuckChanges = append(a.StuckChanges, sc)
+		}
+		rows.Close()
+	}
+
+	// --- Suspended customers ----------------------------------------------
+	//
+	// Joined to the invoice that caused the suspension, so the list can show
+	// what's owed rather than just who's cut off. Amount is what gets them
+	// switched back on, so it's the actionable number.
+	rows, err = sr.DB.Query(ctx, `
+		SELECT c.id::text, c.name,
+		       COALESCE(i.total_amount, 0), COALESCE(i.billing_month, ''),
+		       TO_CHAR(i.suspended_at, 'YYYY-MM-DD')
+		FROM customers c
+		LEFT JOIN invoices i ON i.id = c.suspended_for_invoice_id
+		WHERE c.status = 'suspended'
+		ORDER BY i.suspended_at NULLS LAST
+		LIMIT 100
+	`)
+	if err != nil {
+		fmt.Printf("⚠️ stats: suspended customers failed: %v\n", err)
+	} else {
+		for rows.Next() {
+			var sc SuspendedCustomer
+			if err := rows.Scan(&sc.CustomerId, &sc.CustomerName,
+				&sc.Amount, &sc.BillingMonth, &sc.SuspendedOn); err != nil {
+				continue
+			}
+			a.Suspended = append(a.Suspended, sc)
+		}
+		rows.Close()
+	}
+
+	// --- Money outstanding -------------------------------------------------
+	//
+	// Every unpaid invoice regardless of month, not just last month's. An old
+	// unpaid bill is still money owed, and the dunning cycle only ever chases
+	// the most recent month — so anything older would otherwise be chased
+	// once and then forgotten.
+	if err := sr.DB.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(total_amount), 0)
+		FROM invoices WHERE status NOT LIKE 'PAID%'
+	`).Scan(&a.OverdueCount, &a.OverdueAmount); err != nil {
+		fmt.Printf("⚠️ stats: overdue totals failed: %v\n", err)
+	}
+
+	// --- Did the billing cycle run? ---------------------------------------
+	rows, err = sr.DB.Query(ctx, `
+		SELECT DISTINCT ON (phase)
+		       phase, TO_CHAR(run_date, 'YYYY-MM-DD'), affected,
+		       COALESCE(note, ''), billing_month
+		FROM dunning_runs
+		ORDER BY phase, run_date DESC
+	`)
+	if err != nil {
+		fmt.Printf("⚠️ stats: dunning runs failed: %v\n", err)
+	} else {
+		for rows.Next() {
+			var d DunningStatus
+			if err := rows.Scan(&d.Phase, &d.LastRunOn, &d.Affected, &d.Note, &d.BillingMonth); err != nil {
+				continue
+			}
+			a.LastDunningRuns = append(a.LastDunningRuns, d)
+		}
+		rows.Close()
+	}
+
+	// BillingRunMissed: it's past the 1st and no GENERATE ran this month.
+	//
+	// This is the single most valuable flag on the dashboard. If invoice
+	// generation fails on the 1st, nothing else surfaces it — no bill goes
+	// out, no reminder, no suspension, and the first signal is customers not
+	// paying for a month they were never billed for.
+	loc, lerr := time.LoadLocation("Asia/Kolkata")
+	if lerr == nil {
+		now := time.Now().In(loc)
+		if now.Day() >= 1 {
+			var ran bool
+			if err := sr.DB.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM dunning_runs
+					WHERE phase = 'GENERATE'
+					  AND run_date >= date_trunc('month', CURRENT_DATE)
+				)
+			`).Scan(&ran); err == nil {
+				a.BillingRunMissed = !ran
+			}
+		}
+	}
+
+	return a
 }

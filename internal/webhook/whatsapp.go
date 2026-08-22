@@ -189,7 +189,14 @@ func (wr *WhatsAppResource) handleDisableAccount(rawSender, phone string) {
 		return
 	}
 
-	wr.WhatsApp.SendDeliveryUpdate(rawSender, "⏸️ Your deliveries are now paused starting tomorrow.\n\nYou'll still receive a final bill at the end of the month for deliveries already made.\n\nReply *RESUME* any time to start again.")
+	// "Starting tomorrow" was wrong: is_active is cleared here and the
+	// manifest is generated live, so a customer pausing at 2pm is already off
+	// that evening's van. Someone expecting one more delivery wouldn't get it.
+	//
+	// RESUME is described as a request, not a switch — it routes back through
+	// admin approval, and promising an instant restart sets up the same
+	// disappointment in the other direction.
+	wr.WhatsApp.SendDeliveryUpdate(rawSender, "⏸️ Your deliveries are paused from now.\n\nYou'll still receive a bill at the end of the month for deliveries already made.\n\nReply *RESUME* when you'd like to start again — we'll confirm your first delivery date before deliveries restart.")
 }
 
 // handleReactivateAccount is the return path for a customer who paused
@@ -246,8 +253,20 @@ func (wr *WhatsAppResource) handleDeleteAccount(rawSender, customerID, phone str
 	}
 
 	if unbilledDeliveries > 0 {
-		wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf("❌ We cannot delete your account because you have %d unbilled deliveries this month.\n\nPlease pause your account (reply *PAUSE*) to stop future deliveries. Once your final bill is settled, you can delete your account.", unbilledDeliveries))
-		fmt.Printf("🚨 ADMIN ALERT: Customer %s tried to delete account but has pending payments.\n", phone)
+		// Stop the deliveries even though we're refusing the deletion.
+		//
+		// Previously this only said no. The customer had clearly asked to
+		// leave, was told they couldn't, and kept receiving milk — accruing
+		// more charges against the very balance blocking them. Telling
+		// someone to reply PAUSE after they've already said DELETE ACCOUNT
+		// asks them to act twice to achieve one thing.
+		//
+		// The debt is a reason to hold the account open, not a reason to keep
+		// selling to them.
+		wr.pauseForExit(ctx, customerID)
+
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf("⏸️ Your deliveries have been stopped.\n\nWe can't close your account yet — you have %d deliveries this month that haven't been billed. We'll send your final bill at the start of next month.\n\nOnce it's settled, reply *DELETE ACCOUNT* again and we'll close your account for good.", unbilledDeliveries))
+		fmt.Printf("🚨 ADMIN ALERT: Customer %s asked to delete with %d unbilled deliveries — deliveries stopped, account held.\n", phone, unbilledDeliveries)
 		return
 	}
 
@@ -259,13 +278,31 @@ func (wr *WhatsAppResource) handleDeleteAccount(rawSender, customerID, phone str
 		`SELECT COUNT(*) FROM invoices WHERE customer_id = $1 AND status = 'PENDING'`,
 		customerID,
 	).Scan(&unpaidInvoices); err == nil && unpaidInvoices > 0 {
-		wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf("❌ We cannot delete your account — you have %d unpaid bill(s) outstanding.\n\nPlease settle them first, then try again.", unpaidInvoices))
+		// Same reasoning as above: stop delivering, hold the account open for
+		// the balance.
+		wr.pauseForExit(ctx, customerID)
+
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, fmt.Sprintf("⏸️ Your deliveries have been stopped.\n\nWe can't close your account yet — you have %d unpaid bill(s). Once they're settled, reply *DELETE ACCOUNT* again and we'll close your account for good.", unpaidInvoices))
+		return
+	}
+
+	// order_overrides is the one foreign key into customers that does NOT
+	// cascade (confdeltype 'a'). A bare DELETE therefore fails with a 23503
+	// for any customer who has ever changed a single day's order — which the
+	// customer experiences as "Deletion failed. Please contact support."
+	//
+	// Everything else — subscriptions, delivery_logs, invoices,
+	// pending_subscription_changes — cascades.
+	if _, err := wr.DB.Exec(ctx, `DELETE FROM order_overrides WHERE customer_id = $1`, customerID); err != nil {
+		fmt.Printf("❌ delete: clearing overrides failed for %s: %v\n", customerID, err)
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ Deletion failed. Please reply here and our team will help.")
 		return
 	}
 
 	_, err = wr.DB.Exec(ctx, "DELETE FROM customers WHERE id = $1", customerID)
 	if err != nil {
-		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ Deletion failed. Please contact support.")
+		fmt.Printf("❌ delete: failed for %s: %v\n", customerID, err)
+		wr.WhatsApp.SendDeliveryUpdate(rawSender, "⚠️ Deletion failed. Please reply here and our team will help.")
 		return
 	}
 
@@ -372,4 +409,21 @@ func prettyMonthLabel(m string) string {
 		return t.Format("January 2006")
 	}
 	return m
+}
+
+// pauseForExit stops deliveries for a customer who has asked to leave but
+// can't be deleted yet because they owe money.
+//
+// Only touches an account that's currently active. A customer already
+// suspended for non-payment must stay suspended — downgrading them to
+// 'disabled' would let them lift it themselves with RESUME, which is exactly
+// what the suspension exists to prevent.
+func (wr *WhatsAppResource) pauseForExit(ctx context.Context, customerID string) {
+	if _, err := wr.DB.Exec(ctx, `
+		UPDATE customers
+		SET is_active = false, status = 'disabled'
+		WHERE id = $1 AND status = 'active'
+	`, customerID); err != nil {
+		fmt.Printf("⚠️ pauseForExit: couldn't stop deliveries for %s: %v\n", customerID, err)
+	}
 }

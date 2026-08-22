@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
@@ -447,36 +448,155 @@ func (br BillingResource) Generate(w http.ResponseWriter, r *http.Request) {
 // was created within the last minute — i.e. by the Generate call that just
 // finished. Filtering by created_at avoids re-messaging customers whose
 // invoices already existed from a previous Generate run.
+// billSendConcurrency is how many bills go out at once.
+//
+// Five, not one and not fifty. Serial was the original bug — 700 customers at
+// ~1.5s each needs seventeen minutes and the send died halfway. Going much
+// wider trades that for a different failure: WhatsApp throttles per sender, so
+// a burst of fifty simply queues at Twilio while consuming a pool connection
+// each, and Razorpay rate-limits too.
+//
+// Five gets 700 bills out in roughly three and a half minutes, comfortably
+// inside the budget, without either provider pushing back.
+const billSendConcurrency = 5
+
+// notifyFreshInvoices sends bills for every invoice this month that hasn't had
+// one, concurrently and resumably.
+//
+// # RESUMABLE MATTERS MORE THAN CONCURRENT
+//
+// Work is selected by `bill_sent_at IS NULL`, not by creation time. That means
+// a run which dies partway — timeout, deploy, crash — leaves the remaining
+// invoices still marked unsent, and the next run picks up exactly those. The
+// previous design keyed off "created in the last 60 seconds", so anything
+// missed was missed permanently and invisibly.
+//
+// Marking happens AFTER a successful send. The opposite order would be safer
+// against duplicates but far worse in practice: a customer who never receives
+// a bill still gets chased for it daily and suspended on the 6th, which is a
+// much more damaging failure than receiving the same bill twice.
 func (br BillingResource) notifyFreshInvoices(month string, tallies []CustomerTally) {
-	// Generous timeout: this loop now makes an outbound Razorpay call per
-	// customer as well as a Twilio one, so a large month takes a while.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Budget is generous but finite. The work is now resumable, so hitting it
+	// costs a delay rather than a permanent gap.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	rows, err := br.DB.Query(ctx, `
 		SELECT customer_id FROM invoices
-		WHERE billing_month = $1
-		  AND created_at > NOW() - INTERVAL '1 minute'
+		WHERE billing_month = $1 AND bill_sent_at IS NULL
 	`, month)
 	if err != nil {
 		fmt.Printf("⚠️ notifyFreshInvoices: %v\n", err)
 		return
 	}
-	defer rows.Close()
 
-	fresh := map[uuid.UUID]bool{}
+	unsent := map[uuid.UUID]bool{}
 	for rows.Next() {
 		var id uuid.UUID
-		rows.Scan(&id)
-		fresh[id] = true
+		if err := rows.Scan(&id); err == nil {
+			unsent[id] = true
+		}
+	}
+	rows.Close()
+
+	// Only customers who both owe something and haven't been told.
+	var queue []CustomerTally
+	for _, t := range tallies {
+		if t.TotalAmount > 0 && unsent[t.CustomerId] {
+			queue = append(queue, t)
+		}
+	}
+	if len(queue) == 0 {
+		return
 	}
 
-	for _, t := range tallies {
-		if t.TotalAmount <= 0 || !fresh[t.CustomerId] {
-			continue
-		}
-		br.notifyBill(t, month)
+	fmt.Printf("📤 sending %d bill(s) for %s\n", len(queue), month)
+
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		sent   int
+		failed int
+	)
+	jobs := make(chan CustomerTally)
+
+	for i := 0; i < billSendConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range jobs {
+				// Stop cleanly if the budget ran out. Remaining invoices keep
+				// bill_sent_at NULL and are picked up by the next run.
+				if ctx.Err() != nil {
+					return
+				}
+				if err := br.sendOneBill(ctx, t, month); err != nil {
+					fmt.Printf("⚠️ bill send failed for %s: %v\n", t.CustomerId, err)
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					continue
+				}
+				mu.Lock()
+				sent++
+				mu.Unlock()
+			}
+		}()
 	}
+
+	for _, t := range queue {
+		if ctx.Err() != nil {
+			break
+		}
+		jobs <- t
+	}
+	close(jobs)
+	wg.Wait()
+
+	remaining := len(queue) - sent
+	if remaining > 0 {
+		// Loud, because this is the case that used to be silent. Anyone still
+		// unsent will be chased by the dunning cycle for a bill they never
+		// got, so it needs a human before the 2nd.
+		fmt.Printf("🚨 BILLS INCOMPLETE for %s — %d sent, %d still unsent. Re-run Generate to finish; nothing will be duplicated.\n",
+			month, sent, remaining)
+	} else {
+		fmt.Printf("✅ all %d bill(s) sent for %s\n", sent, month)
+	}
+
+	// Recorded so the dashboard can show a partial run rather than leaving it
+	// to be discovered from customer complaints.
+	br.recordBillRun(ctx, month, sent, remaining, failed)
+}
+
+// sendOneBill delivers a single bill and marks it, so the marker can never be
+// set for a message that didn't go out.
+func (br BillingResource) sendOneBill(ctx context.Context, t CustomerTally, month string) error {
+	if err := br.notifyBill(t, month); err != nil {
+		return err
+	}
+	_, err := br.DB.Exec(ctx, `
+		UPDATE invoices SET bill_sent_at = NOW()
+		WHERE customer_id = $1 AND billing_month = $2
+	`, t.CustomerId, month)
+	return err
+}
+
+// recordBillRun writes the outcome to dunning_runs so a partial send is
+// visible on the dashboard. Best-effort: failing to record must not change
+// what was actually sent.
+func (br BillingResource) recordBillRun(ctx context.Context, month string, sent, remaining, failed int) {
+	note := fmt.Sprintf("%d sent", sent)
+	if remaining > 0 {
+		note = fmt.Sprintf("%d sent, %d NOT SENT (%d errors) — re-run Generate", sent, remaining, failed)
+	}
+	runID, _ := uuid.NewV7()
+	_, _ = br.DB.Exec(ctx, `
+		INSERT INTO dunning_runs (id, run_date, phase, billing_month, affected, note)
+		VALUES ($1, CURRENT_DATE, 'GENERATE', $2, $3, $4)
+		ON CONFLICT (run_date, phase) DO UPDATE
+		SET affected = EXCLUDED.affected, note = EXCLUDED.note, billing_month = EXCLUDED.billing_month
+	`, runID, month, sent, note)
 }
 
 // paymentLine builds the "how to pay" part of a bill message.
@@ -537,15 +657,17 @@ func (br BillingResource) paymentLine(ctx context.Context, customerID uuid.UUID,
 // Falls back to the old free-form message when no template SID is configured,
 // so a deployment without templates still bills people (it just won't reach
 // quiet customers).
-func (br BillingResource) notifyBill(t CustomerTally, month string) {
+func (br BillingResource) notifyBill(t CustomerTally, month string) error {
 	// Long enough to cover a Razorpay round trip plus the Twilio send.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	var phone string
 	if err := br.DB.QueryRow(ctx, `SELECT phone_number FROM customers WHERE id = $1`, t.CustomerId).Scan(&phone); err != nil {
-		fmt.Printf("⚠️ notifyBill: couldn't find phone for %s: %v\n", t.CustomerId, err)
-		return
+		// Returned rather than logged-and-swallowed: the caller marks the
+		// invoice as sent only on success, so this customer stays in the
+		// queue for the next run instead of being silently skipped forever.
+		return fmt.Errorf("no phone for customer %s: %w", t.CustomerId, err)
 	}
 
 	// The invoice id is what the template's button URL appends to /pay/.
@@ -569,18 +691,18 @@ func (br BillingResource) notifyBill(t CustomerTally, month string) {
 			// better followed by an attempt that might land than by silence.
 			fmt.Printf("⚠️ notifyBill: template send failed for %s, falling back: %v\n", phone, err)
 		} else {
-			return
+			return nil
 		}
 	}
 
-	br.notifyBillFreeForm(ctx, phone, t, month)
+	return br.notifyBillFreeForm(ctx, phone, t, month)
 }
 
 // notifyBillFreeForm is the pre-template message, kept as a fallback for
 // deployments without approved templates and for the 24-hour window where it
 // still works. Retains the full itemised breakdown, which the template can't
 // carry.
-func (br BillingResource) notifyBillFreeForm(ctx context.Context, phone string, t CustomerTally, month string) {
+func (br BillingResource) notifyBillFreeForm(ctx context.Context, phone string, t CustomerTally, month string) error {
 	// Pretty product breakdown, only for lines that actually contributed.
 	// Same LABEL and unit conventions used by the customer-facing HTML pages.
 	labels := map[string]string{
@@ -622,8 +744,9 @@ func (br BillingResource) notifyBillFreeForm(ctx context.Context, phone string, 
 	)
 
 	if err := br.WhatsApp.SendDeliveryUpdate(phone, msg); err != nil {
-		fmt.Printf("⚠️ notifyBill: WhatsApp send failed for %s: %v\n", phone, err)
+		return fmt.Errorf("whatsapp send to %s: %w", phone, err)
 	}
+	return nil
 }
 
 // formatAmount renders a rupee amount with Indian digit grouping and no

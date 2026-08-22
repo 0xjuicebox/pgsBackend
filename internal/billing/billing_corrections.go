@@ -133,6 +133,25 @@ func (br BillingResource) FinalInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Mark the account as paused too, not just un-routed.
+	//
+	// stop_order = 0 stops the deliveries, but status stayed 'active' — so on
+	// WhatsApp the customer still saw the ordinary menu and could request
+	// overrides and order changes for deliveries that were never coming.
+	// Everything looked like it was working while nothing was being
+	// delivered, and they'd have had no way to tell.
+	//
+	// Deliberately 'disabled' rather than deactivating outright: the admin
+	// still closes the account manually once payment lands, and 'disabled'
+	// leaves the customer able to reply RESUME if they change their mind.
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE customers SET is_active = false, status = 'disabled' WHERE id = $1 AND status = 'active'`,
+		customerID,
+	); err != nil {
+		http.Error(w, "Failed to pause the account: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	if err := tx.Commit(r.Context()); err != nil {
 		http.Error(w, "Commit failed", http.StatusInternalServerError)
 		return
