@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -287,8 +288,10 @@ const effectiveOrderTotal = `(
 )`
 
 // CloseRoute marks undelivered stops as UNATTEMPTED for the driver's current
-// slot. Reads route assignment from route_slot_drivers and schedule info from
-// subscriptions.
+// slot.
+//
+// Kept as an endpoint for manual use, but the important callers are now
+// EndShift and the auto-end sweeper — see CloseRouteForSlot below for why.
 func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 	driverID := r.Context().Value(middleware.UserIDKey).(string)
 
@@ -297,28 +300,71 @@ func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 		slot = inferSlot(r.Context(), dr.DB)
 	}
 
+	n, err := CloseRouteForSlot(r.Context(), dr.DB, driverID, slot, time.Now().Format("2006-01-02"))
+	if err != nil {
+		if err == errNoRouteForSlot {
+			http.Error(w, `{"error": "No active route for this slot"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to close route: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"message": "Route closed successfully", "closed": %d}`, n)
+}
+
+var errNoRouteForSlot = errors.New("no route assigned for this driver and slot")
+
+// CloseRouteForSlot ends a round: every stop the driver didn't reach becomes
+// UNATTEMPTED.
+//
+// # WHY THIS IS NOW A SHARED FUNCTION RATHER THAN JUST AN ENDPOINT
+//
+// POST /driver/route/close was never called by anything. Not by the driver
+// app, not by EndShift, not by the auto-end sweeper. It sat orphaned.
+//
+// Before manifest locking that was survivable: an unvisited stop simply had no
+// delivery_logs row. Missing data, but inert — billing counts only DELIVERED
+// and nothing else looked.
+//
+// Locking changed that. Every stop now gets a PENDING row at the slot's
+// cutoff, and with nothing closing the round those rows stay PENDING forever:
+// the dashboard reports a run still in progress days later, a stop nobody
+// reached never becomes a recorded miss, and completion figures are quietly
+// wrong.
+//
+// So closing is wired to the two moments a round actually ends — the driver
+// tapping "end shift", and the sweeper auto-ending a shift they forgot to
+// close. A driver who never opens the app at all is covered by the second.
+//
+// Returns how many stops were closed. Idempotent: a second call finds nothing
+// PENDING and nothing missing, and changes nothing.
+func CloseRouteForSlot(ctx context.Context, db *pgxpool.Pool, driverID, slot, targetDate string) (int, error) {
 	var routeID string
-	err := dr.DB.QueryRow(r.Context(), `
+	err := db.QueryRow(ctx, `
 		SELECT route_id FROM route_slot_drivers
 		WHERE driver_id = $1 AND slot = $2 LIMIT 1
 	`, driverID, slot).Scan(&routeID)
 	if err != nil {
-		http.Error(w, `{"error": "No active route for this slot"}`, http.StatusNotFound)
-		return
+		return 0, errNoRouteForSlot
 	}
-
-	targetDate := time.Now().Format("2006-01-02")
 
 	// Insert UNATTEMPTED logs for every scheduled customer on this route+slot
 	// who doesn't already have a delivery log for today.
 	//
+	// On a locked round this finds nothing — the lock sweeper already wrote a
+	// row per stop. It still matters for dates before locking existed, and for
+	// a round whose cutoff hasn't passed but whose driver has finished early.
+	//
 	// The final condition excludes stops with nothing owed — a customer who
 	// paused today via a zero-quantity override. GenerateManifest already
-	// filters those out, so the driver never saw them; without this they'd
-	// be recorded as a missed delivery the driver was never asked to make.
-	// That polluted the admin's log view with false failures and dragged the
+	// filters those out, so the driver never saw them; without this they'd be
+	// recorded as a missed delivery the driver was never asked to make. That
+	// polluted the admin's log view with false failures and dragged the
 	// dashboard's completion rate below 100% on any day someone skipped.
-	query := `
+	insertQuery := `
 		INSERT INTO delivery_logs (customer_id, route_id, driver_id, delivery_date, status, slot)
 		SELECT
 			s.customer_id, s.route_id, $4, $2::date, 'UNATTEMPTED', $3
@@ -338,34 +384,26 @@ func (dr *DriverResource) CloseRoute(w http.ResponseWriter, r *http.Request) {
 		  AND ` + effectiveOrderTotal + ` > 0
 	`
 
-	_, err = dr.DB.Exec(r.Context(), query, routeID, targetDate, slot, driverID)
+	inserted, err := db.Exec(ctx, insertQuery, routeID, targetDate, slot, driverID)
 	if err != nil {
-		http.Error(w, "Failed to close route: "+err.Error(), http.StatusInternalServerError)
-		return
+		return 0, fmt.Errorf("inserting unattempted logs: %w", err)
 	}
 
 	// Convert leftover PENDING stops to UNATTEMPTED.
 	//
-	// Since manifest locking, rows exist from the slot's cutoff rather than
-	// being created here — the INSERT above now finds nothing to do on a
-	// locked round. A stop still marked PENDING when the round closes is
-	// exactly what UNATTEMPTED means: it was on the list and nobody reached
-	// it.
-	//
-	// Without this the stop would stay PENDING forever, showing on tomorrow's
-	// dashboard as a run still in progress and never counting as a miss.
-	if _, err := dr.DB.Exec(r.Context(), `
+	// A stop still PENDING when the round closes is exactly what UNATTEMPTED
+	// means: it was on the list and nobody reached it.
+	updated, err := db.Exec(ctx, `
 		UPDATE delivery_logs
 		SET status = 'UNATTEMPTED', driver_id = COALESCE(driver_id, $4), updated_at = NOW()
 		WHERE route_id = $1 AND delivery_date = $2::date AND slot = $3
 		  AND status = 'PENDING'
-	`, routeID, targetDate, slot, driverID); err != nil {
-		http.Error(w, "Failed to close pending stops: "+err.Error(), http.StatusInternalServerError)
-		return
+	`, routeID, targetDate, slot, driverID)
+	if err != nil {
+		return 0, fmt.Errorf("closing pending stops: %w", err)
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"message": "Route closed successfully"}`))
+	return int(inserted.RowsAffected() + updated.RowsAffected()), nil
 }
 
 // inferSlot picks "morning" or "evening" based on the current time and the

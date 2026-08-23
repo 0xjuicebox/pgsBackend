@@ -198,6 +198,26 @@ func (dr DriverResource) EndShift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Close the round: anything the driver didn't reach becomes UNATTEMPTED.
+	//
+	// This is the moment a round actually ends, and nothing was doing it. The
+	// close endpoint existed but no caller ever hit it, which since manifest
+	// locking means every unvisited stop stayed PENDING indefinitely — showing
+	// on the dashboard as a run still in progress days later, and never
+	// counting as a missed delivery.
+	//
+	// Failure here is logged, not returned. The driver has finished and told
+	// us so; refusing to end their shift because the bookkeeping failed would
+	// leave them stuck on a screen they can't get past, and the auto-end
+	// sweeper will close the round anyway.
+	if n, cerr := CloseRouteForSlot(r.Context(), dr.DB, driverID, req.Slot, today); cerr != nil {
+		if cerr != errNoRouteForSlot {
+			fmt.Printf("⚠️ EndShift: closing route for driver %s (%s) failed: %v\n", driverID, req.Slot, cerr)
+		}
+	} else if n > 0 {
+		fmt.Printf("🏁 closed %s round for driver %s — %d stop(s) marked unattempted\n", req.Slot, driverID, n)
+	}
+
 	var row ShiftRow
 	err = dr.DB.QueryRow(r.Context(), `
 		SELECT id, started_at, ended_at, status
@@ -341,6 +361,26 @@ func sweepAutoEnd(db *pgxpool.Pool) {
 			continue
 		}
 
+		// Collect the drivers first: once the status flips to AUTO_ENDED we
+		// can no longer tell which shifts this pass ended, and their rounds
+		// still need closing.
+		var driverIDs []string
+		rows, qerr := db.Query(ctx, `
+			SELECT driver_id::text FROM shifts
+			WHERE shift_date = $1::date AND slot = $2 AND status = 'ACTIVE'
+		`, today, s.slot)
+		if qerr != nil {
+			fmt.Printf("⚠️ sweepAutoEnd: %s listing failed: %v\n", s.slot, qerr)
+			continue
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err == nil {
+				driverIDs = append(driverIDs, id)
+			}
+		}
+		rows.Close()
+
 		tag, err := db.Exec(ctx, `
 			UPDATE shifts
 			SET status = 'AUTO_ENDED', ended_at = NOW(), updated_at = NOW()
@@ -354,6 +394,24 @@ func sweepAutoEnd(db *pgxpool.Pool) {
 		}
 		if tag.RowsAffected() > 0 {
 			fmt.Printf("🕘 auto-ended %d stale %s shift(s) for %s\n", tag.RowsAffected(), s.slot, today)
+		}
+
+		// Close each auto-ended driver's round.
+		//
+		// A driver who forgets to tap "end shift" is precisely the case this
+		// sweeper exists for, and leaving their round open would keep every
+		// unvisited stop PENDING forever. Ending the shift without closing
+		// the round would fix the dashboard's "runs in progress" count while
+		// leaving the delivery records wrong — worse than not sweeping at
+		// all, because it looks resolved.
+		for _, id := range driverIDs {
+			if n, cerr := CloseRouteForSlot(ctx, db, id, s.slot, today); cerr != nil {
+				if cerr != errNoRouteForSlot {
+					fmt.Printf("⚠️ sweepAutoEnd: closing %s round for driver %s failed: %v\n", s.slot, id, cerr)
+				}
+			} else if n > 0 {
+				fmt.Printf("🏁 auto-closed %s round for driver %s — %d stop(s) marked unattempted\n", s.slot, id, n)
+			}
 		}
 	}
 }
