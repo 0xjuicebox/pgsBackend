@@ -52,6 +52,8 @@ func (dr DriverResource) Routes() chi.Router {
 		r.Post("/sync", dr.Sync)
 		r.Get("/manifest", dr.GetMobileManifest)
 		r.Post("/route/close", dr.CloseRoute)
+		// Standing route assignments, independent of the current slot.
+		r.Get("/routes", dr.GetMyRoutes)
 
 		// Shift lifecycle
 		r.Get("/shift/today", dr.GetTodayShifts)
@@ -421,4 +423,64 @@ func inferSlot(ctx context.Context, db *pgxpool.Pool) string {
 		return "evening"
 	}
 	return "morning"
+}
+
+// -------------------------------------------------------------------------
+// Mobile: which routes am I on?
+// -------------------------------------------------------------------------
+
+// MyRoute is one of the driver's standing route assignments.
+type MyRoute struct {
+	RouteID   string `json:"routeId"`
+	RouteName string `json:"routeName"`
+	Slot      string `json:"slot"`
+	StopCount int    `json:"stopCount"`
+}
+
+// GetMyRoutes returns every route the driver is assigned to, across both slots.
+//
+// GET /driver/routes
+//
+// # WHY THIS EXISTS
+//
+// The driver profile screen used to answer "what route am I on?" by calling
+// /driver/manifest and reading routeName off the response. That endpoint
+// infers the slot from the current time, so a driver assigned to mornings who
+// opened their profile in the afternoon got a 404 and the screen told them
+// "You are not assigned to a delivery route today."
+//
+// They were assigned. The question was just being asked about the wrong slot.
+//
+// Assignment is a standing fact about the driver, not a property of the
+// current hour, so it needs its own query. This also answers it for both
+// slots at once, which the manifest never could.
+func (dr *DriverResource) GetMyRoutes(w http.ResponseWriter, r *http.Request) {
+	driverID := r.Context().Value(middleware.UserIDKey).(string)
+
+	rows, err := dr.DB.Query(r.Context(), `
+		SELECT r.id::text, r.name, rsd.slot,
+		       (SELECT COUNT(*) FROM subscriptions s
+		         WHERE s.route_id = r.id AND s.slot = rsd.slot AND s.stop_order > 0)
+		FROM route_slot_drivers rsd
+		JOIN routes r ON r.id = rsd.route_id
+		WHERE rsd.driver_id = $1::uuid
+		ORDER BY rsd.slot
+	`, driverID)
+	if err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	out := []MyRoute{}
+	for rows.Next() {
+		var m MyRoute
+		if err := rows.Scan(&m.RouteID, &m.RouteName, &m.Slot, &m.StopCount); err != nil {
+			continue
+		}
+		out = append(out, m)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }

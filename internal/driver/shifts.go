@@ -141,17 +141,55 @@ func (dr DriverResource) StartShift(w http.ResponseWriter, r *http.Request) {
 	today := indianToday()
 	shiftID, _ := uuid.NewV7()
 
-	// ON CONFLICT DO NOTHING gives us idempotency; the follow-up SELECT
-	// returns whichever row now owns (driver, date, slot) — the newly
-	// inserted one or the pre-existing one. Both are equally valid answers.
+	// Starting reopens an ended shift rather than doing nothing.
+	//
+	// This used to be ON CONFLICT DO NOTHING, which stranded any driver who
+	// ended their shift early. Thumb the End button at stop 8 of 20 and the
+	// round closes: stops 9-20 flip to UNATTEMPTED. Tap Start again and the
+	// shift stayed ENDED, the manifest returned UNATTEMPTED for every
+	// remaining stop, and the app — which treats anything other than PENDING
+	// as finished — rendered them greyed out with no deliver button.
+	//
+	// Twelve customers left and no way to record any of them. The same thing
+	// happened, without anyone touching anything, when the auto-end sweeper
+	// closed a driver still out on a late round.
+	//
+	// ended_at is cleared so the shift reads as genuinely in progress again.
 	_, err := dr.DB.Exec(r.Context(), `
 		INSERT INTO shifts (id, driver_id, shift_date, slot, status)
 		VALUES ($1, $2, $3::date, $4, 'ACTIVE')
-		ON CONFLICT (driver_id, shift_date, slot) DO NOTHING
+		ON CONFLICT (driver_id, shift_date, slot) DO UPDATE
+		SET status = 'ACTIVE',
+		    ended_at = NULL,
+		    -- Only stamped when reopening something that had ended, so a
+		    -- driver simply double-tapping Start doesn't look like a restart.
+		    reopened_at = CASE
+		        WHEN shifts.status IN ('ENDED', 'AUTO_ENDED') THEN NOW()
+		        ELSE shifts.reopened_at
+		    END,
+		    updated_at = NOW()
 	`, shiftID, driverID, today, req.Slot)
 	if err != nil {
 		http.Error(w, "Failed to start shift: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Reopen the round: stops closed as UNATTEMPTED go back to PENDING.
+	//
+	// Only today's, only this slot, and only stops nobody has actually
+	// recorded — a DELIVERED, SKIPPED or FAILED stop is a decision the driver
+	// made and must not be undone by restarting.
+	//
+	// Without this, reopening the shift would fix the label while leaving
+	// every remaining stop un-deliverable, which is the worse failure: it
+	// looks resolved.
+	if n, rerr := reopenRound(r.Context(), dr.DB, driverID, req.Slot, today); rerr != nil {
+		// Logged, not returned. The driver has asked to start and the shift
+		// is already ACTIVE; refusing here would leave them on a screen they
+		// can't get past for a bookkeeping failure.
+		fmt.Printf("⚠️ StartShift: reopening %s round for driver %s failed: %v\n", req.Slot, driverID, rerr)
+	} else if n > 0 {
+		fmt.Printf("↩️  reopened %s round for driver %s — %d stop(s) back to pending\n", req.Slot, driverID, n)
 	}
 
 	var row ShiftRow
@@ -364,10 +402,18 @@ func sweepAutoEnd(db *pgxpool.Pool) {
 		// Collect the drivers first: once the status flips to AUTO_ENDED we
 		// can no longer tell which shifts this pass ended, and their rounds
 		// still need closing.
+		// reopened_at IS NULL excludes drivers who deliberately restarted
+		// after an auto-end. Without it the sweeper and the driver fight:
+		// ended at 11:30, restarted at 11:35, ended again at 11:40, forever.
+		//
+		// This sweeper exists to catch a driver who FORGOT to end their
+		// shift. One who has explicitly restarted is telling us they are
+		// still out, and that is not a case to correct.
 		var driverIDs []string
 		rows, qerr := db.Query(ctx, `
 			SELECT driver_id::text FROM shifts
 			WHERE shift_date = $1::date AND slot = $2 AND status = 'ACTIVE'
+			  AND reopened_at IS NULL
 		`, today, s.slot)
 		if qerr != nil {
 			fmt.Printf("⚠️ sweepAutoEnd: %s listing failed: %v\n", s.slot, qerr)
@@ -385,6 +431,7 @@ func sweepAutoEnd(db *pgxpool.Pool) {
 			UPDATE shifts
 			SET status = 'AUTO_ENDED', ended_at = NOW(), updated_at = NOW()
 			WHERE shift_date = $1::date AND slot = $2 AND status = 'ACTIVE'
+			  AND reopened_at IS NULL
 		`, today, s.slot)
 		if err != nil {
 			// Log and carry on to the other slot — one failing UPDATE must
@@ -445,4 +492,35 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(body)
+}
+
+// reopenRound puts a closed round back into a deliverable state.
+//
+// Called when a driver starts a shift that was already ended — by mistake, or
+// by the auto-end sweeper catching them mid-round.
+//
+// Deliberately narrow: today only, this slot only, and only stops sitting at
+// UNATTEMPTED. A stop the driver actually marked — DELIVERED, SKIPPED,
+// FAILED — represents a decision, and restarting a shift is not a reason to
+// discard it.
+//
+// planned_order and locked_at are untouched, so a reopened stop still carries
+// the plan it was locked with. The driver sees the same quantities they were
+// asked to deliver, not a fresh computation from subscriptions that may have
+// changed since.
+func reopenRound(ctx context.Context, db *pgxpool.Pool, driverID, slot, date string) (int, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE delivery_logs dl
+		SET status = 'PENDING', updated_at = NOW()
+		FROM route_slot_drivers rsd
+		WHERE rsd.driver_id = $1::uuid AND rsd.slot = $2
+		  AND dl.route_id = rsd.route_id
+		  AND dl.delivery_date = $3::date
+		  AND dl.slot = $2
+		  AND dl.status = 'UNATTEMPTED'
+	`, driverID, slot, date)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }
