@@ -402,6 +402,19 @@ const TOKEN = new URLSearchParams(location.search).get('token');
 const FALLBACK_CENTER = [26.8467, 80.9462];
 const FALLBACK_ZOOM = 12;
 
+  // Step sizes double as minimum order quantities.
+  //
+  // Everything starts at zero and moves in whole steps, so a step of 5000 for
+  // atta means a customer can order 0, 5kg, 10kg — never 2kg. That is the
+  // business rule: these are sack and tin goods, not something split finely.
+  //
+  //   atta     5 kg   sold by the sack
+  //   oil      1 L    sold by the tin
+  //   khand    1 kg
+  //   jaggery  1 kg
+  //
+  // No separate `min` field is needed — a step that is also the minimum
+  // enforces itself, and one number is harder to get out of sync than two.
 const PRODUCTS = [
   { key: 'milk',    label: 'Milk',        emoji: '🥛', unit: 'L',  step: 500 },
   { key: 'curd',    label: 'Curd',        emoji: '🍶', unit: 'L',  step: 500 },
@@ -409,10 +422,10 @@ const PRODUCTS = [
   { key: 'butter',  label: 'Butter',      emoji: '🧈', unit: 'kg', step: 250 },
   { key: 'ghee',    label: 'Desi Ghee',   emoji: '🫙', unit: 'kg', step: 250 },
   { key: 'lassi',   label: 'Buttermilk',  emoji: '🥤', unit: 'L',  step: 500 },
-  { key: 'jaggery', label: 'Jaggery',     emoji: '🍯', unit: 'kg', step: 250 },
-  { key: 'khand',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', step: 250 },
-  { key: 'oil',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  step: 500 },
-  { key: 'atta',    label: 'Atta',        emoji: '🌾', unit: 'kg', step: 1000 },
+  { key: 'jaggery', label: 'Jaggery',     emoji: '🍯', unit: 'kg', step: 1000 },
+  { key: 'khand',   label: 'Desi Khand',  emoji: '🍚', unit: 'kg', step: 1000 },
+  { key: 'oil',     label: 'Mustard Oil', emoji: '🫗', unit: 'L',  step: 1000 },
+  { key: 'atta',    label: 'Atta',        emoji: '🌾', unit: 'kg', step: 5000 },
   { key: 'burfi',   label: 'Milk Burfi',  emoji: '🍬', unit: 'kg', step: 250 },
 ];
 
