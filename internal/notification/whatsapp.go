@@ -25,7 +25,7 @@ func NewWhatsAppService() *WhatsAppService {
 func (s *WhatsAppService) SendUpdateLink(toPhone, token string) error {
 	variables := fmt.Sprintf(`{"1":"%s"}`, token)
 	// ⚠️ Replace with your actual Update Link Template SID from Twilio!
-	return s.SendContentTemplate(toPhone, "HX306ea9cbf65027086120b77ccdfae302", variables)
+	return s.SendContentTemplate(toPhone, templateSID("WHATSAPP_TEMPLATE_UPDATE_LINK", "HX306ea9cbf65027086120b77ccdfae302"), variables)
 }
 
 // formatPhone ensures the number is perfectly formatted for Twilio's WhatsApp API
@@ -97,12 +97,12 @@ func (s *WhatsAppService) SendRejectionNotification(toPhone, customerName, reaso
 // as a separate Twilio template from the registration one.
 func (s *WhatsAppService) SendOverrideLink(toPhone, token string) error {
 	variables := fmt.Sprintf(`{"1":"%s"}`, token)
-	return s.SendContentTemplate(toPhone, "HX40cbc193ae82c16ffcc1d47a31dda48c", variables)
+	return s.SendContentTemplate(toPhone, templateSID("WHATSAPP_TEMPLATE_OVERRIDE_LINK", "HX40cbc193ae82c16ffcc1d47a31dda48c"), variables)
 }
 
 func (s *WhatsAppService) SendIssueLink(toPhone, token string) error {
 	variables := fmt.Sprintf(`{"1":"%s"}`, token)
-	return s.SendContentTemplate(toPhone, "HX08111bb54337d6ef74dadf404e9f2402", variables)
+	return s.SendContentTemplate(toPhone, templateSID("WHATSAPP_TEMPLATE_ISSUE_LINK", "HX08111bb54337d6ef74dadf404e9f2402"), variables)
 }
 
 // -------------------------------------------------------------------------
@@ -111,31 +111,66 @@ func (s *WhatsAppService) SendIssueLink(toPhone, token string) error {
 
 func (s *WhatsAppService) SendIssueFlow(toPhone string) error {
 	// Pass an empty string because there are no variables
-	return s.SendContentTemplate(toPhone, "HX043303525ae32a481156c55240783249", "")
+	return s.SendContentTemplate(toPhone, templateSID("WHATSAPP_TEMPLATE_ISSUE_FLOW", "HX043303525ae32a481156c55240783249"), "")
 }
 
 // SendIssueConfirmation sends the "issue received" confirmation template,
 // which includes a quick-reply button (id "1") that routes back to the main menu.
 func (s *WhatsAppService) SendIssueConfirmation(toPhone string) error {
-	return s.SendContentTemplate(toPhone, "HX7bad95c3f5cf029fbf1124d634c6d2f7", "")
+	return s.SendContentTemplate(toPhone, templateSID("WHATSAPP_TEMPLATE_ISSUE_CONFIRM", "HX7bad95c3f5cf029fbf1124d634c6d2f7"), "")
 }
 
 // SendRegistrationPrompt is sent to ANY unregistered number, regardless of what
 // they typed. It contains a "Register" button.
 func (s *WhatsAppService) SendRegistrationPrompt(toPhone string) error {
-	return s.SendContentTemplate(toPhone, "HX27a35ca1c882c0a76966bd774935b79a", "")
+	return s.SendContentTemplate(toPhone, templateSID("WHATSAPP_TEMPLATE_REG_PROMPT", "HX27a35ca1c882c0a76966bd774935b79a"), "")
 }
 
-// SendRegistrationLink sends a "Visit Website" (Call-to-Action) template.
-// The template's Website URL field is configured in Twilio as:
+// SendRegistrationLink sends the registration link as plain text.
 //
-//	https://babbling-dynasty-scrunch.ngrok-free.dev/register?token={{1}}
+// # WHY NOT A TEMPLATE WITH A BUTTON
 //
-// (Twilio requires a valid domain in the field itself — {{1}} can only be a
-// suffix, not the whole URL — so we pass just the raw token here, not a full link.)
+// This used to be a Call-to-Action template. In practice the button often
+// arrived rendered as static text — WhatsApp paints the message before the
+// interactive layer has hydrated, and it only becomes tappable after the
+// customer closes and reopens the chat.
+//
+// That is a client-side quirk, not something the server can fix. But it lands
+// on the very first thing a new customer ever does, and a signup link that
+// does nothing when tapped is a customer lost before they started.
+//
+// A bare URL in a message body has no interactive layer to fail. WhatsApp
+// auto-links it and it works on first tap, every time.
+//
+// The 24-hour window doesn't apply: this is always a reply, sent seconds after
+// the customer messaged us or tapped Register, so free-form is permitted.
+//
+// The base URL comes from PUBLIC_BASE_URL — the old template had an ngrok
+// domain baked into it, which stops working the moment that tunnel dies.
 func (s *WhatsAppService) SendRegistrationLink(toPhone, token string) error {
-	variables := fmt.Sprintf(`{"1":"%s"}`, token)
-	return s.SendContentTemplate(toPhone, "HX69072c45c623b99ebf805e81d2ef5ac9", variables)
+	link := fmt.Sprintf("%s/register?token=%s", publicBaseURL(), token)
+
+	body := fmt.Sprintf(
+		"🥛 *Welcome to PGS Direct!*\n\n"+
+			"Tap the link below to set up your deliveries — it takes about a minute.\n\n"+
+			"%s\n\n"+
+			"_This link works for the next 30 minutes. Reply here if you need a new one._",
+		link,
+	)
+
+	return s.SendDeliveryUpdate(toPhone, body)
+}
+
+// publicBaseURL is where the customer-facing pages live.
+//
+// Read from the environment so a staging deploy doesn't hand out production
+// links, and so this can never again be a tunnel URL frozen into an approved
+// Meta template that takes two days to change.
+func publicBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "https://pgsbackend-e4hiw.ondigitalocean.app"
 }
 
 func (s *WhatsAppService) SendContentTemplate(toPhone string, templateSid string, variables string) error {
@@ -164,5 +199,26 @@ func (s *WhatsAppService) SendContentTemplate(toPhone string, templateSid string
 }
 
 func (s *WhatsAppService) SendInteractiveMenu(toPhone string) error {
-	return s.SendContentTemplate(toPhone, "HXd4d41a71bcc7f287b2a8dfffa83f649e", "")
+	return s.SendContentTemplate(toPhone, templateSID("WHATSAPP_TEMPLATE_MENU", "HXd4d41a71bcc7f287b2a8dfffa83f649e"), "")
+}
+
+// templateSID resolves a content template SID from the environment, falling
+// back to the value the code shipped with.
+//
+// # WHY THE FALLBACK
+//
+// These eight SIDs were hardcoded. Swapping a template — because Meta made you
+// re-approve it, or because you built a better version — meant a code change,
+// a commit and a redeploy, for what is really a configuration value.
+//
+// The fallback matters as much as the lookup: a deployment that forgets one of
+// these env vars keeps working on the old template rather than silently
+// sending nothing. Losing a message is worse than sending a slightly stale
+// one, particularly for registration, which is the first thing a customer
+// ever receives.
+func templateSID(envKey, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
+		return v
+	}
+	return fallback
 }
