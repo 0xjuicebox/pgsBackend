@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/customer"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/0xjuicebox/pgsBackend/middleware"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
@@ -534,17 +535,7 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 			COALESCE(c.geo_latitude, ''), COALESCE(c.geo_longitude, ''),
 			c.is_active, s.stop_order,
 
-			COALESCE((dl.planned_order->>'milk')::int, o.new_milk_qty, s.default_milk_qty, 0),
-			COALESCE((dl.planned_order->>'curd')::int, o.new_curd_qty, s.default_curd_qty, 0),
-			COALESCE((dl.planned_order->>'butter')::int, o.new_butter_qty, s.default_butter_qty, 0),
-			COALESCE((dl.planned_order->>'ghee')::int, o.new_ghee_qty, s.default_ghee_qty, 0),
-			COALESCE((dl.planned_order->>'lassi')::int, o.new_lassi_qty, s.default_lassi_qty, 0),
-			COALESCE((dl.planned_order->>'paneer')::int, o.new_paneer_qty, s.default_paneer_qty, 0),
-			COALESCE((dl.planned_order->>'jaggery')::int, o.new_jaggery_qty, s.default_jaggery_qty, 0),
-			COALESCE((dl.planned_order->>'khand')::int, o.new_khand_qty, s.default_khand_qty, 0),
-			COALESCE((dl.planned_order->>'oil')::int, o.new_oil_qty, s.default_oil_qty, 0),
-			COALESCE((dl.planned_order->>'atta')::int, o.new_atta_qty, s.default_atta_qty, 0),
-			COALESCE((dl.planned_order->>'burfi')::int, o.new_burfi_qty, s.default_burfi_qty, 0),
+` + schedule.ScheduledQtyList("s", "o", "dl", "$2", "\t\t\t") + `,
 
 			dl.status,
 			dl.locked_at IS NOT NULL,
@@ -564,9 +555,13 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 		WHERE s.route_id = $1 AND s.slot = $3
 		  AND c.is_active = TRUE AND s.stop_order > 0
 		  AND (
-			  s.schedule_type = 'daily'
-			  OR (s.schedule_type = 'custom' AND EXTRACT(DOW FROM $2::date)::int = ANY(s.active_days))
-			  OR (s.schedule_type = 'alternate' AND ($2::date - s.anchor_date) % 2 = 0)
+			  -- Any item due, or an explicit override for this date.
+			  --
+			  -- Per-item schedules mean a customer can have days with nothing
+			  -- scheduled at all — alternate-day butter and nothing else, on
+			  -- an off day. Such a stop must not appear: there is nothing to
+			  -- deliver, and it is not a missed delivery.
+			  ` + schedule.AnyItemDueExpr("s", "$2") + `
 			  OR o.id IS NOT NULL
 		  )
 		ORDER BY s.stop_order ASC

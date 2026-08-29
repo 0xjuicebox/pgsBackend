@@ -60,16 +60,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// products in the order they appear on a bill, so a locked plan and an
-// invoice read the same way.
-var lockProducts = []string{
-	"milk", "curd", "butter", "ghee", "lassi", "paneer",
-	"jaggery", "khand", "oil", "atta", "burfi",
-}
+// lockProducts is schedule.Products, aliased so the two cannot drift.
+//
+// It was a second hand-written copy of the same eleven strings. A product in
+// one list but not the other would have been invisible in the worst way: the
+// manifest showing an item the locked plan silently omitted, or the reverse.
+var lockProducts = schedule.Products
 
 // StartManifestLockSweeper freezes each route+slot manifest once its cutoff
 // passes.
@@ -223,23 +224,9 @@ func LockManifest(ctx context.Context, db *pgxpool.Pool, routeID, slot, date str
 	//
 	// Zero is how a customer cancels one item. It has to be recorded, not
 	// omitted.
-	planExpr := "jsonb_build_object("
-	for i, p := range lockProducts {
-		if i > 0 {
-			planExpr += ", "
-		}
-		planExpr += fmt.Sprintf("'%s', COALESCE(o.new_%s_qty, s.default_%s_qty, 0)", p, p, p)
-	}
-	planExpr += ")"
+	planExpr := schedule.PlannedOrderExpr("s", "o", "$2")
 
-	totalExpr := "("
-	for i, p := range lockProducts {
-		if i > 0 {
-			totalExpr += " + "
-		}
-		totalExpr += fmt.Sprintf("COALESCE(o.new_%s_qty, s.default_%s_qty, 0)", p, p)
-	}
-	totalExpr += ")"
+	totalExpr := schedule.ScheduledTotalExpr("s", "o", "$2")
 
 	query := `
 		INSERT INTO delivery_logs (customer_id, route_id, driver_id, delivery_date, slot,
@@ -258,9 +245,8 @@ func LockManifest(ctx context.Context, db *pgxpool.Pool, routeID, slot, date str
 		  AND s.stop_order > 0
 		  AND dl.id IS NULL
 		  AND (
-			  s.schedule_type = 'daily'
-			  OR (s.schedule_type = 'custom' AND EXTRACT(DOW FROM $2::date)::int = ANY(s.active_days))
-			  OR (s.schedule_type = 'alternate' AND ($2::date - s.anchor_date) % 2 = 0)
+			  -- Any item due, or an explicit override for this date.
+			  ` + schedule.AnyItemDueExpr("s", "$2") + `
 			  OR o.id IS NOT NULL
 		  )
 		  AND ` + totalExpr + ` > 0

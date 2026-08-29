@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/billing"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -171,7 +172,11 @@ func (sr StatsResource) Routes() chi.Router {
 // and never delivered — permanently capping the completion rate below 100%
 // on any day someone skips. GenerateManifest drops those stops too, so the
 // driver was never asked to make them.
-const dueTodayCTE = `
+// Built at init rather than declared const, because the schedule predicate is
+// now generated — one call to item_due_on() per product, produced by
+// schedule.AnyItemDueExpr so that this site and the four query sites cannot
+// drift apart. They previously agreed only by coincidence.
+var dueTodayCTE = `
 	WITH due AS (
 		SELECT s.route_id, s.slot, s.customer_id
 		FROM subscriptions s
@@ -183,12 +188,9 @@ const dueTodayCTE = `
 		WHERE s.route_id IS NOT NULL
 		  AND c.status = 'active'
 		  AND (
-				s.schedule_type = 'daily'
-			 OR (s.schedule_type = 'custom'
-				 AND EXTRACT(DOW FROM $1::date)::int = ANY(s.active_days))
-			 OR (s.schedule_type = 'alternate'
-				 AND ($1::date - s.anchor_date) % 2 = 0)
-			 OR o.id IS NOT NULL
+			  -- Any item due, or an explicit override for this date.
+			  ` + schedule.AnyItemDueExpr("s", "$1") + `
+			  OR o.id IS NOT NULL
 		  )
 		  AND (
 			  COALESCE(o.new_milk_qty,    s.default_milk_qty,    0)

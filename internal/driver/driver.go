@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/route"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/0xjuicebox/pgsBackend/middleware"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
@@ -378,9 +379,8 @@ func CloseRouteForSlot(ctx context.Context, db *pgxpool.Pool, driverID, slot, ta
 		  AND c.is_active = TRUE AND s.stop_order > 0
 		  AND dl.id IS NULL
 		  AND (
-			  s.schedule_type = 'daily'
-			  OR (s.schedule_type = 'custom' AND EXTRACT(DOW FROM $2::date)::int = ANY(s.active_days))
-			  OR (s.schedule_type = 'alternate' AND ($2::date - s.anchor_date) % 2 = 0)
+			  -- Any item due, or an explicit override for this date.
+			  ` + schedule.AnyItemDueExpr("s", "$2") + `
 			  OR o.id IS NOT NULL
 		  )
 		  AND ` + effectiveOrderTotal + ` > 0
