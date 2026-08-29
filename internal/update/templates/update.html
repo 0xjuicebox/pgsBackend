@@ -204,8 +204,14 @@
   border-radius: 24px 24px 0 0;
   padding: 22px 20px calc(28px + env(safe-area-inset-bottom));
   max-height: 85vh;
-  overflow-y: auto;
+  /* Column with a scrolling middle, so the confirm bar stays pinned. It used
+     to be the last child of a scrolling panel, which on a short screen put it
+     below the fold with nothing to suggest scrolling — the sheet looked like
+     it had no way to confirm. */
+  display: flex;
+  flex-direction: column;
 }
+.freq-scroll { overflow-y: auto; flex: 1 1 auto; }
 .freq-panel h3 { margin: 0 0 4px; font-size: 18px; font-weight: 800; }
 .freq-panel .sub { margin: 0 0 18px; font-size: 13px; color: #64748b; }
 
@@ -243,6 +249,7 @@
 
 .freq-done {
   width: 100%;
+  flex: 0 0 auto;
   padding: 15px;
   border: 0;
   border-radius: 14px;
@@ -408,57 +415,66 @@ function openFreqSheet(product, current, slotState, onChange) {
 
     overlay.innerHTML = `
       <div class="freq-panel">
-        <h3>${product.label}</h3>
-        <p class="sub">How often would you like this delivered?</p>
+        <div class="freq-scroll">
+          <h3>${product.label}</h3>
+          <p class="sub">How often would you like this delivered?</p>
 
-        <button type="button" class="freq-opt ${effective.type === 'inherit' ? 'on' : ''}" data-t="inherit">
-          Same as my other items
-          <small>Follows your delivery schedule — ${describeFreq(null, slotState).toLowerCase()}</small>
-        </button>
+          <button type="button" class="freq-opt ${effective.type === 'inherit' ? 'on' : ''}" data-t="inherit">
+            Same as my other items
+            <small>Follows your delivery schedule — ${describeFreq(null, slotState).toLowerCase()}</small>
+          </button>
 
-        <button type="button" class="freq-opt ${effective.type === 'daily' ? 'on' : ''}" data-t="daily">
-          Every day
-        </button>
+          <button type="button" class="freq-opt ${effective.type === 'daily' ? 'on' : ''}" data-t="daily">
+            Every day
+          </button>
 
-        <button type="button" class="freq-opt ${effective.type === 'alternate' ? 'on' : ''}" data-t="alternate">
-          Every other day
-          <small>Starting from your first delivery</small>
-        </button>
+          <button type="button" class="freq-opt ${effective.type === 'alternate' ? 'on' : ''}" data-t="alternate">
+            Every other day
+            <small>Starting from your first delivery</small>
+          </button>
 
-        <button type="button" class="freq-opt ${isCustom ? 'on' : ''}" data-t="custom">
-          Only on certain days
-        </button>
+          <button type="button" class="freq-opt ${isCustom ? 'on' : ''}" data-t="custom">
+            Only on certain days
+          </button>
 
-        ${isCustom ? `
-          <div class="freq-days">
-            ${DAY_NAMES.map((n, i) =>
-              `<button type="button" class="freq-day ${(effective.days || []).includes(i) ? 'on' : ''}" data-d="${i}">${n}</button>`
-            ).join('')}
-          </div>
-          ${(effective.days || []).length === 0
-            ? '<div class="freq-warn">Pick at least one day, or this item will never be delivered.</div>'
-            : ''}
-        ` : ''}
+          ${isCustom ? `
+            <div class="freq-days">
+              ${DAY_NAMES.map((n, i) =>
+                `<button type="button" class="freq-day ${(effective.days || []).includes(i) ? 'on' : ''}" data-d="${i}">${n}</button>`
+              ).join('')}
+            </div>
+            ${(effective.days || []).length === 0
+              ? '<div class="freq-warn">Pick at least one day, or this item will never be delivered.</div>'
+              : ''}
+          ` : ''}
+        </div>
 
-        <button type="button" class="freq-done">Done</button>
+        ${isCustom ? '<button type="button" class="freq-done">Done</button>' : ''}
       </div>`;
 
     overlay.querySelectorAll('.freq-opt').forEach(b => {
       b.addEventListener('click', () => {
         const t = b.dataset.t;
-        if (t === 'inherit') draft = null;
-        else if (t === 'custom') {
+
+        // The three simple options apply and close on the tap.
+        //
+        // A confirm step for "every day" is a button press that can only ever
+        // agree with what was just chosen. Removing it also removes the way
+        // this sheet failed: on a short screen the Done button sat below the
+        // fold and the sheet looked like it had no way to confirm at all.
+        //
+        // Custom is the exception — the days still have to be picked, so it
+        // expands in place and keeps its own confirm.
+        if (t === 'custom') {
           // Seed from the slot's days so the picker opens on something
-          // sensible rather than empty — an empty custom schedule is an item
-          // that never arrives, and it should take deliberate effort to
-          // create.
+          // sensible; an empty custom schedule is an item that never arrives.
           draft = { type: 'custom', days: [...(slotState.activeDays || [1, 4])] };
-        } else if (t === 'alternate') {
-          draft = { type: 'alternate' };
-        } else {
-          draft = { type: 'daily' };
+          render();
+          return;
         }
-        render();
+
+        onChange(t === 'inherit' ? null : { type: t });
+        overlay.remove();
       });
     });
 
@@ -471,17 +487,11 @@ function openFreqSheet(product, current, slotState, onChange) {
       });
     });
 
-    overlay.querySelector('.freq-done').addEventListener('click', () => {
-      // A custom schedule with no days is an item the customer will never
-      // receive. Refusing to close is blunt, but the alternative is a silent
-      // non-delivery they discover weeks later.
-      if (draft && draft.type === 'custom' && (draft.days || []).length === 0) return;
-
-      // Seven days IS daily. Normalising here keeps the stored value honest
-      // and matches what the server does anyway.
-      if (draft && draft.type === 'custom' && draft.days.length === 7) draft = { type: 'daily' };
-
-      onChange(draft);
+    const done = overlay.querySelector('.freq-done');
+    if (done) done.addEventListener('click', () => {
+      if ((draft.days || []).length === 0) return;
+      // Seven days IS daily; normalising keeps the stored value honest.
+      onChange(draft.days.length === 7 ? { type: 'daily' } : draft);
       overlay.remove();
     });
   }
