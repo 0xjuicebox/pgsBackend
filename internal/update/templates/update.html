@@ -836,6 +836,91 @@ input:focus, textarea:focus { border-color: var(--brand); }
   vertical-align: middle;
 }
 
+
+/* ------------------------------------------------------ slot tabs --------
+
+   The slot used to be two cards with a toggle each. A toggle means "on or
+   off, independently" — the one thing a customer cannot do here. Two of them
+   invite turning both on, and the page then takes one away, which reads as a
+   bug rather than a rule.
+
+   Tabs say "one of these" before anything is tapped. The body below belongs
+   to whichever tab is active, so a customer never sees two order forms and
+   never has to work out which one counts.
+   -------------------------------------------------------------------------- */
+
+.slot-tabs {
+  display: flex;
+  gap: 6px;
+  background: var(--line-soft);
+  border-radius: var(--r-md);
+  padding: 6px;
+  margin-bottom: 16px;
+}
+.slot-tab {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  border-radius: var(--r-sm);
+  padding: 13px 8px;
+  cursor: pointer;
+  text-align: center;
+  transition: background .15s ease, box-shadow .15s ease;
+}
+.slot-tab .t-icon { font-size: 20px; line-height: 1; display: block; margin-bottom: 4px; }
+.slot-tab .t-title {
+  display: block;
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--muted);
+  letter-spacing: -0.01em;
+}
+.slot-tab .t-sub { display: block; font-size: 11px; color: var(--faint); margin-top: 1px; }
+.slot-tab.on {
+  background: var(--card);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, .1);
+}
+.slot-tab.on .t-title { color: var(--brand); }
+.slot-tab.on .t-sub { color: var(--muted); }
+
+/* Shown until a tab is chosen, so the section is never an empty rectangle. */
+.slot-empty {
+  border: 1.5px dashed var(--line);
+  border-radius: var(--r-lg);
+  padding: 28px 20px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* The card is now just the body of the active tab — no header, no toggle. */
+.slot-card { border: 0; box-shadow: none; background: transparent; margin: 0; overflow: visible; }
+.slot-card .slot-head { display: none; }
+.slot-card .slot-body { padding: 0; }
+.slot-card:not(.on) { display: none; }
+
+/* -------------------------------------------- frequency as a centred modal
+
+   The sheet was a bottom drawer whose confirm button kept ending up below the
+   fold: a flex child with min-height:auto refuses to shrink, so the scroll
+   area grew past the panel's max-height and pushed the button off-screen.
+   min-height:0 fixes that, but the drawer stays at the mercy of mobile
+   viewport units and the address bar.
+
+   A centred modal sizes to its content and can't push anything past the
+   bottom edge, which removes the class of bug rather than the instance.
+   -------------------------------------------------------------------------- */
+
+.freq-sheet { align-items: center; justify-content: center; padding: 20px; }
+.freq-panel {
+  border-radius: var(--r-xl);
+  max-width: 420px;
+  margin: 0 auto;
+  max-height: 78vh;
+  padding: 22px 20px 20px;
+}
+
 </style>
 </head>
 <body>
@@ -1335,6 +1420,56 @@ function buildSlots() {
   const container = document.getElementById('slotsContainer');
   container.innerHTML = '';
 
+  // ----- Tab strip: morning OR evening -------------------------------------
+  //
+  // Built before the slot bodies so it sits above them. Choosing a tab turns
+  // that slot on and the other off — the same mutual exclusion the toggles
+  // enforced, but now the control says so before it is tapped rather than
+  // correcting the customer afterwards.
+  const tabs = document.createElement('div');
+  tabs.className = 'slot-tabs';
+
+  SLOTS.forEach(slot => {
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = 'slot-tab' + (state.slots[slot.key].on ? ' on' : '');
+    tab.dataset.tab = slot.key;
+    tab.innerHTML =
+      '<span class="t-icon">' + slot.icon + '</span>' +
+      '<span class="t-title">' + slot.title.replace(' delivery', '') + '</span>' +
+      '<span class="t-sub">' + slot.sub + '</span>';
+
+    tab.addEventListener('click', () => {
+      SLOTS.forEach(o => { state.slots[o.key].on = (o.key === slot.key); });
+      syncSlotTabs();
+    });
+
+    tabs.appendChild(tab);
+  });
+  container.appendChild(tabs);
+
+  // Shown until a tab is chosen, so this section is never an empty rectangle
+  // that leaves the customer wondering whether the page finished loading.
+  const emptyHint = document.createElement('div');
+  emptyHint.className = 'slot-empty';
+  emptyHint.textContent = 'Pick a delivery time above to choose your items.';
+  container.appendChild(emptyHint);
+
+  // Keeps the strip, the empty hint and the slot bodies agreeing. Called on
+  // every tab press and once after the bodies are built.
+  function syncSlotTabs() {
+    let anyOn = false;
+    SLOTS.forEach(o => {
+      const on = state.slots[o.key].on;
+      if (on) anyOn = true;
+      const t = tabs.querySelector('[data-tab="' + o.key + '"]');
+      if (t) t.classList.toggle('on', on);
+      const c = container.querySelector('.slot-card[data-slot="' + o.key + '"]');
+      if (c) c.classList.toggle('on', on);
+    });
+    emptyHint.style.display = anyOn ? 'none' : 'block';
+  }
+
   SLOTS.forEach(slot => {
     const s = state.slots[slot.key];
     const card = document.createElement('div');
@@ -1347,25 +1482,10 @@ function buildSlots() {
     head.innerHTML = '<div class="slot-icon">' + slot.icon + '</div>' +
       '<div class="slot-title"><strong>' + slot.title + '</strong><small>' + slot.sub + '</small></div>' +
       '<div class="switch"></div>';
-    head.addEventListener('click', () => {
-      // ONE SLOT PER CUSTOMER (v1) — same rule as registration.
-      //
-      // This form is the other way a second slot could appear: a customer who
-      // registered for mornings could otherwise switch evenings on here and
-      // end up with both. Turning one on turns the other off.
-      const turningOn = !s.on;
-      if (turningOn) {
-        SLOTS.forEach(other => {
-          if (other.key === slot.key) return;
-          state.slots[other.key].on = false;
-          const otherCard = container.querySelector('[data-slot="' + other.key + '"]');
-          if (otherCard) otherCard.classList.remove('on');
-        });
-      }
-      s.on = turningOn;
-      card.classList.toggle('on', s.on);
-      validate();
-    });
+    // Header is hidden — the tab strip owns slot selection now. Kept as a
+    // no-op rather than deleted so the element's structure is unchanged for
+    // anything else that queries it.
+    head.addEventListener('click', () => {});
     card.appendChild(head);
 
     const body = document.createElement('div');
@@ -1471,6 +1591,9 @@ function buildSlots() {
     card.appendChild(body);
     container.appendChild(card);
   });
+
+  // Bodies exist now, so the strip can hide the inactive one.
+  syncSlotTabs();
 }
 
 // --- Validation ---
