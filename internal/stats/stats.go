@@ -296,7 +296,12 @@ func (sr StatsResource) GetStats(w http.ResponseWriter, r *http.Request) {
 	// pull a departing customer off the run — but those are marked inactive
 	// shortly after, and status = 'active' filters them out here.
 	//
-	// Capped at 50. If it ever gets that long the list isn't the problem.
+	// Capped at 500 — bounded by customer count, not by time.
+	//
+	// An unrouted slot means a customer who believes they are subscribed and
+	// appears on no manifest. Hiding some behind a cap is the same failure as
+	// not listing them at all, and a bulk import or a batch of approvals could
+	// easily produce more than fifty at once.
 	unroutedRows, err := sr.DB.Query(ctx, `
 		SELECT s.customer_id::text, c.name, s.slot
 		FROM subscriptions s
@@ -304,7 +309,7 @@ func (sr StatsResource) GetStats(w http.ResponseWriter, r *http.Request) {
 		WHERE c.status = 'active'
 		  AND (s.route_id IS NULL OR s.stop_order = 0)
 		ORDER BY c.name ASC, s.slot ASC
-		LIMIT 50
+		LIMIT 500
 	`)
 	if err != nil {
 		http.Error(w, "Failed checking unrouted slots: "+err.Error(), http.StatusInternalServerError)
@@ -365,9 +370,14 @@ func (sr StatsResource) loadAttention(ctx context.Context) Attention {
 
 	// --- Payment anomalies -------------------------------------------------
 	//
-	// Capped at 50: this is a worklist, not a ledger, and an unbounded query
-	// on a table that grows with every webhook would eventually make the
-	// dashboard slow for no benefit.
+	// Capped at 200. Each row is money that moved in a way we couldn't
+	// reconcile — an ALREADY_PAID is a refund somebody is owed and will not
+	// chase us for. A cap of 50 was a worklist's number, but these do not get
+	// worked off by being looked at; they persist until someone acts.
+	//
+	// Still bounded, because payment_events grows with every webhook forever
+	// and an unbounded query would eventually make the dashboard slow. If 200
+	// is ever reached, the problem is not the limit.
 	//
 	// LEFT JOINs throughout because an UNMATCHED event by definition has no
 	// invoice, and therefore no customer.
@@ -380,7 +390,7 @@ func (sr StatsResource) loadAttention(ctx context.Context) Attention {
 		LEFT JOIN customers c ON c.id = i.customer_id
 		WHERE pe.outcome IN ('ALREADY_PAID', 'AMOUNT_MISMATCH', 'UNMATCHED')
 		ORDER BY pe.received_at DESC
-		LIMIT 50
+		LIMIT 200
 	`)
 	if err != nil {
 		fmt.Printf("⚠️ stats: payment anomalies failed: %v\n", err)
@@ -411,7 +421,9 @@ func (sr StatsResource) loadAttention(ctx context.Context) Attention {
 		WHERE p.review_status = 'APPROVED'
 		  AND p.effective_from < CURRENT_DATE
 		ORDER BY p.effective_from
-		LIMIT 50
+		-- Should always return nothing. If it ever returns 200, the sweeper
+		-- has been failing for weeks and the count matters more than the list.
+		LIMIT 200
 	`)
 	if err != nil {
 		fmt.Printf("⚠️ stats: stuck changes failed: %v\n", err)
@@ -440,7 +452,9 @@ func (sr StatsResource) loadAttention(ctx context.Context) Attention {
 		LEFT JOIN invoices i ON i.id = c.suspended_for_invoice_id
 		WHERE c.status = 'suspended'
 		ORDER BY i.suspended_at NULLS LAST
-		LIMIT 100
+		-- Bounded by the customer count, not by time. Every suspended account
+		-- is a customer receiving no deliveries who thinks they should be.
+		LIMIT 500
 	`)
 	if err != nil {
 		fmt.Printf("⚠️ stats: suspended customers failed: %v\n", err)

@@ -29,7 +29,7 @@ const (
 // number stayed hidden.
 const (
 	defaultPageLimit = 100
-	maxPageLimit     = 500
+	maxPageLimit     = 2000
 )
 
 func Paginate(next http.Handler) http.Handler {
@@ -50,9 +50,12 @@ func Paginate(next http.Handler) http.Handler {
 				// Silently clamping rather than erroring: a caller asking for
 				// more than the cap gets the cap, which is the same shape of
 				// quiet truncation described above — but an unbounded query on
-				// a growing table is worse. 500 is well past any list a person
-				// scrolls, so hitting it means the caller wants an export, and
-				// that should be a different endpoint.
+				// a growing table is worse.
+				//
+				// 2000 covers a full day of deliveries at the scale this is
+				// built for: 700 customers across two slots is 1,400 rows, and
+				// the delivery log screen asks for a whole day at once. A cap
+				// below that would hide part of a day with no sign it had.
 				if l > maxPageLimit {
 					limit = maxPageLimit
 				} else {
