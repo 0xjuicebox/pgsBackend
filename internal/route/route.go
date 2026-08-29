@@ -112,7 +112,11 @@ func (rr RouteResource) List(w http.ResponseWriter, r *http.Request) {
 		page = 1
 	}
 	if limit < 1 {
-		limit = 20
+		// Unreachable in practice: middleware.Paginate always puts a value in
+		// the context, so this branch only fires if the handler is ever
+		// mounted without that middleware. Kept as a floor, not a default —
+		// the real default lives in middleware/pagination.go.
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
