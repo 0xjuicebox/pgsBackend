@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/customer"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5"
@@ -27,6 +28,14 @@ type Subscription struct {
 	DefaultOrder customer.Order `json:"defaultOrder"`
 	RouteId      *uuid.UUID     `json:"routeId,omitempty"`
 	StopOrder    *int           `json:"stopOrder,omitempty"`
+
+	// ItemSchedules overrides the slot schedule per product. Absent products
+	// follow scheduleType above.
+	ItemSchedules map[string]schedule.ItemSchedule `json:"itemSchedules,omitempty"`
+
+	// ItemSchedulesRaw is the JSONB as stored, used only for scanning.
+	// Excluded from JSON so the API exposes the decoded map, not both.
+	ItemSchedulesRaw []byte `json:"-"`
 }
 
 type SubscriptionResource struct {
@@ -107,13 +116,13 @@ func (sr SubscriptionResource) CreateOrUpdate(w http.ResponseWriter, r *http.Req
 			default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
 			default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
 			default_oil_qty, default_atta_qty, default_burfi_qty,
-			route_id, stop_order
+			route_id, stop_order, item_schedules
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9, $10,
 			$11, $12, $13, $14,
 			$15, $16, $17,
-			$18, COALESCE($19, 0)
+			$18, COALESCE($19, 0), $20
 		)
 		ON CONFLICT (customer_id, slot)
 		DO UPDATE SET
@@ -131,17 +140,34 @@ func (sr SubscriptionResource) CreateOrUpdate(w http.ResponseWriter, r *http.Req
 			default_oil_qty = EXCLUDED.default_oil_qty,
 			default_atta_qty = EXCLUDED.default_atta_qty,
 			default_burfi_qty = EXCLUDED.default_burfi_qty,
+			-- COALESCE, not EXCLUDED: an admin editing a quantity sends no
+			-- item_schedules, and taking EXCLUDED directly would wipe the
+			-- customer's per-item frequencies every time. Same reasoning as
+			-- route_id and stop_order below.
+			item_schedules = COALESCE($20, subscriptions.item_schedules),
 			route_id = COALESCE($18, subscriptions.route_id),
 			stop_order = COALESCE($19, subscriptions.stop_order),
 			updated_at = NOW();
 	`
+	// nil when the caller sent no schedules, so COALESCE in the upsert keeps
+	// whatever the customer already had. An admin editing a milk quantity
+	// must not silently clear someone's alternate-day butter.
+	var encodedSchedules []byte
+	if len(sub.ItemSchedules) > 0 {
+		encodedSchedules, err = schedule.ValidateItemSchedules(sub.ItemSchedules, sub.AnchorDate)
+		if err != nil {
+			http.Error(w, "Delivery frequency: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
 	_, err = sr.DB.Exec(
 		r.Context(), query,
 		sub.Id, sub.CustomerId, sub.Slot, sub.ScheduleType, sub.ActiveDays, sub.AnchorDate,
 		sub.DefaultOrder.Milk, sub.DefaultOrder.Curd, sub.DefaultOrder.Butter, sub.DefaultOrder.Ghee,
 		sub.DefaultOrder.Lassi, sub.DefaultOrder.Paneer, sub.DefaultOrder.Jaggery, sub.DefaultOrder.Khand,
 		sub.DefaultOrder.Oil, sub.DefaultOrder.Atta, sub.DefaultOrder.Burfi,
-		sub.RouteId, sub.StopOrder,
+		sub.RouteId, sub.StopOrder, encodedSchedules,
 	)
 	if err != nil {
 		http.Error(w, "Failed to save subscription: "+err.Error(), http.StatusInternalServerError)
@@ -159,7 +185,7 @@ const selectColumns = `
 	default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
 	default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
 	default_oil_qty, default_atta_qty, default_burfi_qty,
-	route_id, stop_order
+	route_id, stop_order, item_schedules
 `
 
 func scanSubscription(row pgx.Row) (Subscription, error) {
@@ -169,9 +195,13 @@ func scanSubscription(row pgx.Row) (Subscription, error) {
 		&s.DefaultOrder.Milk, &s.DefaultOrder.Curd, &s.DefaultOrder.Butter, &s.DefaultOrder.Ghee,
 		&s.DefaultOrder.Lassi, &s.DefaultOrder.Paneer, &s.DefaultOrder.Jaggery, &s.DefaultOrder.Khand,
 		&s.DefaultOrder.Oil, &s.DefaultOrder.Atta, &s.DefaultOrder.Burfi,
-		&s.RouteId, &s.StopOrder,
+		&s.RouteId, &s.StopOrder, &s.ItemSchedulesRaw,
 	)
-	return s, err
+	if err != nil {
+		return s, err
+	}
+	s.ItemSchedules = schedule.ParseItemSchedules(s.ItemSchedulesRaw)
+	return s, nil
 }
 
 // ListByCustomer returns every slot this customer is subscribed to — zero,

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -69,6 +70,27 @@ type SlotSubscription struct {
 	ActiveDays   []int          `json:"activeDays"`   // only meaningful for "custom"
 	StartDate    string         `json:"startDate"`    // only meaningful for "alternate", YYYY-MM-DD
 	Items        map[string]int `json:"items"`        // item key -> quantity
+
+	// ItemSchedules overrides the slot schedule for individual products.
+	//
+	//	{"butter": {"type": "alternate", "anchor": "2026-08-24"}}
+	//
+	// A product absent from the map follows the slot schedule above, which is
+	// what most customers want and what an unchanged form sends. Only items
+	// the customer deliberately gave a different frequency appear here.
+	ItemSchedules map[string]ItemSchedule `json:"itemSchedules"`
+}
+
+// ItemSchedule is one product's own delivery frequency.
+//
+// Mirrors the JSONB stored in subscriptions.item_schedules and read by the
+// item_due_on() SQL function. The field names are part of that contract —
+// renaming one here without changing the function silently stops the schedule
+// applying, and the customer keeps receiving the slot default.
+type ItemSchedule struct {
+	Type   string `json:"type"`             // "daily" | "alternate" | "custom"
+	Days   []int  `json:"days,omitempty"`   // 0=Sunday..6=Saturday, for "custom"
+	Anchor string `json:"anchor,omitempty"` // YYYY-MM-DD, for "alternate"
 }
 
 // SubmitPayload mirrors what register.html's JS sends as JSON.
@@ -214,10 +236,10 @@ func (rr Resource) Submit(w http.ResponseWriter, r *http.Request) {
 			default_milk_qty, default_curd_qty, default_paneer_qty,
 			default_butter_qty, default_ghee_qty, default_lassi_qty,
 			default_jaggery_qty, default_khand_qty, default_oil_qty,
-			default_atta_qty, default_burfi_qty
+			default_atta_qty, default_burfi_qty, item_schedules
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
-			$7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+			$7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
 		)
 		ON CONFLICT (customer_id, slot)
 		DO UPDATE SET
@@ -227,7 +249,8 @@ func (rr Resource) Submit(w http.ResponseWriter, r *http.Request) {
 			default_ghee_qty = EXCLUDED.default_ghee_qty, default_lassi_qty = EXCLUDED.default_lassi_qty,
 			default_jaggery_qty = EXCLUDED.default_jaggery_qty, default_khand_qty = EXCLUDED.default_khand_qty,
 			default_oil_qty = EXCLUDED.default_oil_qty, default_atta_qty = EXCLUDED.default_atta_qty,
-			default_burfi_qty = EXCLUDED.default_burfi_qty;
+			default_burfi_qty = EXCLUDED.default_burfi_qty,
+			item_schedules = EXCLUDED.item_schedules;
 	`
 
 	for _, sub := range payload.Subscriptions {
@@ -241,13 +264,31 @@ func (rr Resource) Submit(w http.ResponseWriter, r *http.Request) {
 			anchorDate = sub.StartDate
 		}
 
+		// Per-item schedules, validated before storage.
+		//
+		// Rejected rather than silently dropped: item_due_on() treats an
+		// unrecognised type as daily, which is right at read time but would
+		// mean a customer who asked for alternate-day butter gets it every
+		// day, saw a confirmation, and has no way to discover the request was
+		// discarded. This is the only point at which anyone can be told.
+		itemSchedules, schErr := toScheduleMap(sub.ItemSchedules)
+		if schErr != nil {
+			http.Error(w, "Delivery frequency: "+schErr.Error(), http.StatusBadRequest)
+			return
+		}
+		encoded, schErr := schedule.ValidateItemSchedules(itemSchedules, anchorDate)
+		if schErr != nil {
+			http.Error(w, "Delivery frequency: "+schErr.Error(), http.StatusBadRequest)
+			return
+		}
+
 		subID, _ := uuid.NewV7()
 		_, err = tx.Exec(ctx, subQuery,
 			subID, finalCustomerID, sub.Slot, sub.ScheduleType, activeDays, anchorDate,
 			sub.Items["milk"], sub.Items["curd"], sub.Items["paneer"],
 			sub.Items["butter"], sub.Items["ghee"], sub.Items["lassi"],
 			sub.Items["jaggery"], sub.Items["khand"], sub.Items["oil"],
-			sub.Items["atta"], sub.Items["burfi"],
+			sub.Items["atta"], sub.Items["burfi"], encoded,
 		)
 		if err != nil {
 			http.Error(w, "Failed to save your order. Please try again.", http.StatusInternalServerError)
@@ -281,4 +322,21 @@ func (rr Resource) Submit(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "Registration received!"})
+}
+
+// toScheduleMap converts the handler's payload type to the shared one.
+//
+// Two identical structs exist because the payload type belongs to the JSON
+// contract with the page and the shared one belongs to the storage contract
+// with item_due_on(). Keeping them separate means a change to the wire format
+// cannot silently alter what gets written to the database.
+func toScheduleMap(in map[string]ItemSchedule) (map[string]schedule.ItemSchedule, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]schedule.ItemSchedule, len(in))
+	for k, v := range in {
+		out[k] = schedule.ItemSchedule{Type: v.Type, Days: v.Days, Anchor: v.Anchor}
+	}
+	return out, nil
 }

@@ -162,6 +162,107 @@
   .success-mark { width: 72px; height: 72px; margin: 0 auto 22px; background: var(--accent-light); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 36px; color: var(--accent); }
   #successScreen h2 { margin: 0 0 10px; font-size: 23px; letter-spacing: -0.02em; }
   #successScreen p { margin: 0; color: var(--ink-soft); font-size: 15px; line-height: 1.6; }
+
+  /* Per-item delivery frequency */
+.freq-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.freq-chip:active { background: #f1f5f9; }
+/* An item on a non-default schedule is tinted, so a customer scanning the
+   list can see at a glance which ones they varied. */
+.freq-chip.custom {
+  border-color: #a7f3d0;
+  background: #ecfdf5;
+  color: #047857;
+}
+.freq-chip .caret { opacity: .5; font-size: 9px; }
+
+.freq-sheet {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, .45);
+  display: flex;
+  align-items: flex-end;
+  z-index: 90;
+}
+.freq-sheet[hidden] { display: none; }
+.freq-panel {
+  background: #fff;
+  width: 100%;
+  border-radius: 24px 24px 0 0;
+  padding: 22px 20px calc(28px + env(safe-area-inset-bottom));
+  max-height: 85vh;
+  overflow-y: auto;
+}
+.freq-panel h3 { margin: 0 0 4px; font-size: 18px; font-weight: 800; }
+.freq-panel .sub { margin: 0 0 18px; font-size: 13px; color: #64748b; }
+
+.freq-opt {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 14px 16px;
+  margin-bottom: 8px;
+  border-radius: 14px;
+  border: 1.5px solid #e2e8f0;
+  background: #fff;
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+  cursor: pointer;
+}
+.freq-opt small { display: block; font-weight: 500; color: #64748b; margin-top: 2px; font-size: 12px; }
+.freq-opt.on { border-color: #047857; background: #ecfdf5; }
+
+.freq-days { display: flex; gap: 6px; margin: 4px 0 14px; flex-wrap: wrap; }
+.freq-day {
+  flex: 1 1 auto;
+  min-width: 40px;
+  padding: 9px 0;
+  border-radius: 10px;
+  border: 1.5px solid #e2e8f0;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  color: #475569;
+  cursor: pointer;
+}
+.freq-day.on { border-color: #047857; background: #047857; color: #fff; }
+
+.freq-done {
+  width: 100%;
+  padding: 15px;
+  border: 0;
+  border-radius: 14px;
+  background: #0f172a;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  margin-top: 6px;
+}
+.freq-warn {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  color: #92400e;
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
 </style>
 </head>
 <body>
@@ -252,6 +353,198 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/**
+ * Human description of an item's schedule, for the chip label.
+ *
+ * Returns the SLOT's description when the item has no schedule of its own, so
+ * the chip always states what will actually happen rather than going blank on
+ * the common case. A blank chip would read as "not set" and invite a customer
+ * to configure something that is already correct.
+ */
+function describeFreq(itemSched, slotState) {
+  const s = itemSched || { type: slotState.scheduleType, days: [...(slotState.activeDays || [])] };
+
+  if (s.type === 'alternate') return 'Every other day';
+  if (s.type === 'custom') {
+    const days = (s.days || []).slice().sort((a, b) => a - b);
+    if (days.length === 0) return 'Pick days';
+    if (days.length === 7) return 'Every day';
+    if (days.length === 1) return DAY_NAMES[days[0]] + ' only';
+    return days.map(d => DAY_NAMES[d]).join(', ');
+  }
+  return 'Every day';
+}
+
+/**
+ * True when the item is following the slot schedule rather than its own.
+ * Drives the chip tint.
+ */
+function freqIsDefault(itemSched) {
+  return !itemSched || !itemSched.type;
+}
+
+/**
+ * Opens the frequency sheet for one product.
+ *
+ * onChange receives the new schedule object, or null to clear it back to the
+ * slot default. Clearing rather than storing an explicit copy of the slot
+ * schedule matters: a customer who later changes their slot schedule expects
+ * items they never touched to follow it.
+ */
+function openFreqSheet(product, current, slotState, onChange) {
+  const overlay = document.createElement('div');
+  overlay.className = 'freq-sheet';
+
+  // Working copy, so dismissing without confirming changes nothing.
+  let draft = current
+    ? { type: current.type, days: [...(current.days || [])], anchor: current.anchor }
+    : null;
+
+  function render() {
+    const effective = draft || { type: 'inherit' };
+    const isCustom = effective.type === 'custom';
+
+    overlay.innerHTML = `
+      <div class="freq-panel">
+        <h3>${product.label}</h3>
+        <p class="sub">How often would you like this delivered?</p>
+
+        <button type="button" class="freq-opt ${effective.type === 'inherit' ? 'on' : ''}" data-t="inherit">
+          Same as my other items
+          <small>Follows your delivery schedule — ${describeFreq(null, slotState).toLowerCase()}</small>
+        </button>
+
+        <button type="button" class="freq-opt ${effective.type === 'daily' ? 'on' : ''}" data-t="daily">
+          Every day
+        </button>
+
+        <button type="button" class="freq-opt ${effective.type === 'alternate' ? 'on' : ''}" data-t="alternate">
+          Every other day
+          <small>Starting from your first delivery</small>
+        </button>
+
+        <button type="button" class="freq-opt ${isCustom ? 'on' : ''}" data-t="custom">
+          Only on certain days
+        </button>
+
+        ${isCustom ? `
+          <div class="freq-days">
+            ${DAY_NAMES.map((n, i) =>
+              `<button type="button" class="freq-day ${(effective.days || []).includes(i) ? 'on' : ''}" data-d="${i}">${n}</button>`
+            ).join('')}
+          </div>
+          ${(effective.days || []).length === 0
+            ? '<div class="freq-warn">Pick at least one day, or this item will never be delivered.</div>'
+            : ''}
+        ` : ''}
+
+        <button type="button" class="freq-done">Done</button>
+      </div>`;
+
+    overlay.querySelectorAll('.freq-opt').forEach(b => {
+      b.addEventListener('click', () => {
+        const t = b.dataset.t;
+        if (t === 'inherit') draft = null;
+        else if (t === 'custom') {
+          // Seed from the slot's days so the picker opens on something
+          // sensible rather than empty — an empty custom schedule is an item
+          // that never arrives, and it should take deliberate effort to
+          // create.
+          draft = { type: 'custom', days: [...(slotState.activeDays || [1, 4])] };
+        } else if (t === 'alternate') {
+          draft = { type: 'alternate' };
+        } else {
+          draft = { type: 'daily' };
+        }
+        render();
+      });
+    });
+
+    overlay.querySelectorAll('.freq-day').forEach(b => {
+      b.addEventListener('click', () => {
+        const d = parseInt(b.dataset.d, 10);
+        const days = draft.days || [];
+        draft.days = days.includes(d) ? days.filter(x => x !== d) : [...days, d];
+        render();
+      });
+    });
+
+    overlay.querySelector('.freq-done').addEventListener('click', () => {
+      // A custom schedule with no days is an item the customer will never
+      // receive. Refusing to close is blunt, but the alternative is a silent
+      // non-delivery they discover weeks later.
+      if (draft && draft.type === 'custom' && (draft.days || []).length === 0) return;
+
+      // Seven days IS daily. Normalising here keeps the stored value honest
+      // and matches what the server does anyway.
+      if (draft && draft.type === 'custom' && draft.days.length === 7) draft = { type: 'daily' };
+
+      onChange(draft);
+      overlay.remove();
+    });
+  }
+
+  overlay.addEventListener('click', (e) => {
+    // Backdrop dismiss discards the draft, which is why draft is a copy.
+    if (e.target === overlay) overlay.remove();
+  });
+
+  render();
+  document.body.appendChild(overlay);
+}
+
+/**
+ * Builds the chip for one product row.
+ *
+ * Hidden while the quantity is zero: a schedule for something the customer
+ * isn't ordering is noise, and showing eleven chips on an empty form makes
+ * the page look like a configuration screen rather than an order.
+ */
+function buildFreqChip(product, slotState, getQty, getSched, setSched) {
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.className = 'freq-chip';
+
+  function sync() {
+    const qty = getQty();
+    if (qty <= 0) { chip.style.display = 'none'; return; }
+    chip.style.display = 'inline-flex';
+
+    const sched = getSched();
+    chip.classList.toggle('custom', !freqIsDefault(sched));
+    chip.innerHTML = describeFreq(sched, slotState) + ' <span class="caret">▾</span>';
+  }
+
+  chip.addEventListener('click', () => {
+    openFreqSheet(product, getSched(), slotState, (next) => {
+      setSched(next);
+      sync();
+    });
+  });
+
+  sync();
+  return { el: chip, sync };
+}
+
+/**
+ * Collects the itemSchedules payload for one slot.
+ *
+ * Only items with a quantity AND their own schedule are included. Sending a
+ * schedule for an item the customer isn't ordering would store a rule that
+ * silently starts applying the day they add it.
+ */
+function collectItemSchedules(slotState, products) {
+  const out = {};
+  products.forEach(p => {
+    const qty = slotState.items[p.key] || 0;
+    const sched = (slotState.itemSchedules || {})[p.key];
+    if (qty > 0 && sched && sched.type) out[p.key] = sched;
+  });
+  return Object.keys(out).length ? out : undefined;
+}
+
 const TOKEN = new URLSearchParams(location.search).get('token');
 const FALLBACK_CENTER = [26.8467, 80.9462];
 
@@ -560,6 +853,7 @@ function buildSlots() {
         val.textContent = formatQty(q, p.unit);
         val.classList.toggle('zero', q === 0);
         minus.disabled = q === 0;
+        if (typeof freq !== 'undefined') freq.sync();
       }
       const minus = document.createElement('button');
       minus.type = 'button'; minus.className = 'qty-btn'; minus.textContent = '−';
@@ -574,6 +868,18 @@ function buildSlots() {
       nameEl.innerHTML = '<strong></strong><small></small>';
       nameEl.querySelector('strong').textContent = p.label;
       nameEl.querySelector('small').textContent = 'in steps of ' + formatQty(p.step, p.unit);
+
+      // Per-item frequency, seeded from what the customer already has so
+      // editing a milk quantity doesn't silently reset their alternate-day
+      // butter.
+      s.itemSchedules = s.itemSchedules || {};
+      const freq = buildFreqChip(
+        p, s,
+        () => s.items[p.key] || 0,
+        () => s.itemSchedules[p.key],
+        (next) => { if (next) s.itemSchedules[p.key] = next; else delete s.itemSchedules[p.key]; }
+      );
+      nameEl.appendChild(freq.el);
       row.appendChild(nameEl);
 
       const ctrl = document.createElement('div'); ctrl.className = 'qty-ctrl';
@@ -661,6 +967,11 @@ async function load() {
       s.activeDays = new Set(incoming.activeDays || [0,1,2,3,4,5,6]);
       s.startDate = incoming.startDate || todayISO();
       s.items = orderToPlain(incoming.items);
+      // Existing per-item frequencies, so the form opens showing what the
+      // customer already chose. Without this, editing a milk quantity would
+      // resubmit slot defaults for everything and silently wipe their
+      // alternate-day butter.
+      s.itemSchedules = incoming.itemSchedules || {};
     });
 
     document.getElementById('loader').style.display = 'none';
@@ -713,6 +1024,7 @@ async function submit() {
       activeDays: [...s.activeDays].sort(),
       startDate: s.startDate,
       items: plainToOrder(s.items),
+      ...(collectItemSchedules(s, PRODUCTS) ? { itemSchedules: collectItemSchedules(s, PRODUCTS) } : {}),
     };
   });
 

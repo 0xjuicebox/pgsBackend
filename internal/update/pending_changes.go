@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5"
@@ -393,8 +394,8 @@ func applyOneChange(
 			id, customer_id, slot, schedule_type, active_days, anchor_date,
 			default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
 			default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
-			default_oil_qty, default_atta_qty, default_burfi_qty
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			default_oil_qty, default_atta_qty, default_burfi_qty, item_schedules
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 		ON CONFLICT (customer_id, slot) DO UPDATE SET
 			schedule_type = EXCLUDED.schedule_type, active_days = EXCLUDED.active_days,
 			anchor_date = EXCLUDED.anchor_date,
@@ -404,6 +405,7 @@ func applyOneChange(
 			default_jaggery_qty = EXCLUDED.default_jaggery_qty, default_khand_qty = EXCLUDED.default_khand_qty,
 			default_oil_qty = EXCLUDED.default_oil_qty, default_atta_qty = EXCLUDED.default_atta_qty,
 			default_burfi_qty = EXCLUDED.default_burfi_qty,
+			item_schedules = EXCLUDED.item_schedules,
 			updated_at = NOW()`
 
 	submitted := map[string]bool{}
@@ -422,12 +424,25 @@ func applyOneChange(
 			anchor = s.StartDate
 		}
 
+		// Per-item schedules were validated when the change was submitted, so
+		// a failure here means the staged JSON was altered between submission
+		// and application. Storing NULL is the safe outcome: every item falls
+		// back to the slot schedule, which is what the customer had before.
+		// Refusing the whole change instead would strand an approved request
+		// that retries hourly forever and is invisible in the review queue.
+		encoded, schErr := schedule.ValidateItemSchedules(toScheduleMap(s.ItemSchedules), anchor)
+		if schErr != nil {
+			fmt.Printf("⚠️ applyOneChange: bad item schedules for %s %s, storing none: %v\n",
+				customerID, s.Slot, schErr)
+			encoded = nil
+		}
+
 		subID, _ := uuid.NewV7()
 		if _, err := tx.Exec(ctx, subQuery,
 			subID, customerID, s.Slot, s.ScheduleType, activeDays, anchor,
 			s.Items.Milk, s.Items.Curd, s.Items.Butter, s.Items.Ghee,
 			s.Items.Lassi, s.Items.Paneer, s.Items.Jaggery, s.Items.Khand,
-			s.Items.Oil, s.Items.Atta, s.Items.Burfi,
+			s.Items.Oil, s.Items.Atta, s.Items.Burfi, encoded,
 		); err != nil {
 			return fmt.Errorf("upsert subscription %s: %w", s.Slot, err)
 		}
@@ -632,4 +647,21 @@ func prettyDate(ymd string) string {
 		return t.Format("2 January")
 	}
 	return ymd
+}
+
+// toScheduleMap converts the wire type to the storage type.
+//
+// Two identical structs, deliberately. The wire type belongs to the JSON
+// contract with update.html; the storage type belongs to the contract with
+// item_due_on(). Keeping them apart means a change to what the page sends
+// cannot silently alter what reaches the database.
+func toScheduleMap(in map[string]ItemSchedule) map[string]schedule.ItemSchedule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]schedule.ItemSchedule, len(in))
+	for k, v := range in {
+		out[k] = schedule.ItemSchedule{Type: v.Type, Days: v.Days, Anchor: v.Anchor}
+	}
+	return out
 }

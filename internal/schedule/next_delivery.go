@@ -61,13 +61,26 @@ type Slot struct {
 	ActiveDays   []int  // 0=Sunday .. 6=Saturday, used when custom
 	AnchorDate   time.Time
 	Routed       bool // has a route_id — an unrouted slot is never delivered
+
+	// ItemSchedules overrides the slot schedule per product. Empty means every
+	// item follows the slot.
+	ItemSchedules map[string]ItemSchedule
+	// Quantities, so a next-delivery answer only counts items the customer
+	// actually orders. Without this an alternate-day-butter customer would be
+	// told their next delivery is tomorrow on the strength of ten products
+	// they buy none of.
+	Quantities map[string]int
 }
 
 // LoadSlots reads a customer's subscriptions in the shape this package needs.
 func LoadSlots(ctx context.Context, db *pgxpool.Pool, customerID string) ([]Slot, error) {
 	rows, err := db.Query(ctx, `
 		SELECT slot, schedule_type, COALESCE(active_days, ARRAY[0,1,2,3,4,5,6]),
-		       anchor_date, route_id IS NOT NULL
+		       anchor_date, route_id IS NOT NULL,
+		       item_schedules,
+		       default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
+		       default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
+		       default_oil_qty, default_atta_qty, default_burfi_qty
 		FROM subscriptions
 		WHERE customer_id = $1
 		ORDER BY slot
@@ -80,18 +93,90 @@ func LoadSlots(ctx context.Context, db *pgxpool.Pool, customerID string) ([]Slot
 	var out []Slot
 	for rows.Next() {
 		var s Slot
-		if err := rows.Scan(&s.Slot, &s.ScheduleType, &s.ActiveDays, &s.AnchorDate, &s.Routed); err != nil {
+		var schedulesRaw []byte
+		qty := make([]int, len(Products))
+		ptrs := []any{&s.Slot, &s.ScheduleType, &s.ActiveDays, &s.AnchorDate, &s.Routed, &schedulesRaw}
+		// Scan order matches the SELECT, which matches Products.
+		for i := range qty {
+			ptrs = append(ptrs, &qty[i])
+		}
+		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
+		}
+		s.ItemSchedules = ParseItemSchedules(schedulesRaw)
+		s.Quantities = make(map[string]int, len(Products))
+		for i, p := range Products {
+			s.Quantities[p] = qty[i]
 		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
 }
 
-// dueOn reports whether this slot delivers on the given date.
+// dueOn reports whether this slot delivers anything on the given date.
+//
+// With per-item schedules a slot is due when ANY item the customer orders is
+// due. A customer whose only alternate-day item is butter has days where
+// nothing at all arrives, and telling them "your next delivery is tomorrow"
+// on such a day would be wrong.
 //
 // SCHEDULE-PREDICATE-COPY — see the package comment.
 func (s Slot) dueOn(d time.Time) bool {
+	if len(s.Quantities) > 0 {
+		any := false
+		for _, p := range Products {
+			if s.Quantities[p] <= 0 {
+				continue
+			}
+			if s.itemDueOn(p, d) {
+				any = true
+				break
+			}
+		}
+		return any
+	}
+	return s.slotDueOn(d)
+}
+
+// itemDueOn applies a product's own schedule, falling back to the slot's.
+// The Go mirror of item_due_on() in SQL — see the package comment on why a
+// second implementation exists here and nowhere else.
+func (s Slot) itemDueOn(product string, d time.Time) bool {
+	sch, ok := s.ItemSchedules[product]
+	if !ok || sch.Type == "" {
+		return s.slotDueOn(d)
+	}
+
+	switch sch.Type {
+	case "alternate":
+		anchor := s.AnchorDate
+		if sch.Anchor != "" {
+			if t, err := time.Parse("2006-01-02", sch.Anchor); err == nil {
+				anchor = t
+			}
+		}
+		a := time.Date(anchor.Year(), anchor.Month(), anchor.Day(), 0, 0, 0, 0, IST)
+		t := time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, IST)
+		days := int(t.Sub(a).Hours() / 24)
+		if days < 0 {
+			return false
+		}
+		return days%2 == 0
+	case "custom":
+		for _, wd := range sch.Days {
+			if wd == int(d.Weekday()) {
+				return true
+			}
+		}
+		return false
+	default:
+		// Unrecognised types deliver, matching item_due_on(). Over-delivering
+		// gets noticed the same morning; under-delivering does not.
+		return true
+	}
+}
+
+func (s Slot) slotDueOn(d time.Time) bool {
 	switch s.ScheduleType {
 	case "alternate":
 		// Every second day counting from the anchor. Uses whole days between

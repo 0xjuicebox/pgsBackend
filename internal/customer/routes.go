@@ -583,22 +583,55 @@ func (cr CustomerResource) orderSummary(ctx context.Context, customerID string) 
 		{"Burfi", "default_burfi_qty", false},
 	}
 
+	// Product keys in the same order as items, to look up each line's
+	// schedule. Derived from the column name so the two cannot drift.
+	productKeys := make([]string, len(items))
 	cols := make([]string, len(items))
 	for i, it := range items {
 		cols[i] = "COALESCE(SUM(" + it.col + "),0)"
+		productKeys[i] = strings.TrimSuffix(strings.TrimPrefix(it.col, "default_"), "_qty")
 	}
 
+	// Per-item schedules alongside the quantities, so the summary can name a
+	// frequency that differs from the slot default. "Butter 250 g" reads as a
+	// daily order to a customer who asked for alternate-day butter, and the
+	// approval message is the only place they could catch that.
+	//
+	// Aggregated across slots with jsonb_agg because a customer may in
+	// principle have two; in practice one-slot-per-customer means one row.
 	row := cr.DB.QueryRow(ctx,
-		"SELECT "+strings.Join(cols, ", ")+" FROM subscriptions WHERE customer_id = $1", customerID)
+		"SELECT "+strings.Join(cols, ", ")+
+			", COALESCE((SELECT jsonb_agg(item_schedules) FROM subscriptions "+
+			"WHERE customer_id = $1 AND item_schedules IS NOT NULL), '[]'::jsonb)"+
+			" FROM subscriptions WHERE customer_id = $1", customerID)
 
 	vals := make([]int, len(items))
-	ptrs := make([]any, len(items))
+	ptrs := make([]any, 0, len(items)+1)
 	for i := range vals {
-		ptrs[i] = &vals[i]
+		ptrs = append(ptrs, &vals[i])
 	}
+	var schedulesRaw []byte
+	ptrs = append(ptrs, &schedulesRaw)
+
 	if err := row.Scan(ptrs...); err != nil {
 		fmt.Printf("⚠️ orderSummary: %v\n", err)
 		return "your usual order"
+	}
+
+	// jsonb_agg gives an array of maps; flatten to one lookup. Later entries
+	// win, which only matters if a customer somehow has two slots with
+	// conflicting schedules for the same product — and either answer is then
+	// equally arbitrary.
+	itemSchedules := map[string]schedule.ItemSchedule{}
+	var aggregated []map[string]schedule.ItemSchedule
+	if len(schedulesRaw) > 0 {
+		if err := json.Unmarshal(schedulesRaw, &aggregated); err == nil {
+			for _, m := range aggregated {
+				for k, v := range m {
+					itemSchedules[k] = v
+				}
+			}
+		}
 	}
 
 	var parts []string
@@ -606,7 +639,15 @@ func (cr CustomerResource) orderSummary(ctx context.Context, customerID string) 
 		if vals[i] <= 0 {
 			continue
 		}
-		parts = append(parts, it.label+" "+formatBaseQty(vals[i], it.litre))
+		entry := it.label + " " + formatBaseQty(vals[i], it.litre)
+		// Only when it differs from the slot default. Appending "(every day)"
+		// to every line would bury the one item that is actually different.
+		if sch, ok := itemSchedules[productKeys[i]]; ok {
+			if desc := schedule.DescribeItemSchedule(&sch); desc != "" && sch.Type != "daily" {
+				entry += " (" + desc + ")"
+			}
+		}
+		parts = append(parts, entry)
 	}
 	if len(parts) == 0 {
 		return "your usual order"

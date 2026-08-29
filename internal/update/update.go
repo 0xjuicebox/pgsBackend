@@ -13,6 +13,7 @@ import (
 	"github.com/0xjuicebox/pgsBackend/internal/customer"
 	"github.com/0xjuicebox/pgsBackend/internal/notification"
 	"github.com/0xjuicebox/pgsBackend/internal/registration"
+	"github.com/0xjuicebox/pgsBackend/internal/schedule"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -82,6 +83,27 @@ type SlotSubscription struct {
 	ActiveDays   []int          `json:"activeDays"`
 	StartDate    string         `json:"startDate"`
 	Items        customer.Order `json:"items"`
+
+	// ItemSchedules overrides the slot schedule per product. Absent products
+	// follow the slot schedule. Same shape as registration and the same
+	// contract with item_due_on().
+	//
+	// Deliberately NOT on UpdatePayload below: that is the legacy pre-slots
+	// shape, kept so a browser holding a cached copy of the old page still
+	// submits successfully. An old page cannot send per-item schedules, and
+	// giving it the field would imply otherwise.
+	ItemSchedules map[string]ItemSchedule `json:"itemSchedules"`
+}
+
+// ItemSchedule is one product's own delivery frequency.
+//
+// Field names are the JSONB keys item_due_on() reads. Renaming one here
+// without changing the SQL function silently stops the schedule applying, and
+// the customer keeps receiving the slot default.
+type ItemSchedule struct {
+	Type   string `json:"type"`             // "daily" | "alternate" | "custom"
+	Days   []int  `json:"days,omitempty"`   // 0=Sunday..6=Saturday, for "custom"
+	Anchor string `json:"anchor,omitempty"` // YYYY-MM-DD, for "alternate"
 }
 
 // PendingSummary tells the page a change is already under review, so it can
@@ -134,7 +156,8 @@ func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
         SELECT slot, schedule_type, active_days, TO_CHAR(anchor_date, 'YYYY-MM-DD'),
                default_milk_qty, default_curd_qty, default_butter_qty, default_ghee_qty,
                default_lassi_qty, default_paneer_qty, default_jaggery_qty, default_khand_qty,
-               default_oil_qty, default_atta_qty, default_burfi_qty
+               default_oil_qty, default_atta_qty, default_burfi_qty,
+               item_schedules
         FROM subscriptions WHERE customer_id = $1`, customerID)
 	if err != nil {
 		http.Error(w, "Failed to load subscriptions", http.StatusInternalServerError)
@@ -145,14 +168,22 @@ func (ur UpdateResource) GetState(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var slot string
 		var s SlotSubscription
+		var schedulesRaw []byte
 		if err := rows.Scan(
 			&slot, &s.ScheduleType, &s.ActiveDays, &s.StartDate,
 			&s.Items.Milk, &s.Items.Curd, &s.Items.Butter, &s.Items.Ghee,
 			&s.Items.Lassi, &s.Items.Paneer, &s.Items.Jaggery, &s.Items.Khand,
 			&s.Items.Oil, &s.Items.Atta, &s.Items.Burfi,
+			&schedulesRaw,
 		); err != nil {
 			continue
 		}
+
+		// Existing per-item schedules, so the form opens showing what the
+		// customer already chose. Without this a customer editing their milk
+		// quantity would resubmit slot defaults for everything and silently
+		// wipe their alternate-day butter.
+		s.ItemSchedules = fromScheduleMap(schedule.ParseItemSchedules(schedulesRaw))
 		s.Subscribed = true
 		s.Slot = slot
 		if slot == "evening" {
@@ -282,6 +313,24 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate per-item schedules at submission, not when the sweeper applies
+	// them tomorrow.
+	//
+	// Caught here it is a form error the customer can fix. Caught tomorrow it
+	// is an approved change that fails silently, retries hourly forever, and
+	// has already vanished from the admin review queue because that filters
+	// on PENDING.
+	for _, sub := range payload.Subscriptions {
+		anchor := sub.StartDate
+		if anchor == "" {
+			anchor = time.Now().Format("2006-01-02")
+		}
+		if _, err := schedule.ValidateItemSchedules(toScheduleMap(sub.ItemSchedules), anchor); err != nil {
+			http.Error(w, "Delivery frequency: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
 	var customerID string
 	var currentAddress, currentLat, currentLng string
 	err = ur.DB.QueryRow(ctx, `
@@ -342,4 +391,16 @@ func (ur UpdateResource) Submit(w http.ResponseWriter, r *http.Request) {
 		"status":  "pending_review",
 		"message": "Change request submitted for review",
 	})
+}
+
+// fromScheduleMap converts the storage type back to the wire type.
+func fromScheduleMap(in map[string]schedule.ItemSchedule) map[string]ItemSchedule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]ItemSchedule, len(in))
+	for k, v := range in {
+		out[k] = ItemSchedule{Type: v.Type, Days: v.Days, Anchor: v.Anchor}
+	}
+	return out
 }
