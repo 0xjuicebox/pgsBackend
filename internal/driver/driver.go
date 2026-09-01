@@ -412,17 +412,57 @@ func CloseRouteForSlot(ctx context.Context, db *pgxpool.Pool, driverID, slot, ta
 // cutoff stored in system_config. If it's before the evening cutoff, the
 // driver is probably still on their morning run; after it, they're on evening.
 // Falls back to "morning" if anything goes wrong.
+// inferSlot guesses which round is current, for callers that didn't say.
+//
+// # TWO BUGS THIS FIXES
+//
+// It used time.Now() in the SERVER's timezone. DigitalOcean containers run
+// UTC, so the evening boundary landed 5.5 hours late — at 18:00 IST the
+// server saw 12:30 and still called it morning. Every date and time decision
+// in this system is IST; this one had been left out.
+//
+// It also compared strings: time.Now().Format("15:04") against a TIME column
+// rendered as "13:00:00". "13:00" sorts before "13:00:00" because it is a
+// prefix, so the boundary minute itself fell on the wrong side.
+//
+// Comparing minutes-since-midnight removes both.
+//
+// Only reachable when a caller omits ?slot= — the driver app always sends it
+// — but a wrong guess here silently returns the other round's manifest, which
+// is the kind of thing that looks like data loss rather than a default.
 func inferSlot(ctx context.Context, db *pgxpool.Pool) string {
 	var eveningCutoff string
-	err := db.QueryRow(ctx, `SELECT evening_cutoff_time FROM system_config LIMIT 1`).Scan(&eveningCutoff)
+	if err := db.QueryRow(ctx,
+		`SELECT evening_cutoff_time::text FROM system_config LIMIT 1`).Scan(&eveningCutoff); err != nil {
+		return "morning"
+	}
+
+	loc, err := time.LoadLocation("Asia/Kolkata")
 	if err != nil {
 		return "morning"
 	}
-	now := time.Now().Format("15:04")
-	if now >= eveningCutoff {
+	now := time.Now().In(loc)
+	nowMins := now.Hour()*60 + now.Minute()
+
+	cutMins, ok := parseClockMinutes(eveningCutoff)
+	if !ok {
+		return "morning"
+	}
+
+	if nowMins >= cutMins {
 		return "evening"
 	}
 	return "morning"
+}
+
+// parseClockMinutes turns "13:00" or "13:00:00" into minutes since midnight.
+func parseClockMinutes(v string) (int, bool) {
+	for _, layout := range []string{"15:04:05", "15:04"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t.Hour()*60 + t.Minute(), true
+		}
+	}
+	return 0, false
 }
 
 // -------------------------------------------------------------------------

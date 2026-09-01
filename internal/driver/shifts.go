@@ -59,6 +59,23 @@ type ShiftRow struct {
 // morningCutoff/eveningCutoff while they carried order deadlines is what
 // made the sweeper bug hard to see. Named for what they are now.
 type ShiftCutoffs struct {
+	// When a round may START.
+	//
+	// These are the customers' ORDER cutoffs, not a separate setting. The
+	// manifest locks at the cutoff, so before it the driver's list is still
+	// live and a customer can change tomorrow's order out from under a van
+	// that has already been loaded. After it, the list is frozen and safe to
+	// work from.
+	//
+	// Reusing the order cutoff means there is one deadline per slot rather
+	// than two that could drift apart.
+	MorningStart string `json:"morningStart"` // HH:MM:SS — morning_cutoff_time
+	EveningStart string `json:"eveningStart"` // HH:MM:SS — evening_cutoff_time
+
+	// When a round is considered over. An ACTIVE shift past this is
+	// auto-ended by the sweeper within five minutes, so starting one after
+	// this time produces a shift that ends itself — which reads as the app
+	// malfunctioning.
 	MorningShiftEnd string `json:"morningShiftEnd"` // HH:MM:SS
 	EveningShiftEnd string `json:"eveningShiftEnd"` // HH:MM:SS
 }
@@ -114,10 +131,17 @@ func (dr DriverResource) GetTodayShifts(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Best-effort; a missing row shouldn't break the response.
-	dr.DB.QueryRow(r.Context(),
-		`SELECT morning_shift_end_time::text, evening_shift_end_time::text FROM system_config LIMIT 1`,
-	).Scan(&state.Cutoffs.MorningShiftEnd, &state.Cutoffs.EveningShiftEnd)
+	// Best-effort; a missing row shouldn't break the response. The client
+	// treats empty strings as "no window known" and leaves the buttons
+	// enabled rather than locking a driver out on a config read failure.
+	dr.DB.QueryRow(r.Context(), `
+		SELECT morning_cutoff_time::text, evening_cutoff_time::text,
+		       morning_shift_end_time::text, evening_shift_end_time::text
+		FROM system_config LIMIT 1
+	`).Scan(
+		&state.Cutoffs.MorningStart, &state.Cutoffs.EveningStart,
+		&state.Cutoffs.MorningShiftEnd, &state.Cutoffs.EveningShiftEnd,
+	)
 
 	writeJSON(w, http.StatusOK, state)
 }
