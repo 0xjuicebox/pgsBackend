@@ -616,13 +616,17 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 			return manifest, err
 		}
 
-		// Skip zero-quantity stops (customer paused for the day via override).
-		o := stop.DeliveryOrder
-		if o.Milk == 0 && o.Curd == 0 && o.Butter == 0 && o.Ghee == 0 && o.Lassi == 0 &&
-			o.Paneer == 0 && o.Jaggery == 0 && o.Khand == 0 && o.Oil == 0 && o.Atta == 0 && o.Burfi == 0 {
-			continue
-		}
-
+		// Every stop on the route is returned, including those with nothing
+		// to deliver — that is what skip_reason is for.
+		//
+		// This used to drop any all-zero stop, which was correct when the
+		// manifest only listed deliveries. It survived the change that made
+		// the query inclusive, and quietly undid it: the database returned an
+		// alternate-day customer on an off day with reason "Not scheduled
+		// today", and this loop threw the row away before anyone saw it.
+		//
+		// Two filters for one decision, in two languages, is how that hid.
+		// The SQL is now the only place a stop is excluded.
 		manifest.Stops = append(manifest.Stops, stop)
 	}
 
