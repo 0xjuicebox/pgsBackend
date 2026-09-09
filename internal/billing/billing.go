@@ -92,7 +92,21 @@ func (br BillingResource) aggregate(ctx context.Context, month string) ([]Custom
 	sums := make([]string, 0, len(Products)*2)
 	for _, p := range Products {
 		sums = append(sums, fmt.Sprintf("COALESCE(SUM(d.delivered_%s_qty), 0)", p))
-		sums = append(sums, fmt.Sprintf("COALESCE(SUM(d.delivered_%s_qty * d.unit_price_%s), 0)", p, p))
+		// Divided by 1000: prices are per LITRE or per KILOGRAM, quantities are in
+		// millilitres or grams.
+		//
+		// routes.price_milk = 105 means rupees 105 per litre — which is what an admin
+		// types and what anyone reading the table would assume. delivery_logs stores
+		// that same figure as a snapshot at delivery time.
+		//
+		// Without the division, 2 L of milk billed as 2000 x 105 = rupees 210,000.
+		// Every invoice was out by a factor of a thousand.
+		//
+		// Storing a per-millilitre price instead would remove the division but round
+		// rupees 105/L to 0.11 in NUMERIC(10,2) — a 4.7% overcharge baked into the
+		// schema. Keeping the human-readable price and dividing at the point of use is
+		// both exact and legible.
+		sums = append(sums, fmt.Sprintf("COALESCE(SUM(d.delivered_%s_qty * d.unit_price_%s) / 1000.0, 0)", p, p))
 	}
 
 	query := fmt.Sprintf(`
@@ -129,7 +143,15 @@ func (br BillingResource) aggregate(ctx context.Context, month string) ([]Custom
 		for i, p := range Products {
 			t.Breakdown.Quantities[p] = qty[i]
 			if qty[i] > 0 {
-				t.Breakdown.Prices[p] = revenue[i] / float64(qty[i])
+				// Stored per LITRE or KILOGRAM, matching routes.price_* and
+				// what the customer is shown. revenue is already in rupees and
+				// qty is in base units, so the ratio is per base unit — the
+				// x1000 brings it back to the unit anyone actually quotes.
+				//
+				// Derived rather than copied from unit_price_* because a
+				// month can span a price change, and the effective rate a
+				// customer paid is the one worth showing on their bill.
+				t.Breakdown.Prices[p] = (revenue[i] / float64(qty[i])) * 1000
 				t.Breakdown.LineTotals[p] = revenue[i]
 			}
 			t.TotalAmount += revenue[i]

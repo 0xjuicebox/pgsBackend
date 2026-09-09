@@ -451,6 +451,11 @@ type ManifestStop struct {
 	Status        *string        `json:"status"`
 	ActualOrder   customer.Order `json:"actualOrder"`
 
+	// SkipReason explains why nothing is being delivered to this stop today,
+	// and is empty when there is. Drives the "no delivery" row on both the
+	// admin manifest and the driver's list.
+	SkipReason string `json:"skipReason"`
+
 	// Locked means this stop's plan was frozen at the slot's cutoff and is
 	// authoritative. False means the manifest is still being computed live —
 	// either the cutoff hasn't passed, or the date predates locking.
@@ -537,6 +542,30 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 
 ` + schedule.ScheduledQtyList("s", "o", "dl", "$2", "\t\t\t") + `,
 
+			-- Why this stop has nothing to deliver today, or empty when it
+			-- does. Computed rather than stored: it is a description of the
+			-- current state, not a fact about the delivery.
+			--
+			-- The manifest used to omit these customers entirely. A driver
+			-- comparing today's list against yesterday's had no way to tell a
+			-- customer who is not due from one who was dropped by a bug, and
+			-- no way to answer a neighbour asking why the van skipped a house.
+			-- Showing the row with a reason turns an absence into an
+			-- explanation.
+			CASE
+				WHEN c.status = 'suspended'            THEN 'Unpaid bill'
+				WHEN c.status = 'disabled'             THEN 'Paused by customer'
+				WHEN c.is_active = FALSE               THEN 'Not active'
+				WHEN o.id IS NOT NULL
+				 AND ` + schedule.ScheduledTotalExpr("s", "o", "$2") + ` = 0
+				                                       THEN 'Skipped for today'
+				WHEN NOT (` + schedule.AnyItemDueExpr("s", "$2") + `)
+				 AND o.id IS NULL                      THEN 'Not scheduled today'
+				WHEN ` + schedule.ScheduledTotalExpr("s", "o", "$2") + ` = 0
+				                                       THEN 'Nothing to deliver'
+				ELSE ''
+			END AS skip_reason,
+
 			dl.status,
 			dl.locked_at IS NOT NULL,
 			dl.plan_edited_at IS NOT NULL,
@@ -553,17 +582,7 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 		LEFT JOIN order_overrides o ON o.customer_id = c.id AND o.target_date = $2 AND o.slot = $3
 		LEFT JOIN delivery_logs dl ON dl.customer_id = c.id AND dl.delivery_date = $2 AND dl.slot = $3
 		WHERE s.route_id = $1 AND s.slot = $3
-		  AND c.is_active = TRUE AND s.stop_order > 0
-		  AND (
-			  -- Any item due, or an explicit override for this date.
-			  --
-			  -- Per-item schedules mean a customer can have days with nothing
-			  -- scheduled at all — alternate-day butter and nothing else, on
-			  -- an off day. Such a stop must not appear: there is nothing to
-			  -- deliver, and it is not a missed delivery.
-			  ` + schedule.AnyItemDueExpr("s", "$2") + `
-			  OR o.id IS NOT NULL
-		  )
+		  AND s.stop_order > 0
 		ORDER BY s.stop_order ASC
 	`
 
@@ -584,6 +603,7 @@ func GenerateManifest(db *pgxpool.Pool, ctx context.Context, routeId string, tar
 			&stop.DeliveryOrder.Lassi, &stop.DeliveryOrder.Paneer, &stop.DeliveryOrder.Jaggery, &stop.DeliveryOrder.Khand,
 			&stop.DeliveryOrder.Oil, &stop.DeliveryOrder.Atta, &stop.DeliveryOrder.Burfi,
 
+			&stop.SkipReason,
 			&stop.Status,
 			&stop.Locked,
 			&stop.PlanEdited,

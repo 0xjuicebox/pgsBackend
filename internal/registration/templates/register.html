@@ -1263,7 +1263,21 @@ function openFreqSheet(product, current, slotState, onChange) {
           return;
         }
 
-        onChange(t === 'inherit' ? null : { type: t });
+        // An alternate schedule is anchored to today.
+        //
+        // Without an anchor, item_due_on() falls back to the slot's
+        // anchor_date — the customer's subscription start. Someone adding
+        // alternate-day butter in September would have its parity decided by
+        // a date in August, so whether it arrives tomorrow or the day after
+        // is arbitrary to them.
+        //
+        // "Alternate day", chosen today, means "starting from now". The
+        // anchor should say the same thing.
+        onChange(
+          t === 'inherit' ? null
+          : t === 'alternate' ? { type: 'alternate', anchor: todayISO() }
+          : { type: t }
+        );
         overlay.remove();
       });
     });
@@ -1407,7 +1421,21 @@ const state = {
   },
 };
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
+// Local date, not UTC.
+//
+// toISOString() converts to UTC first, and India is UTC+5:30 — so between
+// midnight and 05:30 IST it returns YESTERDAY. A customer registering at 1am
+// would get an anchor date one day early, flipping the parity of every
+// alternate-day schedule they set.
+//
+// The same expression made the driver app fetch the wrong day's manifest and
+// record deliveries against the wrong date.
+function todayISO() {
+  const d = new Date();
+  return d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0');
+}
 
 // ===========================================================================
 // Formatting

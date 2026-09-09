@@ -197,10 +197,10 @@ func (s *Service) buildPayPage(ctx context.Context, invoiceID string) (payPageDa
 		if qty <= 0 {
 			continue
 		}
-		// breakdown.prices holds price per BASE unit — aggregate computes
-		// revenue/quantity where quantity is in ml or g. Milk at ₹70/L is
-		// stored as 0.07. Showing that raw reads as broken, so multiply up
-		// to the unit customers actually price in.
+		// breakdown.prices is already per LITRE or KILOGRAM — the unit a
+		// customer quotes and the same figure the admin typed on the route.
+		// No conversion needed here; aggregate does it once when building the
+		// breakdown.
 		unit := "kg"
 		if payLitreProducts[p] {
 			unit = "L"
@@ -208,7 +208,7 @@ func (s *Service) buildPayPage(ctx context.Context, invoiceID string) (payPageDa
 		data.Lines = append(data.Lines, payLine{
 			Label:    payProductLabels[p],
 			Quantity: formatPayQty(qty, p),
-			Rate:     formatRupees(bd.Prices[p]*1000) + "/" + unit,
+			Rate:     formatRupees(bd.Prices[p]) + "/" + unit,
 			Total:    formatRupees(bd.LineTotals[p]),
 		})
 	}
